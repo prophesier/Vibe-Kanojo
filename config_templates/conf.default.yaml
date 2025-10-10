@@ -289,7 +289,7 @@ character_config:
     edge_tts:
       # Check out doc at https://github.com/rany2/edge-tts
       # Use `edge-tts --list-voices` to list all available voices
-      voice: 'en-US-AriaNeural' # 'en-US-AvaMultilingualNeural' #'zh-CN-XiaoxiaoNeural' # 'ja-JP-NanamiNeural'
+      voice: 'en-US-AvaMultilingualNeural' # 'en-US-AvaMultilingualNeural' #'zh-CN-XiaoxiaoNeural' # 'ja-JP-NanamiNeural'
 
     # pyttsx3_tts doesn't have any config.
 
@@ -423,8 +423,8 @@ character_config:
     elevenlabs_tts:
       api_key: ''
       voice_id: '' # Voice ID from ElevenLabs
-      model_id: '' # Model ID (e.g., eleven_multilingual_v2)
-      output_format: '' # Output audio format (e.g., mp3_44100_128)
+      model_id: 'eleven_multilingual_v2' # Model ID (e.g., eleven_multilingual_v2)
+      output_format: 'mp3_44100_128' # Output audio format (e.g., mp3_44100_128)
       stability: 0.5 # Voice stability (0.0 to 1.0)
       similarity_boost: 0.5 # Voice similarity boost (0.0 to 1.0)
       style: 0.0 # Voice style exaggeration (0.0 to 1.0)

@@ -1,16 +1,11 @@
 # src/open_llm_vtuber/tts/elevenlabs_tts.py
 import os
-import sys
 from pathlib import Path
 
 from loguru import logger
 from elevenlabs.client import ElevenLabs
 
 from .tts_interface import TTSInterface
-
-# Add the current directory to sys.path for relative imports if needed
-current_dir = os.path.dirname(os.path.abspath(__file__))
-sys.path.append(current_dir)
 
 
 class TTSEngine(TTSInterface):
@@ -52,20 +47,14 @@ class TTSEngine(TTSInterface):
         self.similarity_boost = similarity_boost
         self.style = style
         self.use_speaker_boost = use_speaker_boost
-        
+
         # Determine file extension from output format
         if "mp3" in output_format:
             self.file_extension = "mp3"
-        elif "wav" in output_format:
+        elif "pcm" in output_format or "wav" in output_format:
             self.file_extension = "wav"
         else:
             self.file_extension = "mp3"  # Default to mp3
-            
-        self.new_audio_dir = "cache"
-        self.temp_audio_file = "temp_elevenlabs"
-
-        if not os.path.exists(self.new_audio_dir):
-            os.makedirs(self.new_audio_dir)
 
         try:
             # Initialize ElevenLabs client
@@ -98,7 +87,7 @@ class TTSEngine(TTSInterface):
             logger.debug(
                 f"Generating audio via ElevenLabs for text: '{text[:50]}...' with voice '{self.voice_id}' model '{self.model_id}'"
             )
-            
+
             # Generate audio using ElevenLabs API
             audio = self.client.text_to_speech.convert(
                 text=text,
@@ -110,15 +99,17 @@ class TTSEngine(TTSInterface):
                     "similarity_boost": self.similarity_boost,
                     "style": self.style,
                     "use_speaker_boost": self.use_speaker_boost,
-                }
+                },
             )
-            
+
             # Write the audio data to file
             with open(speech_file_path, "wb") as f:
                 for chunk in audio:
                     f.write(chunk)
 
-            logger.info(f"Successfully generated audio file via ElevenLabs: {speech_file_path}")
+            logger.info(
+                f"Successfully generated audio file via ElevenLabs: {speech_file_path}"
+            )
 
         except Exception as e:
             logger.critical(f"Error: ElevenLabs TTS unable to generate audio: {e}")
@@ -127,7 +118,9 @@ class TTSEngine(TTSInterface):
                 try:
                     os.remove(speech_file_path)
                 except OSError as rm_err:
-                    logger.error(f"Could not remove incomplete file {speech_file_path}: {rm_err}")
+                    logger.error(
+                        f"Could not remove incomplete file {speech_file_path}: {rm_err}"
+                    )
             return None
 
         return str(speech_file_path)
