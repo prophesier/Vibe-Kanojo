@@ -24,7 +24,6 @@ class TTSEngine(TTSInterface):
         similarity_boost: float = 0.5,
         style: float = 0.0,
         use_speaker_boost: bool = True,
-        **kwargs,
     ):
         """
         Initializes the ElevenLabs TTS engine.
@@ -64,7 +63,7 @@ class TTSEngine(TTSInterface):
             logger.critical(f"Failed to initialize ElevenLabs client: {e}")
             self.client = None
 
-    def generate_audio(self, text: str, file_name_no_ext=None):
+    def generate_audio(self, text: str, file_name_no_ext: str | None = None) -> str | None:
         """
         Generate speech audio file using ElevenLabs TTS.
 
