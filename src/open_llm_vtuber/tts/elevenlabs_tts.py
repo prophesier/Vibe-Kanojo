@@ -50,9 +50,10 @@ class TTSEngine(TTSInterface):
         # Determine file extension from output format
         if "mp3" in output_format:
             self.file_extension = "mp3"
-        elif "pcm" in output_format or "wav" in output_format:
+        elif "pcm" in output_format:
             self.file_extension = "wav"
         else:
+            logger.warning(f"Unknown output format '{output_format}', defaulting to mp3 extension.")
             self.file_extension = "mp3"  # Default to mp3
 
         try:
@@ -62,6 +63,7 @@ class TTSEngine(TTSInterface):
         except Exception as e:
             logger.critical(f"Failed to initialize ElevenLabs client: {e}")
             self.client = None
+            raise e
 
     def generate_audio(self, text: str, file_name_no_ext: str | None = None) -> str | None:
         """
@@ -120,7 +122,7 @@ class TTSEngine(TTSInterface):
                     logger.error(
                         f"Could not remove incomplete file {speech_file_path}: {rm_err}"
                     )
-            return None
+            raise e
 
         return str(speech_file_path)
 
