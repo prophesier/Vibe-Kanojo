@@ -515,7 +515,7 @@ class TTSConfig(I18nMixin):
     openai_tts: Optional[OpenAITTSConfig] = Field(None, alias="openai_tts")
     spark_tts: Optional[SparkTTSConfig] = Field(None, alias="spark_tts")
     minimax_tts: Optional[MinimaxTTSConfig] = Field(None, alias="minimax_tts")
-    elevenlabs_tts: Optional[ElevenLabsTTSConfig] = Field(None, alias="elevenlabs_tts")
+    elevenlabs_tts: ElevenLabsTTSConfig | None = Field(None, alias="elevenlabs_tts")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "tts_model": Description(
