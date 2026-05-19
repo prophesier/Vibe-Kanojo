@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 import websockets
 from loguru import logger
@@ -121,6 +121,7 @@ class OLVBridge:
         *,
         request_id: str,
         on_reply: ReplyCallback,
+        images: Optional[Sequence[dict[str, Any]]] = None,
     ) -> None:
         """Send a single user turn and await its full reply.
 
@@ -139,11 +140,16 @@ class OLVBridge:
             self._current_turn = turn
 
             try:
+                payload: dict[str, Any] = {"type": "text-input", "text": text}
+                if images:
+                    payload["images"] = list(images)
                 async with self._send_lock:
-                    await self._ws.send(
-                        json.dumps({"type": "text-input", "text": text})
-                    )
-                logger.debug(f"Sent text-input to OLV (request_id={request_id})")
+                    await self._ws.send(json.dumps(payload))
+                logger.debug(
+                    f"Sent text-input to OLV (request_id={request_id}"
+                    + (f", images={len(images)}" if images else "")
+                    + ")"
+                )
 
                 try:
                     await asyncio.wait_for(turn.done.wait(), timeout=self._turn_timeout)
