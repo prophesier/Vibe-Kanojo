@@ -122,6 +122,7 @@ class OLVBridge:
         request_id: str,
         on_reply: ReplyCallback,
         images: Optional[Sequence[dict[str, Any]]] = None,
+        metadata: Optional[dict[str, Any]] = None,
     ) -> None:
         """Send a single user turn and await its full reply.
 
@@ -143,6 +144,8 @@ class OLVBridge:
                 payload: dict[str, Any] = {"type": "text-input", "text": text}
                 if images:
                     payload["images"] = list(images)
+                if metadata:
+                    payload["metadata"] = dict(metadata)
                 async with self._send_lock:
                     await self._ws.send(json.dumps(payload))
                 logger.debug(

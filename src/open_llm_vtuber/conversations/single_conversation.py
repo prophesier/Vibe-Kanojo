@@ -45,8 +45,10 @@ async def process_single_conversation(
     Returns:
         str: Complete response text
     """
-    # Create TTSTaskManager for this conversation
-    tts_manager = TTSTaskManager()
+    # Create TTSTaskManager for this conversation. Honour metadata.skip_tts so
+    # text-only callers (e.g. the Discord bridge) can bypass audio synthesis.
+    skip_tts = bool(metadata and metadata.get("skip_tts", False))
+    tts_manager = TTSTaskManager(skip_tts=skip_tts)
     full_response = ""  # Initialize full_response here
 
     try:

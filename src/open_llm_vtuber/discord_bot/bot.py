@@ -29,10 +29,12 @@ async def _collect_images(
             continue
         try:
             data = await att.read()
+            encoded = base64.b64encode(data).decode()
             result.append(
                 {
                     "source": "upload",
-                    "data": base64.b64encode(data).decode(),
+                    # basic_memory_agent expects a data URL, not raw base64.
+                    "data": f"data:{mime};base64,{encoded}",
                     "mime_type": mime,
                 }
             )
@@ -143,6 +145,7 @@ class DiscordVTuberBot(discord.Client):
                     request_id=request_id,
                     on_reply=_on_reply,
                     images=images or None,
+                    metadata={"skip_tts": True},
                 )
         except Exception as e:
             logger.exception(f"Bridge send failed: {e}")
