@@ -231,6 +231,19 @@ class OLVBridge:
             logger.debug(f"OLV status: {data.get('text')}")
             return
 
+        if msg_type == "backend-synth-complete":
+            # OLV waits for this ack before sending conversation-chain-end.
+            # The browser sends it after playing audio; we ack immediately.
+            if self._ws is not None:
+                try:
+                    async with self._send_lock:
+                        await self._ws.send(
+                            json.dumps({"type": "frontend-playback-complete"})
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to send frontend-playback-complete: {e}")
+            return
+
         if msg_type == "control":
             ctrl = data.get("text")
             if ctrl == "conversation-chain-end" and self._current_turn is not None:
