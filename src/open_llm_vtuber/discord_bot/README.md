@@ -77,6 +77,22 @@ pip install "discord.py>=2.3.2"
 
 ## 4. Configure `conf.yaml`
 
+### 4a. Enable the proxy endpoint in OLV
+
+The bridge connects to OLV's `/proxy-ws` endpoint, which is disabled by
+default. Open your `conf.yaml` and make sure `enable_proxy: true` is set
+inside the `system_config:` block:
+
+```yaml
+system_config:
+  enable_proxy: true   # ← required for the Discord bridge
+  # ... rest of your system_config
+```
+
+Restart the OLV server after this change.
+
+### 4b. Add the `discord_config` section
+
 Open your `conf.yaml` and add a `discord_config:` section at the bottom
 (copy it from `config_templates/conf.default.yaml` if you started from a
 template that pre-dated this feature):
@@ -95,7 +111,11 @@ discord_config:
 Recommended: keep the token out of the file and provide it via env var:
 
 ```bash
+# Linux / macOS
 export DISCORD_BOT_TOKEN="..."
+
+# Windows PowerShell
+$env:DISCORD_BOT_TOKEN="..."
 ```
 
 ### Options
@@ -143,6 +163,12 @@ Type something in an allowed channel and the bot will reply.
 
 - **"discord_config section missing"** — copy the block from
   `config_templates/conf.default.yaml` into your `conf.yaml`.
+- **"server rejected WebSocket connection: HTTP 500/403/404"** — the OLV
+  server does not have `enable_proxy: true` in its `system_config:`.
+  Add it and restart OLV (see step 4a).
+- **"Improper token has been passed"** — the Discord bot token in
+  `discord_config.token` (or `DISCORD_BOT_TOKEN` env var) is empty or
+  wrong. Use the token from the Bot page in the Discord Developer Portal.
 - **Bot ignores messages** — make sure (1) the `Message Content Intent`
   is enabled in the Developer Portal, (2) the bot has `View Channel` +
   `Send Messages` permission in the channel, (3) the guild/channel IDs
