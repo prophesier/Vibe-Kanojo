@@ -187,6 +187,16 @@ class OLVBridge:
                     self._ready_event.set()
                     delay = self._reconnect_initial_delay
                     logger.info("OLV bridge connected")
+
+                    # Ask OLV to create a fresh history file so messages get
+                    # persisted. Without this, context.history_uid stays empty
+                    # and store_message() drops everything on the floor.
+                    try:
+                        async with self._send_lock:
+                            await ws.send(json.dumps({"type": "create-new-history"}))
+                    except Exception as e:
+                        logger.warning(f"Failed to request new history: {e}")
+
                     await self._receive_forever(ws)
             except asyncio.CancelledError:
                 raise
