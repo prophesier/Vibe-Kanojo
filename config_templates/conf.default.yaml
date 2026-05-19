@@ -501,3 +501,23 @@ live_config:
     room_ids: [1991478060]
     # SESSDATA cookie value (optional, for authenticated requests)
     sessdata: ""
+
+# Discord Bridge
+# Run with: uv run python -m src.open_llm_vtuber.discord_bot
+# See src/open_llm_vtuber/discord_bot/README.md for setup instructions.
+discord_config:
+  # Discord bot token. Leave empty to read from the DISCORD_BOT_TOKEN env var.
+  # NEVER commit a real token to source control.
+  token: ""
+  # Whitelist of guild (server) IDs. Empty = allow every guild the bot is in.
+  guild_ids: []
+  # Whitelist of channel IDs. Empty = no channel restriction.
+  channel_ids: []
+  # If true, only reply when the bot is @-mentioned.
+  respond_to_mentions_only: false
+  # Optional prefix for user messages (e.g. "!ai "). Empty = forward all
+  # matching messages.
+  command_prefix: ""
+  # Override the OLV WebSocket URL. Empty = derive from system_config:
+  # ws://{system_config.host}:{system_config.port}/proxy-ws
+  olv_ws_url: ""

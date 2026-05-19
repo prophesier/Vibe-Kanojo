@@ -497,3 +497,22 @@ live_config:
     room_ids: [1991478060]
     # SESSDATA cookie值（可选，用于认证请求，可以查看发送弹幕用户名）
     sessdata: ""
+
+# Discord 桥接
+# 启动命令: uv run python -m src.open_llm_vtuber.discord_bot
+# 详细配置和注册 Bot 的步骤见 src/open_llm_vtuber/discord_bot/README.md
+discord_config:
+  # Discord bot 令牌。留空则从环境变量 DISCORD_BOT_TOKEN 读取。
+  # 切勿将真实 token 提交到版本库。
+  token: ""
+  # 允许响应的 guild (服务器) ID 白名单。留空 = 所有已加入的服务器都允许。
+  guild_ids: []
+  # 允许响应的频道 ID 白名单。留空 = 不限制频道。
+  channel_ids: []
+  # 是否仅在被 @ 时回复。
+  respond_to_mentions_only: false
+  # 可选的消息前缀(如 "!ai "),只有以该前缀开头的消息会被转发。留空 = 全部转发。
+  command_prefix: ""
+  # 覆盖 OLV WebSocket 地址。留空则根据 system_config 自动拼接:
+  # ws://{system_config.host}:{system_config.port}/proxy-ws
+  olv_ws_url: ""

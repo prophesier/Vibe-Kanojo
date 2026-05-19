@@ -48,6 +48,9 @@ bilibili = [
     "Brotli~=1.1.0",
     "yarl>=1.12.0,<2.0"
 ]
+discord = [
+    "discord.py>=2.3.2"
+]
 
 [tool.pixi.project]
 channels = ["conda-forge"]
