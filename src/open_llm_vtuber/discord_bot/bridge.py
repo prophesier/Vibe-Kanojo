@@ -272,6 +272,17 @@ class OLVBridge:
             if self._current_turn is not None:
                 self._current_turn.result.error = message
                 self._current_turn.done.set()
+            # The proxy only resets conversation_active on chain-end or
+            # interrupt-signal. OLV doesn't send chain-end on errors, so send
+            # interrupt-signal to unblock the proxy's message queue.
+            if self._ws is not None:
+                try:
+                    async with self._send_lock:
+                        await self._ws.send(
+                            json.dumps({"type": "interrupt-signal", "text": ""})
+                        )
+                except Exception:
+                    pass
             return
 
         # Other message types (set-model-and-conf, group-update, history-list, ...)
