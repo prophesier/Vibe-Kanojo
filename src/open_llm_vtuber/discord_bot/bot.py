@@ -6,6 +6,7 @@ here (see ``README.md``).
 
 from __future__ import annotations
 
+import base64
 import uuid
 from typing import Iterable, Optional
 
@@ -13,6 +14,31 @@ import discord
 from loguru import logger
 
 from .bridge import OLVBridge, TurnResult
+
+_IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+
+async def _collect_images(
+    attachments: list[discord.Attachment],
+) -> list[dict]:
+    """Download image attachments and return base64-encoded OLV image dicts."""
+    result = []
+    for att in attachments:
+        mime = (att.content_type or "").split(";")[0].strip()
+        if mime not in _IMAGE_MIME_TYPES:
+            continue
+        try:
+            data = await att.read()
+            result.append(
+                {
+                    "source": "upload",
+                    "data": base64.b64encode(data).decode(),
+                    "mime_type": mime,
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Failed to download attachment {att.filename!r}: {e}")
+    return result
 
 
 def _allowed(value: object, whitelist: Iterable[int]) -> bool:
@@ -80,7 +106,11 @@ class DiscordVTuberBot(discord.Client):
             return
 
         content = (message.content or "").strip()
-        if not content:
+        images = (
+            await _collect_images(message.attachments) if message.attachments else []
+        )
+
+        if not content and not images:
             return
 
         if self._mentions_only:
@@ -93,14 +123,14 @@ class DiscordVTuberBot(discord.Client):
                 return
             content = content[len(self._prefix) :].strip()
 
-        if not content:
+        if not content and not images:
             return
 
         request_id = str(uuid.uuid4())
         logger.info(
             f"[discord→olv] guild={message.guild and message.guild.id} "
             f"channel={message.channel.id} user={message.author.id} "
-            f"req={request_id} text={content!r}"
+            f"req={request_id} text={content!r} images={len(images)}"
         )
 
         async def _on_reply(result: TurnResult) -> None:
@@ -109,7 +139,10 @@ class DiscordVTuberBot(discord.Client):
         try:
             async with message.channel.typing():
                 await self._bridge.send_text(
-                    content, request_id=request_id, on_reply=_on_reply
+                    content,
+                    request_id=request_id,
+                    on_reply=_on_reply,
+                    images=images or None,
                 )
         except Exception as e:
             logger.exception(f"Bridge send failed: {e}")
