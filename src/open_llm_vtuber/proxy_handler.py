@@ -269,7 +269,7 @@ class ProxyHandler:
             if "audio" not in message
             else {
                 **{k: v for k, v in message.items() if k != "audio"},
-                "audio": f"[Audio data, {len(message.get('audio', ''))} bytes truncated]",
+                "audio": f"[Audio data, {len(message['audio'])} bytes truncated]" if message.get('audio') is not None else "[silent audio]",
             }
         )
 
