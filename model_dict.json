@@ -1,5 +1,36 @@
 [
     {
+        "name": "anan",
+        "description": "",
+        "url": "/live2d-models/AnAn/AnAn - model.model3.json",
+        "kScale": 0.5,
+        "initialXshift": 0,
+        "initialYshift": 0,
+        "kXOffset": 1150,
+        "idleMotionGroupName": "Idle",
+        "emotionMap": {
+            "neutral": 0,
+            "anger": 14,
+            "disgust": 2,
+            "fear": 3,
+            "joy": 4,
+            "smirk": 5,
+            "sadness": 6,
+            "surprise": 7,
+            "down": 10,
+            "blush": 15,
+            "sweat": 16,
+            "announce": 12
+        },
+        "tapMotions": {
+            "HitAreaHead": {
+                "Idle": 0
+            },
+            "HitAreaBody": {
+                "Idle": 0
+            }
+        }
+    },{
         "name": "mao_pro",
         "description": "",
         "url": "/live2d-models/mao_pro/runtime/mao_pro.model3.json",
