@@ -1,5 +1,6 @@
 # ignore the user configuration file
 conf.yaml
+model_dict.json
 
 # ignore non-default background images
 /backgrounds/*
