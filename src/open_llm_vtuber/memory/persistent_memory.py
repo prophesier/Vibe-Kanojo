@@ -42,10 +42,18 @@ class PersistentMemoryManager:
     # backfills against the same character.
     _backfill_in_progress: ClassVar[Set[str]] = set()
 
-    def __init__(self, conf_uid: str, *, max_facts: int = 50, diary_count: int = 5) -> None:
+    def __init__(
+        self,
+        conf_uid: str,
+        *,
+        max_facts: int = 50,
+        diary_count: int = 5,
+        recent_sessions: int = 3,
+    ) -> None:
         self._conf_uid = conf_uid
         self._max_facts = max_facts
         self._diary_count = diary_count
+        self._recent_sessions = recent_sessions
         self._base_dir = os.path.join("chat_history", conf_uid)
         self._facts_path = os.path.join(self._base_dir, "facts.json")
         self._diaries_dir = os.path.join(self._base_dir, "diaries")
@@ -85,10 +93,14 @@ class PersistentMemoryManager:
         self,
         recent_messages: List[Dict[str, Any]],
         llm: Any,
+        diary_context: str = "",
     ) -> None:
         """Extract new facts from recent messages and append to facts.json.
 
-        Runs as a fire-and-forget background task.
+        Runs as a fire-and-forget background task. ``diary_context`` is an
+        optional summary of older sessions (used during backfill) so the LLM
+        has context beyond the sliding window without burning tokens on full
+        message history.
         """
         try:
             existing = self._load_facts()
@@ -96,17 +108,19 @@ class PersistentMemoryManager:
                 "\n".join(f"- {f['fact']}" for f in existing) if existing else "(まだありません)"
             )
             conv_text = self._format_messages(recent_messages)
-            if not conv_text.strip():
-                logger.info(f"[memory] Fact extraction skipped: empty conversation ({len(recent_messages)} raw msgs)")
+            if not conv_text.strip() and not diary_context.strip():
+                logger.info(f"[memory] Fact extraction skipped: empty input ({len(recent_messages)} raw msgs)")
                 return
 
-            prompt = (
-                f"既存の事実リスト（繰り返さないこと）:\n{existing_text}\n\n"
-                f"分析する会話:\n{conv_text}"
-            )
+            prompt_parts = [f"既存の事実リスト（繰り返さないこと）:\n{existing_text}"]
+            if diary_context.strip():
+                prompt_parts.append(f"以前のセッションのまとめ（参考）:\n{diary_context}")
+            if conv_text.strip():
+                prompt_parts.append(f"分析する会話:\n{conv_text}")
+            prompt = "\n\n".join(prompt_parts)
             logger.info(
                 f"[memory] Extracting facts from {len(recent_messages)} messages "
-                f"({len(conv_text)} chars)"
+                f"({len(conv_text)} chars conversation, {len(diary_context)} chars diary context)"
             )
             raw = await self._call_llm(llm, _FACT_EXTRACT_SYSTEM, prompt)
             logger.info(f"[memory] Fact-extraction LLM raw output: {raw[:500]!r}")
@@ -218,19 +232,59 @@ class PersistentMemoryManager:
                 logger.info("[memory] Diary backfill complete.")
 
             # --- Fact backfill (one-time, only when facts.json doesn't exist) ---
+            # Uses the sliding-window range of recent sessions in full, plus
+            # diary summaries for older sessions. This keeps the prompt
+            # bounded by config (recent_sessions + diary_count) rather than
+            # ballooning if facts.json gets deleted with lots of history.
             if not os.path.exists(self._facts_path):
-                all_messages = []
-                for entry in history_list:
+                # history_list is newest-first; take the N most recent sessions
+                recent_entries = history_list[: self._recent_sessions]
+                recent_uids = {e["uid"] for e in recent_entries}
+                recent_messages: List[Dict[str, Any]] = []
+                # Reverse so messages flow oldest→newest within the window
+                for entry in reversed(recent_entries):
                     msgs = get_history(conf_uid, entry["uid"])
                     if msgs:
-                        all_messages.extend(msgs)
-                if all_messages:
+                        recent_messages.extend(msgs)
+
+                # Pull diary summaries for older sessions (excluding the ones
+                # already covered by the full-message window above).
+                older_diary_entries = []
+                if os.path.isdir(self._diaries_dir):
+                    for fname in os.listdir(self._diaries_dir):
+                        if not fname.endswith(".json"):
+                            continue
+                        diary_uid = fname[:-5]
+                        if diary_uid in recent_uids:
+                            continue
+                        try:
+                            with open(
+                                os.path.join(self._diaries_dir, fname),
+                                "r",
+                                encoding="utf-8",
+                            ) as f:
+                                entry = json.load(f)
+                            if isinstance(entry, dict) and "content" in entry:
+                                entry.setdefault("history_uid", diary_uid)
+                                older_diary_entries.append(entry)
+                        except Exception:
+                            continue
+                older_diary_entries.sort(key=lambda e: e.get("history_uid", ""))
+
+                diary_context = "\n\n".join(
+                    f"[{d.get('date', '')}]\n{d['content']}"
+                    for d in older_diary_entries
+                )
+
+                if recent_messages or diary_context:
                     logger.info(
                         f"[memory] facts.json not found — running one-time fact "
-                        f"extraction across {len(history_list)} historical sessions "
-                        f"({len(all_messages)} messages total)…"
+                        f"extraction (recent sessions: {len(recent_entries)}, "
+                        f"older diaries: {len(older_diary_entries)})…"
                     )
-                    await self.extract_facts_async(all_messages, llm)
+                    await self.extract_facts_async(
+                        recent_messages, llm, diary_context=diary_context
+                    )
                     logger.info("[memory] Fact backfill complete.")
         except Exception as e:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
