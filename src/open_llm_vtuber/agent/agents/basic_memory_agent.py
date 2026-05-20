@@ -179,37 +179,55 @@ class BasicMemoryAgent(AgentInterface):
         """Attach a PersistentMemoryManager for fact extraction and diary injection."""
         self._memory_manager = manager
 
-    def _build_runtime_system(self) -> str:
-        """Return the dynamic system prompt: persona + memory block + current time."""
-        weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        now = datetime.now()
-        time_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        weekday = weekdays[now.weekday()]
-        time_block = f"[Current time: {time_str} {weekday}]"
+    @staticmethod
+    def _format_timestamp(ts: str) -> str:
+        """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS Weekday]'."""
+        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        try:
+            dt = datetime.fromisoformat(ts)
+            return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}]"
+        except (ValueError, TypeError):
+            return f"[{ts}]" if ts else ""
 
+    @classmethod
+    def _now_tag(cls) -> str:
+        """Timestamp tag for messages happening right now."""
+        return cls._format_timestamp(datetime.now().isoformat(timespec="seconds"))
+
+    def _build_runtime_system(self) -> str:
+        """Return the dynamic system prompt: persona + memory block.
+
+        Per-turn time is injected directly into user messages (see
+        _to_text_prompt) rather than the system prompt, so the LLM can
+        distinguish when each turn occurred instead of treating the entire
+        conversation as 'now'.
+        """
         parts = [self._system]
         if self._memory_manager:
             mem_block = self._memory_manager.get_memory_prompt()
             if mem_block:
                 parts.append(mem_block)
-        parts.append(time_block)
         return "\n\n".join(parts)
+
+    def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        """Convert a stored history record into a memory entry, prepending
+        the message's original timestamp so the LLM knows when it happened.
+        """
+        role = "user" if msg["role"] == "human" else "assistant"
+        content = msg.get("content")
+        if not isinstance(content, str) or not content:
+            return None
+        tag = self._format_timestamp(msg.get("timestamp", ""))
+        return {"role": role, "content": f"{tag} {content}".strip()}
 
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
         """Load memory from a single chat history file."""
         messages = get_history(conf_uid, history_uid)
-
         self._memory = []
         for msg in messages:
-            role = "user" if msg["role"] == "human" else "assistant"
-            content = msg["content"]
-            if isinstance(content, str) and content:
-                self._memory.append(
-                    {
-                        "role": role,
-                        "content": content,
-                    }
-                )
+            entry = self._msg_from_history_record(msg)
+            if entry:
+                self._memory.append(entry)
             else:
                 logger.warning(f"Skipping invalid message from history: {msg}")
         logger.info(f"Loaded {len(self._memory)} messages from history.")
@@ -222,10 +240,9 @@ class BasicMemoryAgent(AgentInterface):
         for uid, messages in sessions:
             loaded_uids.append(uid)
             for msg in messages:
-                role = "user" if msg["role"] == "human" else "assistant"
-                content = msg["content"]
-                if isinstance(content, str) and content:
-                    self._memory.append({"role": role, "content": content})
+                entry = self._msg_from_history_record(msg)
+                if entry:
+                    self._memory.append(entry)
         if self._memory_manager:
             # Diaries for these sessions will be suppressed from the injected
             # memory block — the full conversation is already in _memory.
@@ -265,8 +282,14 @@ class BasicMemoryAgent(AgentInterface):
         logger.info(f"Handled interrupt with role '{interrupt_role}'.")
 
     def _to_text_prompt(self, input_data: BatchInput) -> str:
-        """Format input data to text prompt."""
-        message_parts = []
+        """Format input data to text prompt.
+
+        Prepends a timestamp so the LLM has temporal context for this turn —
+        especially important when older messages (loaded from history) also
+        carry their own timestamps; without this tag the LLM would assume
+        the new message has no time at all.
+        """
+        message_parts = [self._now_tag()]
 
         for text_data in input_data.texts:
             if text_data.source == TextSource.INPUT:
