@@ -1,7 +1,8 @@
 # config_manager/system.py
 from pydantic import Field, model_validator
-from typing import Dict, ClassVar
+from typing import Dict, ClassVar, Optional
 from .i18n import I18nMixin, Description
+from .memory import PersistentMemoryConfig
 
 
 class SystemConfig(I18nMixin):
@@ -13,6 +14,9 @@ class SystemConfig(I18nMixin):
     config_alts_dir: str = Field(..., alias="config_alts_dir")
     tool_prompts: Dict[str, str] = Field(..., alias="tool_prompts")
     enable_proxy: bool = Field(False, alias="enable_proxy")
+    persistent_memory: PersistentMemoryConfig = Field(
+        default_factory=PersistentMemoryConfig, alias="persistent_memory"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "conf_version": Description(en="Configuration version", zh="配置文件版本"),
@@ -28,6 +32,10 @@ class SystemConfig(I18nMixin):
         "enable_proxy": Description(
             en="Enable proxy mode for multiple clients",
             zh="启用代理模式以支持多个客户端使用一个 ws 连接",
+        ),
+        "persistent_memory": Description(
+            en="Persistent memory configuration (facts + session diaries)",
+            zh="持久化记忆配置（事实库+会话日记）",
         ),
     }
 
