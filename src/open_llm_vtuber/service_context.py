@@ -432,6 +432,7 @@ class ServiceContext:
                     conf_uid=self.character_config.conf_uid,
                     max_facts=mem_cfg.max_facts,
                     diary_count=mem_cfg.diary_count,
+                    recent_sessions=mem_cfg.recent_sessions,
                 )
                 if hasattr(self.agent_engine, "set_memory_manager"):
                     self.agent_engine.set_memory_manager(self.memory_manager)
