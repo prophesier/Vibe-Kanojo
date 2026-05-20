@@ -8,7 +8,6 @@ from typing import (
     Union,
     Optional,
 )
-import asyncio
 from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
@@ -196,15 +195,6 @@ class BasicMemoryAgent(AgentInterface):
         parts.append(time_block)
         return "\n\n".join(parts)
 
-    def _schedule_fact_extraction(self) -> None:
-        """Fire-and-forget: extract facts from the last few turns."""
-        if not self._memory_manager or not self._llm:
-            return
-        recent = self._memory[-20:]  # last ~10 exchanges
-        asyncio.create_task(
-            self._memory_manager.extract_facts_async(recent, self._llm)
-        )
-
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
         """Load memory from a single chat history file."""
         messages = get_history(conf_uid, history_uid)
@@ -228,12 +218,18 @@ class BasicMemoryAgent(AgentInterface):
         """Load the N most recent session histories into memory (oldest→newest)."""
         sessions = get_recent_histories(conf_uid, n)
         self._memory = []
-        for _uid, messages in sessions:
+        loaded_uids = []
+        for uid, messages in sessions:
+            loaded_uids.append(uid)
             for msg in messages:
                 role = "user" if msg["role"] == "human" else "assistant"
                 content = msg["content"]
                 if isinstance(content, str) and content:
                     self._memory.append({"role": role, "content": content})
+        if self._memory_manager:
+            # Diaries for these sessions will be suppressed from the injected
+            # memory block — the full conversation is already in _memory.
+            self._memory_manager.set_active_sessions(loaded_uids)
         logger.info(
             f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)."
         )
@@ -705,7 +701,6 @@ class BasicMemoryAgent(AgentInterface):
                         complete_response += text_chunk
                 if complete_response:
                     self._add_message(complete_response, "assistant")
-                    self._schedule_fact_extraction()
 
         return chat_with_memory
 
