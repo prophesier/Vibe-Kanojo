@@ -8,7 +8,6 @@ from typing import (
     Union,
     Optional,
 )
-import asyncio
 from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
@@ -195,15 +194,6 @@ class BasicMemoryAgent(AgentInterface):
                 parts.append(mem_block)
         parts.append(time_block)
         return "\n\n".join(parts)
-
-    def _schedule_fact_extraction(self) -> None:
-        """Fire-and-forget: extract facts from the last few turns."""
-        if not self._memory_manager or not self._llm:
-            return
-        recent = self._memory[-20:]  # last ~10 exchanges
-        asyncio.create_task(
-            self._memory_manager.extract_facts_async(recent, self._llm)
-        )
 
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
         """Load memory from a single chat history file."""
@@ -711,7 +701,6 @@ class BasicMemoryAgent(AgentInterface):
                         complete_response += text_chunk
                 if complete_response:
                     self._add_message(complete_response, "assistant")
-                    self._schedule_fact_extraction()
 
         return chat_with_memory
 

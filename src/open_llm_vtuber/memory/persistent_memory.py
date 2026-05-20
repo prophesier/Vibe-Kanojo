@@ -7,6 +7,7 @@ Layer 3 – session diaries: per-session mood summaries, stored in diaries/.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from datetime import datetime
@@ -151,6 +152,23 @@ class PersistentMemoryManager:
             logger.debug(f"[memory] Saved diary for session {history_uid}")
         except Exception as e:
             logger.warning(f"[memory] Diary creation failed: {e}")
+
+    async def end_of_session_async(
+        self,
+        history_messages: List[Dict[str, Any]],
+        history_uid: str,
+        llm: Any,
+    ) -> None:
+        """Run diary generation and fact extraction concurrently at session end.
+
+        Both tasks receive the full session history so neither is starved of
+        context. Runs as a fire-and-forget background task.
+        """
+        await asyncio.gather(
+            self.create_diary_async(history_messages, history_uid, llm),
+            self.extract_facts_async(history_messages, llm),
+            return_exceptions=True,
+        )
 
     async def backfill_async(self, conf_uid: str, llm: Any) -> None:
         """Generate diaries for any existing sessions that don't have one yet.
