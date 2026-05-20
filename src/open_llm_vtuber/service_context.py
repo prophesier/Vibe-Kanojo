@@ -36,6 +36,7 @@ from .config_manager import (
     read_yaml,
     validate_config,
 )
+from .memory.persistent_memory import PersistentMemoryManager
 
 
 class ServiceContext:
@@ -57,6 +58,7 @@ class ServiceContext:
 
         self.mcp_server_registery: ServerRegistry | None = None
         self.tool_adapter: ToolAdapter | None = None
+        self.memory_manager: PersistentMemoryManager | None = None
         self.tool_manager: ToolManager | None = None
         self.mcp_client: MCPClient | None = None
         self.tool_executor: ToolExecutor | None = None
@@ -399,6 +401,20 @@ class ServiceContext:
             # Save the current configuration
             self.character_config.agent_config = agent_config
             self.system_prompt = system_prompt
+
+            # Wire up persistent memory if enabled
+            mem_cfg = self.system_config.persistent_memory
+            if mem_cfg.enabled:
+                self.memory_manager = PersistentMemoryManager(
+                    conf_uid=self.character_config.conf_uid,
+                    max_facts=mem_cfg.max_facts,
+                    diary_count=mem_cfg.diary_count,
+                )
+                if hasattr(self.agent_engine, "set_memory_manager"):
+                    self.agent_engine.set_memory_manager(self.memory_manager)
+                logger.info("[memory] Persistent memory manager initialised.")
+            else:
+                self.memory_manager = None
 
         except Exception as e:
             logger.error(f"Failed to initialize agent: {e}")
