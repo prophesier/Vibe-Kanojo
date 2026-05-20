@@ -182,11 +182,13 @@ class PersistentMemoryManager:
         )
 
     async def backfill_async(self, conf_uid: str, llm: Any) -> None:
-        """Generate diaries for any existing sessions that don't have one yet.
+        """Generate diaries and facts for sessions that don't have them yet.
 
-        Fire-and-forget: scans chat_history/{conf_uid}/*.json and produces a
-        diary for each session that has actual messages but no diary file.
-        Idempotent — running it again is a no-op once everything is backfilled.
+        Diary backfill: scans chat_history/{conf_uid}/diaries/ and creates a
+        diary for each session that has messages but no diary file.
+        Fact backfill: if facts.json doesn't exist yet, runs a one-time
+        extraction across all historical sessions.
+        Both are idempotent — running again is a no-op once everything exists.
         Guarded by a process-wide lock so concurrent connections don't double up.
         """
         if conf_uid in PersistentMemoryManager._backfill_in_progress:
@@ -196,24 +198,42 @@ class PersistentMemoryManager:
             from ..chat_history_manager import get_history_list, get_history
 
             history_list = get_history_list(conf_uid)
-            missing = []
+
+            # --- Diary backfill ---
+            missing_diaries = []
             for entry in history_list:
                 uid = entry["uid"]
                 diary_path = os.path.join(self._diaries_dir, f"{uid}.json")
                 if not os.path.exists(diary_path):
-                    missing.append(uid)
-            if not missing:
-                return
-            logger.info(
-                f"[memory] Backfilling {len(missing)} session diary entries…"
-            )
-            for uid in missing:
-                messages = get_history(conf_uid, uid)
-                if messages:
-                    await self.create_diary_async(messages, uid, llm)
-            logger.info("[memory] Backfill complete.")
+                    missing_diaries.append(uid)
+
+            if missing_diaries:
+                logger.info(
+                    f"[memory] Backfilling {len(missing_diaries)} session diary entries…"
+                )
+                for uid in missing_diaries:
+                    messages = get_history(conf_uid, uid)
+                    if messages:
+                        await self.create_diary_async(messages, uid, llm)
+                logger.info("[memory] Diary backfill complete.")
+
+            # --- Fact backfill (one-time, only when facts.json doesn't exist) ---
+            if not os.path.exists(self._facts_path):
+                all_messages = []
+                for entry in history_list:
+                    msgs = get_history(conf_uid, entry["uid"])
+                    if msgs:
+                        all_messages.extend(msgs)
+                if all_messages:
+                    logger.info(
+                        f"[memory] facts.json not found — running one-time fact "
+                        f"extraction across {len(history_list)} historical sessions "
+                        f"({len(all_messages)} messages total)…"
+                    )
+                    await self.extract_facts_async(all_messages, llm)
+                    logger.info("[memory] Fact backfill complete.")
         except Exception as e:
-            logger.warning(f"[memory] Backfill failed: {e}")
+            logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
             PersistentMemoryManager._backfill_in_progress.discard(conf_uid)
 
