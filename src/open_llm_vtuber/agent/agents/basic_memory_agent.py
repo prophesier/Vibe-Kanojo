@@ -8,13 +8,15 @@ from typing import (
     Union,
     Optional,
 )
+import asyncio
+from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
 from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
-from ...chat_history_manager import get_history
+from ...chat_history_manager import get_history, get_recent_histories
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -67,6 +69,7 @@ class BasicMemoryAgent(AgentInterface):
         self._tool_executor = tool_executor
         self._mcp_prompt_string = mcp_prompt_string
         self._json_detector = StreamJSONDetector()
+        self._memory_manager = None  # set via set_memory_manager()
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -173,8 +176,37 @@ class BasicMemoryAgent(AgentInterface):
 
         self._memory.append(message_data)
 
+    def set_memory_manager(self, manager) -> None:
+        """Attach a PersistentMemoryManager for fact extraction and diary injection."""
+        self._memory_manager = manager
+
+    def _build_runtime_system(self) -> str:
+        """Return the dynamic system prompt: persona + memory block + current time."""
+        weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        now = datetime.now()
+        time_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        weekday = weekdays[now.weekday()]
+        time_block = f"[Current time: {time_str} {weekday}]"
+
+        parts = [self._system]
+        if self._memory_manager:
+            mem_block = self._memory_manager.get_memory_prompt()
+            if mem_block:
+                parts.append(mem_block)
+        parts.append(time_block)
+        return "\n\n".join(parts)
+
+    def _schedule_fact_extraction(self) -> None:
+        """Fire-and-forget: extract facts from the last few turns."""
+        if not self._memory_manager or not self._llm:
+            return
+        recent = self._memory[-20:]  # last ~10 exchanges
+        asyncio.create_task(
+            self._memory_manager.extract_facts_async(recent, self._llm)
+        )
+
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
-        """Load memory from chat history."""
+        """Load memory from a single chat history file."""
         messages = get_history(conf_uid, history_uid)
 
         self._memory = []
@@ -191,6 +223,20 @@ class BasicMemoryAgent(AgentInterface):
             else:
                 logger.warning(f"Skipping invalid message from history: {msg}")
         logger.info(f"Loaded {len(self._memory)} messages from history.")
+
+    def set_memory_from_recent_histories(self, conf_uid: str, n: int) -> None:
+        """Load the N most recent session histories into memory (oldest→newest)."""
+        sessions = get_recent_histories(conf_uid, n)
+        self._memory = []
+        for _uid, messages in sessions:
+            for msg in messages:
+                role = "user" if msg["role"] == "human" else "assistant"
+                content = msg["content"]
+                if isinstance(content, str) and content:
+                    self._memory.append({"role": role, "content": content})
+        logger.info(
+            f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)."
+        )
 
     def handle_interrupt(self, heard_response: str) -> None:
         """Handle user interruption."""
@@ -299,7 +345,7 @@ class BasicMemoryAgent(AgentInterface):
         current_assistant_message_content = []
 
         while True:
-            stream = self._llm.chat_completion(messages, self._system, tools=tools)
+            stream = self._llm.chat_completion(messages, self._build_runtime_system(), tools=tools)
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
 
@@ -409,20 +455,19 @@ class BasicMemoryAgent(AgentInterface):
         messages = initial_messages.copy()
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
-        current_system_prompt = self._system
 
         while True:
             if self.prompt_mode_flag:
                 if self._mcp_prompt_string:
                     current_system_prompt = (
-                        f"{self._system}\n\n{self._mcp_prompt_string}"
+                        f"{self._build_runtime_system()}\n\n{self._mcp_prompt_string}"
                     )
                 else:
                     logger.warning("Prompt mode active but mcp_prompt_string is empty!")
-                    current_system_prompt = self._system
+                    current_system_prompt = self._build_runtime_system()
                 tools_for_api = None
             else:
-                current_system_prompt = self._system
+                current_system_prompt = self._build_runtime_system()
                 tools_for_api = tools
 
             stream = self._llm.chat_completion(
@@ -643,7 +688,9 @@ class BasicMemoryAgent(AgentInterface):
                 return
             else:
                 logger.info("Starting simple chat completion.")
-                token_stream = self._llm.chat_completion(messages, self._system)
+                token_stream = self._llm.chat_completion(
+                    messages, self._build_runtime_system()
+                )
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""
@@ -658,6 +705,7 @@ class BasicMemoryAgent(AgentInterface):
                         complete_response += text_chunk
                 if complete_response:
                     self._add_message(complete_response, "assistant")
+                    self._schedule_fact_extraction()
 
         return chat_with_memory
 

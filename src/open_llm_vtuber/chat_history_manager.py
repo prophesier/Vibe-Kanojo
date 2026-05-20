@@ -351,6 +351,24 @@ def modify_latest_message(
         return False
 
 
+def get_recent_histories(
+    conf_uid: str, n: int
+) -> List[tuple[str, List[HistoryMessage]]]:
+    """Return the N most recent non-empty histories, ordered oldest→newest.
+
+    Each element is (history_uid, messages).
+    """
+    history_list = get_history_list(conf_uid)  # already newest-first
+    result = []
+    for entry in history_list[:n]:
+        uid = entry["uid"]
+        messages = get_history(conf_uid, uid)
+        if messages:
+            result.append((uid, messages))
+    result.reverse()  # oldest first so memory builds chronologically
+    return result
+
+
 def rename_history_file(
     conf_uid: str, old_history_uid: str, new_history_uid: str
 ) -> bool:

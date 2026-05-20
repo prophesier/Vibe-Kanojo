@@ -25,7 +25,15 @@ system_config:
     # 用来增强LLM输出可发音文本的提示词
     # speakable_prompt: 'speakable_prompt'
     # 额外指导 LLM 如何使用工具的提示词
-    # tool_guidance_prompt: 'tool_guidance_prompt' 
+    # tool_guidance_prompt: 'tool_guidance_prompt'
+
+  # 持久化记忆：跨重启保留的事实库和会话日记。
+  # 需要可用的 LLM（复用 agent 中配置的同一个 LLM）。
+  persistent_memory:
+    enabled: false
+    recent_sessions: 3  # Layer 1：新会话开始时加载的历史会话数量
+    diary_count: 5       # Layer 3：注入到系统提示词的最近日记条数
+    max_facts: 50        # Layer 2：facts.json 保留的最大事实条数
 
 # 默认角色的配置
 character_config:
