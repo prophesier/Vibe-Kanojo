@@ -434,13 +434,33 @@ class WebSocketHandler:
     ) -> None:
         """Handle creation of new chat history"""
         context = self.client_contexts[client_uid]
-        history_uid = create_new_history(context.character_config.conf_uid)
+        conf_uid = context.character_config.conf_uid
+
+        # Generate diary for the session that just ended (fire-and-forget)
+        if context.memory_manager and context.history_uid:
+            from .chat_history_manager import get_history as _get_history
+            old_messages = _get_history(conf_uid, context.history_uid)
+            old_uid = context.history_uid
+            llm = getattr(context.agent_engine, "_llm", None)
+            if old_messages and llm:
+                asyncio.create_task(
+                    context.memory_manager.create_diary_async(old_messages, old_uid, llm)
+                )
+
+        history_uid = create_new_history(conf_uid)
         if history_uid:
             context.history_uid = history_uid
-            context.agent_engine.set_memory_from_history(
-                conf_uid=context.character_config.conf_uid,
-                history_uid=history_uid,
-            )
+            mem_cfg = context.system_config.persistent_memory
+            if mem_cfg.enabled and hasattr(context.agent_engine, "set_memory_from_recent_histories"):
+                context.agent_engine.set_memory_from_recent_histories(
+                    conf_uid=conf_uid,
+                    n=mem_cfg.recent_sessions,
+                )
+            else:
+                context.agent_engine.set_memory_from_history(
+                    conf_uid=conf_uid,
+                    history_uid=history_uid,
+                )
             await websocket.send_text(
                 json.dumps(
                     {

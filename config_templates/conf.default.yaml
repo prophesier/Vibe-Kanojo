@@ -23,7 +23,18 @@ system_config:
     # Prompt to enhance the LLM's ability to output speakable text
     # speakable_prompt: 'speakable_prompt'
     # Additional guidance for LLM on how to use tools
-    # tool_guidance_prompt: 'tool_guidance_prompt' 
+    # tool_guidance_prompt: 'tool_guidance_prompt'
+
+  # Persistent memory: facts + session diaries that survive server restarts.
+  # Requires a working LLM (uses the same LLM configured for the agent).
+  persistent_memory:
+    enabled: false
+    # How many recent session histories to load into context at new-session start (Layer 1)
+    recent_sessions: 3
+    # How many recent session diary entries to inject into the system prompt (Layer 3)
+    diary_count: 5
+    # Maximum facts to keep in facts.json before trimming oldest (Layer 2)
+    max_facts: 50
 
 # configuration for the default character
 character_config:
