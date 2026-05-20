@@ -16,20 +16,21 @@ from loguru import logger
 
 
 _FACT_EXTRACT_SYSTEM = (
-    "You are a memory assistant. Extract important, durable facts about the user "
-    "from the conversation. Focus on: personal info, preferences, relationships, "
-    "ongoing situations, commitments. Skip ephemeral chit-chat.\n"
-    "Output ONLY a JSON array like: "
-    '[{"fact": "User has a cat named Mimi"}, {"fact": "User is a software engineer"}]\n'
-    "If there are no new facts worth saving, output an empty array: []"
+    "あなたは記憶アシスタントです。会話からユーザーに関する重要で持続的な事実を抽出してください。"
+    "注目すべき点：個人情報、好み、人間関係、進行中の状況、約束事。"
+    "一時的な雑談はスキップしてください。\n"
+    "既存の事実リストが提供される場合、それらを繰り返さないでください。新しい情報のみ抽出してください。\n"
+    "出力はJSONの配列のみ: "
+    '[{"fact": "ユーザーはミミという猫を飼っている"}, {"fact": "ユーザーはソフトウェアエンジニアである"}]\n'
+    "保存する価値のある新しい事実がない場合は、空の配列を出力してください: []"
 )
 
 _DIARY_SYSTEM = (
-    "You are a memory assistant. Write a brief diary entry (2-4 sentences) "
-    "summarising the conversation session from the AI character's first-person perspective. "
-    "Capture: main topics, user's emotional state, anything that was agreed or promised, "
-    "and the general vibe. Write naturally — do NOT include expression tags like [neutral]. "
-    "Output only the diary text, nothing else."
+    "あなたは記憶アシスタントです。AIキャラクターの一人称視点から、"
+    "この会話セッションを簡潔な日記として2〜4文でまとめてください。"
+    "含めるべき内容：主なトピック、ユーザーの感情状態、約束や合意事項、全体的な雰囲気。"
+    "自然な文体で書いてください。[neutral]などの表現タグは含めないでください。"
+    "日記の本文のみを出力し、他は何も出力しないでください。"
 )
 
 
@@ -275,7 +276,7 @@ class PersistentMemoryManager:
                     part.get("text", "") for part in content if isinstance(part, dict)
                 )
             if content:
-                label = "User" if role == "user" else "AI"
+                label = "ユーザー" if role in ("user", "human") else "AI"
                 lines.append(f"{label}: {content}")
         return "\n".join(lines)
 
