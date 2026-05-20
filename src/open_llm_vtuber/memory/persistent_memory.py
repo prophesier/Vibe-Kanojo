@@ -93,19 +93,26 @@ class PersistentMemoryManager:
         try:
             existing = self._load_facts()
             existing_text = (
-                "\n".join(f"- {f['fact']}" for f in existing) if existing else "(none yet)"
+                "\n".join(f"- {f['fact']}" for f in existing) if existing else "(まだありません)"
             )
             conv_text = self._format_messages(recent_messages)
             if not conv_text.strip():
+                logger.info(f"[memory] Fact extraction skipped: empty conversation ({len(recent_messages)} raw msgs)")
                 return
 
             prompt = (
-                f"Existing facts (do NOT repeat these):\n{existing_text}\n\n"
-                f"Conversation to analyse:\n{conv_text}"
+                f"既存の事実リスト（繰り返さないこと）:\n{existing_text}\n\n"
+                f"分析する会話:\n{conv_text}"
+            )
+            logger.info(
+                f"[memory] Extracting facts from {len(recent_messages)} messages "
+                f"({len(conv_text)} chars)"
             )
             raw = await self._call_llm(llm, _FACT_EXTRACT_SYSTEM, prompt)
+            logger.info(f"[memory] Fact-extraction LLM raw output: {raw[:500]!r}")
             new_facts = self._parse_json_list(raw)
             if not new_facts:
+                logger.info("[memory] No new facts extracted.")
                 return
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -115,9 +122,12 @@ class PersistentMemoryManager:
             if len(merged) > self._max_facts:
                 merged = merged[-self._max_facts :]
             self._save_facts(merged)
-            logger.debug(f"[memory] Added {len(tagged)} new fact(s). Total: {len(merged)}")
+            logger.info(
+                f"[memory] Added {len(tagged)} new fact(s) → {self._facts_path} "
+                f"(total: {len(merged)})"
+            )
         except Exception as e:
-            logger.warning(f"[memory] Fact extraction failed: {e}")
+            logger.warning(f"[memory] Fact extraction failed: {e}", exc_info=True)
 
     async def create_diary_async(
         self,

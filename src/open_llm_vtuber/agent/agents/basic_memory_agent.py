@@ -207,6 +207,12 @@ class BasicMemoryAgent(AgentInterface):
             mem_block = self._memory_manager.get_memory_prompt()
             if mem_block:
                 parts.append(mem_block)
+        parts.append(
+            "Note on timestamps: user messages are prefixed with "
+            "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know when each message "
+            "was sent. These tags are metadata for your reference only — do NOT "
+            "include any such timestamp tag in your own replies."
+        )
         return "\n\n".join(parts)
 
     def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
