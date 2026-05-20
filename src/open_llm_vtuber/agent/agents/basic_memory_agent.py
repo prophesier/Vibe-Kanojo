@@ -228,12 +228,18 @@ class BasicMemoryAgent(AgentInterface):
         """Load the N most recent session histories into memory (oldest→newest)."""
         sessions = get_recent_histories(conf_uid, n)
         self._memory = []
-        for _uid, messages in sessions:
+        loaded_uids = []
+        for uid, messages in sessions:
+            loaded_uids.append(uid)
             for msg in messages:
                 role = "user" if msg["role"] == "human" else "assistant"
                 content = msg["content"]
                 if isinstance(content, str) and content:
                     self._memory.append({"role": role, "content": content})
+        if self._memory_manager:
+            # Diaries for these sessions will be suppressed from the injected
+            # memory block — the full conversation is already in _memory.
+            self._memory_manager.set_active_sessions(loaded_uids)
         logger.info(
             f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)."
         )
