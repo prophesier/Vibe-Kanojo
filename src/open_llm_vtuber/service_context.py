@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from typing import Callable
 from loguru import logger
 from fastapi import WebSocket
@@ -412,6 +413,16 @@ class ServiceContext:
                 )
                 if hasattr(self.agent_engine, "set_memory_manager"):
                     self.agent_engine.set_memory_manager(self.memory_manager)
+                # Backfill diaries for any pre-existing sessions that lack one.
+                # Safe to call on every connection: existing diaries are
+                # skipped, so this is a no-op once the backfill is done.
+                llm = getattr(self.agent_engine, "_llm", None)
+                if llm:
+                    asyncio.create_task(
+                        self.memory_manager.backfill_async(
+                            self.character_config.conf_uid, llm
+                        )
+                    )
                 logger.info("[memory] Persistent memory manager initialised.")
             else:
                 self.memory_manager = None

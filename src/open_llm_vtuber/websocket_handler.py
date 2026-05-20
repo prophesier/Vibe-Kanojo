@@ -436,7 +436,7 @@ class WebSocketHandler:
         context = self.client_contexts[client_uid]
         conf_uid = context.character_config.conf_uid
 
-        # Generate diary for the session that just ended (fire-and-forget)
+        # At session end: generate diary + extract facts concurrently (fire-and-forget)
         if context.memory_manager and context.history_uid:
             from .chat_history_manager import get_history as _get_history
             old_messages = _get_history(conf_uid, context.history_uid)
@@ -444,7 +444,7 @@ class WebSocketHandler:
             llm = getattr(context.agent_engine, "_llm", None)
             if old_messages and llm:
                 asyncio.create_task(
-                    context.memory_manager.create_diary_async(old_messages, old_uid, llm)
+                    context.memory_manager.end_of_session_async(old_messages, old_uid, llm)
                 )
 
         history_uid = create_new_history(conf_uid)
