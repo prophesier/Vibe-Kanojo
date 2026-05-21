@@ -75,6 +75,9 @@ class PersistentMemoryManager:
         # diaries are excluded from the injected memory block to avoid
         # duplicating content the agent already has verbatim.
         self._active_session_uids: set = set()
+        # The session that is currently being written to (i.e. in progress).
+        # Backfill skips this UID so it doesn't summarise an unfinished session.
+        self._current_session_uid: str = ""
         os.makedirs(self._diaries_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -84,6 +87,14 @@ class PersistentMemoryManager:
     def set_active_sessions(self, uids) -> None:
         """Mark these session UIDs as already loaded in the sliding window."""
         self._active_session_uids = set(uids or [])
+
+    def set_current_session(self, uid: str) -> None:
+        """Register the session that is currently in progress.
+
+        Backfill will skip this UID so an unfinished session is never
+        summarised into a diary or used for premature fact extraction.
+        """
+        self._current_session_uid = uid or ""
 
     def get_memory_prompt(self) -> str:
         """Return the memory block to prepend to the system prompt."""
@@ -233,9 +244,14 @@ class PersistentMemoryManager:
             history_list = get_history_list(conf_uid)
 
             # --- Diary backfill ---
+            # Skip the currently-active (in-progress) session: its diary should
+            # only be written by end_of_session_async once the session finishes.
+            skip_uid = self._current_session_uid
             missing_diaries = []
             for entry in history_list:
                 uid = entry["uid"]
+                if uid == skip_uid:
+                    continue
                 diary_path = os.path.join(self._diaries_dir, f"{uid}.json")
                 if not os.path.exists(diary_path):
                     missing_diaries.append(uid)
@@ -258,12 +274,15 @@ class PersistentMemoryManager:
                 for fname in sorted(os.listdir(self._diaries_dir)):
                     if not fname.endswith(".json"):
                         continue
+                    uid = fname[:-5]
+                    if uid == skip_uid:
+                        continue
                     path = os.path.join(self._diaries_dir, fname)
                     try:
                         with open(path, "r", encoding="utf-8") as f:
                             d = json.load(f)
                         if not d.get("facts_extracted"):
-                            unprocessed_uids.append(fname[:-5])
+                            unprocessed_uids.append(uid)
                     except Exception:
                         continue
 
