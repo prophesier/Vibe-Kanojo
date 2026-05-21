@@ -215,6 +215,73 @@ class BasicMemoryAgent(AgentInterface):
         )
         return "\n\n".join(parts)
 
+    # ------------------------------------------------------------------
+    # Prompt caching helpers (Claude only)
+    # ------------------------------------------------------------------
+
+    _CACHE_CONTROL_1H = {"type": "ephemeral", "ttl": "1h"}
+
+    def _is_claude_llm(self) -> bool:
+        return isinstance(self._llm, ClaudeAsyncLLM)
+
+    def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
+        """Return system prompt in the right shape for the active LLM.
+
+        For Claude, returns a list with one cache-controlled text block so
+        the whole system prompt (persona + memory + timestamp note) is
+        cached server-side. For other LLMs, returns the plain string.
+        """
+        text = self._build_runtime_system()
+        if self._is_claude_llm():
+            return [
+                {
+                    "type": "text",
+                    "text": text,
+                    "cache_control": self._CACHE_CONTROL_1H,
+                }
+            ]
+        return text
+
+    def _attach_cache_breakpoint(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Mark the last message's last text block with cache_control.
+
+        Returns a new list with the last message replaced; the original
+        message objects (which live in self._memory) are not mutated.
+        Only applies for Claude LLM — otherwise returns messages unchanged.
+        """
+        if not self._is_claude_llm() or not messages:
+            return messages
+
+        new_messages = list(messages)
+        last = new_messages[-1]
+        content = last.get("content")
+
+        if isinstance(content, str):
+            new_last = {
+                **last,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": self._CACHE_CONTROL_1H,
+                    }
+                ],
+            }
+        elif isinstance(content, list) and content:
+            new_content = [dict(c) for c in content]
+            new_content[-1] = {
+                **new_content[-1],
+                "cache_control": self._CACHE_CONTROL_1H,
+            }
+            new_last = {**last, "content": new_content}
+        else:
+            return new_messages
+
+        new_messages[-1] = new_last
+        return new_messages
+
     def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
         """Convert a stored history record into a memory entry, prepending
         the message's original timestamp so the LLM knows when it happened.
@@ -313,6 +380,10 @@ class BasicMemoryAgent(AgentInterface):
     def _to_messages(self, input_data: BatchInput) -> List[Dict[str, Any]]:
         """Prepare messages for LLM API call."""
         messages = self._memory.copy()
+        # Cache breakpoint goes on the last historical message — everything
+        # up to and including it gets cached by Anthropic, while the fresh
+        # user input appended below stays uncached. No-op for non-Claude.
+        messages = self._attach_cache_breakpoint(messages)
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
         if text_prompt:
@@ -370,7 +441,7 @@ class BasicMemoryAgent(AgentInterface):
         current_assistant_message_content = []
 
         while True:
-            stream = self._llm.chat_completion(messages, self._build_runtime_system(), tools=tools)
+            stream = self._llm.chat_completion(messages, self._build_system_for_llm(), tools=tools)
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
 
@@ -714,7 +785,7 @@ class BasicMemoryAgent(AgentInterface):
             else:
                 logger.info("Starting simple chat completion.")
                 token_stream = self._llm.chat_completion(
-                    messages, self._build_runtime_system()
+                    messages, self._build_system_for_llm()
                 )
                 complete_response = ""
                 async for event in token_stream:
