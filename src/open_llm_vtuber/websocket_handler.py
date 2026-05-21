@@ -316,6 +316,8 @@ class WebSocketHandler:
                 if remaining <= 0:
                     self._active_history_uid.pop(conf_uid, None)
                     self._session_ref_count.pop(conf_uid, None)
+                    if context.memory_manager:
+                        context.memory_manager.set_current_session("")
                 else:
                     self._session_ref_count[conf_uid] = remaining
 
@@ -474,6 +476,8 @@ class WebSocketHandler:
                 self._session_ref_count[conf_uid] = (
                     self._session_ref_count.get(conf_uid, 0) + 1
                 )
+                if context.memory_manager:
+                    context.memory_manager.set_current_session(global_uid)
                 mem_cfg = context.system_config.persistent_memory
                 if mem_cfg.enabled and hasattr(
                     context.agent_engine, "set_memory_from_recent_histories"
@@ -512,6 +516,8 @@ class WebSocketHandler:
                     )
                 self._active_history_uid.pop(conf_uid, None)
                 self._session_ref_count.pop(conf_uid, None)
+                if context.memory_manager:
+                    context.memory_manager.set_current_session("")
             else:
                 self._session_ref_count[conf_uid] = old_ref_count
 
@@ -521,6 +527,8 @@ class WebSocketHandler:
             context.history_uid = history_uid
             self._active_history_uid[conf_uid] = history_uid
             self._session_ref_count[conf_uid] = 1
+            if context.memory_manager:
+                context.memory_manager.set_current_session(history_uid)
 
             mem_cfg = context.system_config.persistent_memory
             if mem_cfg.enabled and hasattr(
