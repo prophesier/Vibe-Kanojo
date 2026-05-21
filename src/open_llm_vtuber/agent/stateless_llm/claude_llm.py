@@ -4,7 +4,7 @@ for language generation.
 """
 
 import json
-from typing import AsyncIterator, List, Dict, Any
+from typing import AsyncIterator, List, Dict, Any, Union
 
 from loguru import logger
 from anthropic import AsyncAnthropic, NOT_GIVEN
@@ -32,9 +32,13 @@ class AsyncLLM(StatelessLLMInterface):
         self.model = model
         self.system = system
 
-        # Initialize Claude client
+        # Initialize Claude client. The extended-cache-ttl beta header lets us
+        # request 1-hour prompt cache TTL on cache_control blocks; without it
+        # only the default 5-minute TTL is accepted.
         self.client = AsyncAnthropic(
-            api_key=llm_api_key, base_url=base_url if base_url else None
+            api_key=llm_api_key,
+            base_url=base_url if base_url else None,
+            default_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"},
         )
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
@@ -84,7 +88,7 @@ class AsyncLLM(StatelessLLMInterface):
     async def chat_completion(
         self,
         messages: List[Dict[str, Any]],
-        system: str = None,
+        system: Union[str, List[Dict[str, Any]]] = None,
         tools: List[Dict[str, Any]] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -93,7 +97,9 @@ class AsyncLLM(StatelessLLMInterface):
 
         Parameters:
         - messages (List[Dict[str, Any]]): The list of messages to send to the API.
-        - system (str, optional): System prompt to use for this completion.
+        - system (Union[str, List[Dict[str, Any]]], optional): System prompt.
+          Pass a list of content blocks to enable prompt caching via
+          ``cache_control`` markers; pass a plain string for a normal request.
         - tools (List[Dict[str, Any]], optional): List of tools available.
 
         Yields:
@@ -132,6 +138,19 @@ class AsyncLLM(StatelessLLMInterface):
                 async for event in stream:
                     if event.type == "message_start":
                         logger.debug("Stream: message_start")
+                        usage = getattr(event.message, "usage", None)
+                        if usage:
+                            fresh = getattr(usage, "input_tokens", 0) or 0
+                            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+                            cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                            total_input = fresh + cache_read + cache_write
+                            hit_pct = (
+                                (cache_read / total_input * 100) if total_input else 0
+                            )
+                            logger.info(
+                                f"[cache] read={cache_read} write={cache_write} "
+                                f"fresh={fresh} (hit {hit_pct:.0f}%)"
+                            )
                         yield {
                             "type": "message_start",
                             "data": event.message.model_dump(exclude_none=True),
