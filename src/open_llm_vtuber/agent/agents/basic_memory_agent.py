@@ -194,25 +194,21 @@ class BasicMemoryAgent(AgentInterface):
         """Timestamp tag for messages happening right now."""
         return cls._format_timestamp(datetime.now().isoformat(timespec="seconds"))
 
-    def _build_runtime_system(self) -> str:
-        """Return the dynamic system prompt: persona + memory block.
+    _TIMESTAMP_NOTE = (
+        "Note on timestamps: user messages are prefixed with "
+        "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know when each message "
+        "was sent. These tags are metadata for your reference only — do NOT "
+        "include any such timestamp tag in your own replies."
+    )
 
-        Per-turn time is injected directly into user messages (see
-        _to_text_prompt) rather than the system prompt, so the LLM can
-        distinguish when each turn occurred instead of treating the entire
-        conversation as 'now'.
-        """
+    def _build_runtime_system(self) -> str:
+        """Return the full system prompt as a plain string (used for non-Claude LLMs)."""
         parts = [self._system]
         if self._memory_manager:
             mem_block = self._memory_manager.get_memory_prompt()
             if mem_block:
                 parts.append(mem_block)
-        parts.append(
-            "Note on timestamps: user messages are prefixed with "
-            "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know when each message "
-            "was sent. These tags are metadata for your reference only — do NOT "
-            "include any such timestamp tag in your own replies."
-        )
+        parts.append(self._TIMESTAMP_NOTE)
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -227,20 +223,45 @@ class BasicMemoryAgent(AgentInterface):
     def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
         """Return system prompt in the right shape for the active LLM.
 
-        For Claude, returns a list with one cache-controlled text block so
-        the whole system prompt (persona + memory + timestamp note) is
-        cached server-side. For other LLMs, returns the plain string.
+        For Claude, returns up to 3 separately cache-controlled blocks:
+          1. Persona + timestamp note  (ultra-stable, changes only on character edit)
+          2. Facts                     (changes only on fact extraction)
+          3. Diaries                   (changes only when a new diary is generated)
+        Combined with the message-history breakpoint (_attach_cache_breakpoint),
+        this uses up to 4 of Anthropic's allowed cache checkpoints.
+
+        For other LLMs, returns the plain combined string.
         """
-        text = self._build_runtime_system()
-        if self._is_claude_llm():
-            return [
-                {
-                    "type": "text",
-                    "text": text,
-                    "cache_control": self._CACHE_CONTROL_1H,
-                }
-            ]
-        return text
+        if not self._is_claude_llm():
+            return self._build_runtime_system()
+
+        blocks: List[Dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": "\n\n".join([self._system, self._TIMESTAMP_NOTE]),
+                "cache_control": self._CACHE_CONTROL_1H,
+            }
+        ]
+        if self._memory_manager:
+            facts_text = self._memory_manager.get_facts_prompt()
+            if facts_text:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": facts_text,
+                        "cache_control": self._CACHE_CONTROL_1H,
+                    }
+                )
+            diaries_text = self._memory_manager.get_diaries_prompt()
+            if diaries_text:
+                blocks.append(
+                    {
+                        "type": "text",
+                        "text": diaries_text,
+                        "cache_control": self._CACHE_CONTROL_1H,
+                    }
+                )
+        return blocks
 
     def _attach_cache_breakpoint(
         self, messages: List[Dict[str, Any]]
@@ -310,9 +331,18 @@ class BasicMemoryAgent(AgentInterface):
                 logger.warning(f"Skipping invalid message from history: {msg}")
         logger.info(f"Loaded {len(self._memory)} messages from history.")
 
-    def set_memory_from_recent_histories(self, conf_uid: str, n: int) -> None:
-        """Load the N most recent session histories into memory (oldest→newest)."""
-        sessions = get_recent_histories(conf_uid, n)
+    def set_memory_from_recent_histories(
+        self, conf_uid: str, n: int, current_uid: str = ""
+    ) -> None:
+        """Load the N most recent COMPLETED session histories into memory, then
+        append any messages already in the current (in-progress) session.
+
+        Keeping the current session separate from the N-session window ensures
+        that the sliding window membership is identical regardless of when
+        different clients connect during a shared session, which prevents
+        spurious cache misses on Anthropic's prompt cache.
+        """
+        sessions = get_recent_histories(conf_uid, n, exclude_uid=current_uid)
         self._memory = []
         loaded_uids = []
         for uid, messages in sessions:
@@ -321,12 +351,26 @@ class BasicMemoryAgent(AgentInterface):
                 entry = self._msg_from_history_record(msg)
                 if entry:
                     self._memory.append(entry)
+
+        # Always append the current session last so conversation continuity
+        # is preserved even for clients that join mid-session.
+        if current_uid:
+            current_messages = get_history(conf_uid, current_uid)
+            if current_messages:
+                for msg in current_messages:
+                    entry = self._msg_from_history_record(msg)
+                    if entry:
+                        self._memory.append(entry)
+            loaded_uids.append(current_uid)
+
         if self._memory_manager:
-            # Diaries for these sessions will be suppressed from the injected
-            # memory block — the full conversation is already in _memory.
+            # Diaries for all loaded sessions are suppressed — their content
+            # is already present verbatim in self._memory.
             self._memory_manager.set_active_sessions(loaded_uids)
         logger.info(
-            f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)."
+            f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)"
+            + (" + current session" if current_uid else "")
+            + "."
         )
 
     def handle_interrupt(self, heard_response: str) -> None:
