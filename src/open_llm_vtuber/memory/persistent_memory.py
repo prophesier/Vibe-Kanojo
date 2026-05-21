@@ -10,21 +10,33 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Set
 from loguru import logger
 
+# Matches timestamp tags injected by _to_text_prompt: "[YYYY-MM-DD HH:MM:SS Weekday]"
+_TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE)
+
 
 _FACT_EXTRACT_SYSTEM = (
-    "あなたは記憶アシスタントです。会話からユーザーに関する重要で持続的な事実を抽出してください。"
-    "対象の例：個人情報、好み、人間関係、進行中のプロジェクト、使用しているツールや技術、"
-    "約束・合意事項、ユーザーの目標や課題。"
-    "それ以外でも、今後の会話で役立つとあなたが判断した事実はすべて含めてください。"
-    "一時的な雑談や、文脈なしでは意味をなさない情報はスキップしてください。\n"
-    "既存の事実リストが提供される場合、それらを繰り返さないでください。新しい情報のみ抽出してください。\n"
-    "出力はJSONの配列のみ: "
-    '[{"fact": "ユーザーはOLV向けDiscordブリッジを開発中"}, {"fact": "ユーザーはWindowsを使用している"}]\n'
-    "保存する価値のある新しい事実がない場合は、空の配列を出力してください: []"
+    "あなたは記憶アシスタントです。会話からユーザーに関する持続的な事実を抽出してください。\n"
+    "抽出すべき情報（これに限らない）：\n"
+    "- 個人情報：出身地、学歴（学部・専攻など）、職業、年齢層\n"
+    "- 好み・趣味・習慣\n"
+    "- 人間関係\n"
+    "- 進行中のプロジェクト、使用ツール・技術\n"
+    "- 約束・合意事項\n"
+    "- ユーザーの目標・課題・悩み\n\n"
+    "重要なガイドライン：\n"
+    "- 会話の大半が技術的な内容でも、その中に1回だけ出てきたユーザー自身の情報も必ず抽出する\n"
+    "- 中国語・日本語・英語が混在していても、すべての言語の発言を対象にする\n"
+    "- 判断に迷うなら抽出する（省略するより多めに拾う方が良い）\n"
+    "- 真に一時的・文脈依存で今後役に立たない情報だけをスキップする\n\n"
+    "既存の事実リストが提供される場合、それらを繰り返さないこと。新しい情報のみ抽出してください。\n"
+    "出力はJSONの配列のみ（日本語で記述）: "
+    '[{"fact": "ユーザーは物理学部出身"}, {"fact": "ユーザーはWindowsを使用している"}]\n'
+    "本当に新しい事実が1件もない場合のみ、空の配列を出力してください: []"
 )
 
 _DIARY_SYSTEM = (
@@ -124,6 +136,7 @@ class PersistentMemoryManager:
                 f"[memory] Extracting facts from {len(recent_messages)} messages "
                 f"({len(conv_text)} chars conversation, {len(diary_context)} chars diary context)"
             )
+            logger.debug(f"[memory] Fact extraction conversation preview: {conv_text[:400]!r}")
             raw = await self._call_llm(llm, _FACT_EXTRACT_SYSTEM, prompt)
             logger.info(f"[memory] Fact-extraction LLM raw output: {raw[:500]!r}")
             new_facts = self._parse_json_list(raw)
@@ -386,6 +399,9 @@ class PersistentMemoryManager:
                 content = " ".join(
                     part.get("text", "") for part in content if isinstance(part, dict)
                 )
+            # Strip timestamp tags that _to_text_prompt prepends to user messages
+            # so the fact-extraction LLM focuses on the actual speech content.
+            content = _TIMESTAMP_RE.sub("", content).strip()
             if content:
                 label = "ユーザー" if role in ("user", "human") else "AI"
                 lines.append(f"{label}: {content}")
