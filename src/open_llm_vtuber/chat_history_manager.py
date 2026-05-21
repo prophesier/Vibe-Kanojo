@@ -354,16 +354,23 @@ def modify_latest_message(
 
 
 def get_recent_histories(
-    conf_uid: str, n: int
+    conf_uid: str, n: int, exclude_uid: str = ""
 ) -> List[tuple[str, List[HistoryMessage]]]:
     """Return the N most recent non-empty histories, ordered oldest→newest.
 
     Each element is (history_uid, messages).
+    exclude_uid is skipped so callers can keep the active session separate
+    and append it themselves, ensuring the sliding window membership is
+    stable across reconnects (preventing spurious cache invalidations).
     """
     history_list = get_history_list(conf_uid)  # already newest-first
     result = []
-    for entry in history_list[:n]:
+    for entry in history_list:
+        if len(result) >= n:
+            break
         uid = entry["uid"]
+        if uid == exclude_uid:
+            continue
         messages = get_history(conf_uid, uid)
         if messages:
             result.append((uid, messages))

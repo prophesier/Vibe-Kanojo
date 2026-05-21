@@ -485,6 +485,7 @@ class WebSocketHandler:
                     context.agent_engine.set_memory_from_recent_histories(
                         conf_uid=conf_uid,
                         n=mem_cfg.recent_sessions,
+                        current_uid=global_uid,
                     )
                 else:
                     context.agent_engine.set_memory_from_history(
@@ -537,6 +538,7 @@ class WebSocketHandler:
                 context.agent_engine.set_memory_from_recent_histories(
                     conf_uid=conf_uid,
                     n=mem_cfg.recent_sessions,
+                    current_uid=history_uid,
                 )
             else:
                 context.agent_engine.set_memory_from_history(
