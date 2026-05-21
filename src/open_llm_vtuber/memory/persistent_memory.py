@@ -196,16 +196,20 @@ class PersistentMemoryManager:
             self.extract_facts_async(history_messages, llm),
             return_exceptions=True,
         )
+        # Mark diary so backfill knows this session's facts were already extracted.
+        self._mark_diary_facts_extracted(history_uid)
 
     async def backfill_async(self, conf_uid: str, llm: Any) -> None:
         """Generate diaries and facts for sessions that don't have them yet.
 
-        Diary backfill: scans chat_history/{conf_uid}/diaries/ and creates a
-        diary for each session that has messages but no diary file.
-        Fact backfill: if facts.json doesn't exist yet, runs a one-time
-        extraction across all historical sessions.
-        Both are idempotent — running again is a no-op once everything exists.
-        Guarded by a process-wide lock so concurrent connections don't double up.
+        Diary backfill: creates a diary for each session that has messages but
+        no diary file yet.
+        Fact backfill: processes any diary that doesn't carry a
+        ``"facts_extracted": true`` marker, using the sliding-window approach
+        (recent N sessions in full + older diary summaries) so the prompt stays
+        bounded regardless of how many sessions exist.
+        Both passes are idempotent. Guarded by a process-wide lock so concurrent
+        connections don't kick off duplicate backfills for the same character.
         """
         if conf_uid in PersistentMemoryManager._backfill_in_progress:
             return
@@ -233,61 +237,67 @@ class PersistentMemoryManager:
                         await self.create_diary_async(messages, uid, llm)
                 logger.info("[memory] Diary backfill complete.")
 
-            # --- Fact backfill (one-time, only when facts.json doesn't exist) ---
-            # Uses the sliding-window range of recent sessions in full, plus
-            # diary summaries for older sessions. This keeps the prompt
-            # bounded by config (recent_sessions + diary_count) rather than
-            # ballooning if facts.json gets deleted with lots of history.
-            if not os.path.exists(self._facts_path):
-                # history_list is newest-first; take the N most recent sessions
-                recent_entries = history_list[: self._recent_sessions]
-                recent_uids = {e["uid"] for e in recent_entries}
-                recent_messages: List[Dict[str, Any]] = []
-                # Reverse so messages flow oldest→newest within the window
-                for entry in reversed(recent_entries):
-                    msgs = get_history(conf_uid, entry["uid"])
-                    if msgs:
-                        recent_messages.extend(msgs)
+            # --- Fact backfill: sessions whose diary lacks facts_extracted=True ---
+            # This handles the server-restart case where end_of_session_async
+            # never ran for the last active session.
+            unprocessed_uids: List[str] = []
+            if os.path.isdir(self._diaries_dir):
+                for fname in sorted(os.listdir(self._diaries_dir)):
+                    if not fname.endswith(".json"):
+                        continue
+                    path = os.path.join(self._diaries_dir, fname)
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            d = json.load(f)
+                        if not d.get("facts_extracted"):
+                            unprocessed_uids.append(fname[:-5])
+                    except Exception:
+                        continue
 
-                # Pull diary summaries for older sessions (excluding the ones
-                # already covered by the full-message window above).
-                older_diary_entries = []
-                if os.path.isdir(self._diaries_dir):
-                    for fname in os.listdir(self._diaries_dir):
-                        if not fname.endswith(".json"):
-                            continue
-                        diary_uid = fname[:-5]
-                        if diary_uid in recent_uids:
-                            continue
-                        try:
-                            with open(
-                                os.path.join(self._diaries_dir, fname),
-                                "r",
-                                encoding="utf-8",
-                            ) as f:
-                                entry = json.load(f)
-                            if isinstance(entry, dict) and "content" in entry:
-                                entry.setdefault("history_uid", diary_uid)
-                                older_diary_entries.append(entry)
-                        except Exception:
-                            continue
-                older_diary_entries.sort(key=lambda e: e.get("history_uid", ""))
+            if not unprocessed_uids:
+                return
 
-                diary_context = "\n\n".join(
-                    f"[{d.get('date', '')}]\n{d['content']}"
-                    for d in older_diary_entries
+            logger.info(
+                f"[memory] {len(unprocessed_uids)} session(s) pending fact extraction."
+            )
+
+            # Use the most recent N unprocessed sessions in full; the rest as
+            # diary summaries to keep token cost bounded.
+            unprocessed_uids.sort()  # lexicographic = chronological
+            recent_uids = set(unprocessed_uids[-self._recent_sessions :])
+            recent_messages: List[Dict[str, Any]] = []
+            for uid in unprocessed_uids[-self._recent_sessions :]:
+                msgs = get_history(conf_uid, uid)
+                if msgs:
+                    recent_messages.extend(msgs)
+
+            older_parts: List[str] = []
+            for uid in unprocessed_uids:
+                if uid in recent_uids:
+                    continue
+                path = os.path.join(self._diaries_dir, f"{uid}.json")
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        d = json.load(f)
+                    if "content" in d:
+                        older_parts.append(f"[{d.get('date', uid)}]\n{d['content']}")
+                except Exception:
+                    continue
+            diary_context = "\n\n".join(older_parts)
+
+            if recent_messages or diary_context:
+                logger.info(
+                    f"[memory] Running fact extraction backfill "
+                    f"({len(recent_uids)} recent session(s) full, "
+                    f"{len(older_parts)} older diary summary/summaries)…"
                 )
-
-                if recent_messages or diary_context:
-                    logger.info(
-                        f"[memory] facts.json not found — running one-time fact "
-                        f"extraction (recent sessions: {len(recent_entries)}, "
-                        f"older diaries: {len(older_diary_entries)})…"
-                    )
-                    await self.extract_facts_async(
-                        recent_messages, llm, diary_context=diary_context
-                    )
-                    logger.info("[memory] Fact backfill complete.")
+                await self.extract_facts_async(
+                    recent_messages, llm, diary_context=diary_context
+                )
+                # Mark all processed diaries so this doesn't repeat next startup.
+                for uid in unprocessed_uids:
+                    self._mark_diary_facts_extracted(uid)
+                logger.info("[memory] Fact backfill complete.")
         except Exception as e:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
@@ -311,6 +321,21 @@ class PersistentMemoryManager:
         os.makedirs(self._base_dir, exist_ok=True)
         with open(self._facts_path, "w", encoding="utf-8") as f:
             json.dump(facts, f, ensure_ascii=False, indent=2)
+
+    def _mark_diary_facts_extracted(self, history_uid: str) -> None:
+        """Set facts_extracted=True on the diary file for history_uid (no-op if missing)."""
+        diary_path = os.path.join(self._diaries_dir, f"{history_uid}.json")
+        if not os.path.exists(diary_path):
+            return
+        try:
+            with open(diary_path, "r", encoding="utf-8") as f:
+                entry = json.load(f)
+            if not entry.get("facts_extracted"):
+                entry["facts_extracted"] = True
+                with open(diary_path, "w", encoding="utf-8") as f:
+                    json.dump(entry, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _load_recent_diaries(self) -> List[Dict[str, Any]]:
         if not os.path.isdir(self._diaries_dir):

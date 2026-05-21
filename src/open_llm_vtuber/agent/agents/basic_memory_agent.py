@@ -283,15 +283,20 @@ class BasicMemoryAgent(AgentInterface):
         return new_messages
 
     def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
-        """Convert a stored history record into a memory entry, prepending
-        the message's original timestamp so the LLM knows when it happened.
+        """Convert a stored history record into a memory entry.
+
+        Timestamps are prepended only to user messages so the LLM knows when
+        each turn occurred.  Omitting them from assistant turns prevents the
+        model from mimicking the format in its own replies.
         """
         role = "user" if msg["role"] == "human" else "assistant"
         content = msg.get("content")
         if not isinstance(content, str) or not content:
             return None
-        tag = self._format_timestamp(msg.get("timestamp", ""))
-        return {"role": role, "content": f"{tag} {content}".strip()}
+        if role == "user":
+            tag = self._format_timestamp(msg.get("timestamp", ""))
+            content = f"{tag} {content}".strip()
+        return {"role": role, "content": content}
 
     def set_memory_from_history(self, conf_uid: str, history_uid: str) -> None:
         """Load memory from a single chat history file."""
