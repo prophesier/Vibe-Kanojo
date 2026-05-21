@@ -433,9 +433,31 @@ class WebSocketHandler:
     async def _handle_create_history(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
-        """Handle creation of new chat history"""
+        """Handle creation or reuse of chat history.
+
+        If the context already has an active history_uid, reuse it. This
+        prevents a second client (e.g. web UI connecting after Discord) from
+        prematurely ending the active session by auto-issuing this message
+        on connect. Pass {"force": true} to override and force a new session.
+        """
         context = self.client_contexts[client_uid]
         conf_uid = context.character_config.conf_uid
+        force = bool(data.get("force", False)) if isinstance(data, dict) else False
+
+        # Reuse the active session unless caller explicitly forces a new one.
+        if context.history_uid and not force:
+            logger.info(
+                f"Reusing active history {context.history_uid} for client {client_uid}"
+            )
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "new-history-created",
+                        "history_uid": context.history_uid,
+                    }
+                )
+            )
+            return
 
         # At session end: generate diary + extract facts concurrently (fire-and-forget)
         if context.memory_manager and context.history_uid:
