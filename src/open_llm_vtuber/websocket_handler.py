@@ -509,10 +509,11 @@ class WebSocketHandler:
                 from .chat_history_manager import get_history as _get_history
                 old_messages = _get_history(conf_uid, old_uid)
                 llm = getattr(context.agent_engine, "_llm", None)
+                persona = getattr(context.agent_engine, "_system", "") or ""
                 if old_messages and llm:
                     asyncio.create_task(
                         context.memory_manager.end_of_session_async(
-                            old_messages, old_uid, llm
+                            old_messages, old_uid, llm, persona=persona
                         )
                     )
                 self._active_history_uid.pop(conf_uid, None)
