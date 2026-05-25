@@ -45,8 +45,22 @@ _DIARY_SYSTEM = (
     "含めるべき内容：主なトピック、ユーザーの感情状態、約束や合意事項、全体的な雰囲気。"
     "セッション情報に開始・終了時刻が含まれる場合、「今日」「本日」という曖昧な表現を避け、"
     "「〇〇時頃」「〇〇時から〇〇時の会話で」のように具体的な時刻を使って書いてください。"
+    "人格設定が提供されている場合、その口調・性格・思考パターンを反映した文体で書いてください。"
     "自然な文体で書いてください。[neutral]などの表現タグは含めないでください。"
     "日記の本文のみを出力し、他は何も出力しないでください。"
+)
+
+_FACT_PRUNE_SYSTEM = (
+    "あなたは記憶アシスタントです。ユーザーに関する事実リストが保存上限を超えました。"
+    "AIキャラクターの視点から、最も重要度の低い項目を選んで削除する必要があります。\n\n"
+    "判断基準：\n"
+    "- 残すべき：個人的に重要な情報（出身、学歴、職業、人間関係、価値観など）\n"
+    "- 残すべき：長期的に変わらない情報（性格、趣味、習慣など）\n"
+    "- 削除対象：一時的・状況依存の情報（今やっているタスク、その時の気分など）\n"
+    "- 削除対象：同じトピックで重複する場合は古い方\n"
+    "- 削除対象：人格設定の視点から、ユーザーとの関係に最も影響が薄いもの\n\n"
+    "削除するインデックス（数字）のみをJSON配列で出力してください: [3, 7, 12]\n"
+    "他のテキストは一切出力しないこと。"
 )
 
 
@@ -124,13 +138,16 @@ class PersistentMemoryManager:
         recent_messages: List[Dict[str, Any]],
         llm: Any,
         diary_context: str = "",
+        persona: str = "",
     ) -> None:
         """Extract new facts from recent messages and append to facts.json.
 
         Runs as a fire-and-forget background task. ``diary_context`` is an
         optional summary of older sessions (used during backfill) so the LLM
         has context beyond the sliding window without burning tokens on full
-        message history.
+        message history. ``persona`` is the character's system prompt; when
+        provided it is prepended so fact selection and pruning reflect what
+        the character would consider memorable.
         """
         try:
             existing = self._load_facts()
@@ -153,7 +170,9 @@ class PersistentMemoryManager:
                 f"({len(conv_text)} chars conversation, {len(diary_context)} chars diary context)"
             )
             logger.debug(f"[memory] Fact extraction conversation preview: {conv_text[:400]!r}")
-            raw = await self._call_llm(llm, _FACT_EXTRACT_SYSTEM, prompt)
+            raw = await self._call_llm(
+                llm, self._with_persona(_FACT_EXTRACT_SYSTEM, persona), prompt
+            )
             logger.info(f"[memory] Fact-extraction LLM raw output: {raw[:500]!r}")
             new_facts = self._parse_json_list(raw)
             if not new_facts:
@@ -163,9 +182,12 @@ class PersistentMemoryManager:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             tagged = [{"fact": f["fact"], "updated": now} for f in new_facts if "fact" in f]
             merged = existing + tagged
-            # Trim to max_facts keeping newest
+            # Smart trim: ask the LLM (in-character) to drop least-important
+            # entries when over the cap, instead of blindly dropping by age.
             if len(merged) > self._max_facts:
-                merged = merged[-self._max_facts :]
+                merged = await self._prune_facts_with_llm(
+                    merged, self._max_facts, llm, persona=persona
+                )
             self._save_facts(merged)
             logger.info(
                 f"[memory] Added {len(tagged)} new fact(s) → {self._facts_path} "
@@ -179,8 +201,13 @@ class PersistentMemoryManager:
         history_messages: List[Dict[str, Any]],
         history_uid: str,
         llm: Any,
+        persona: str = "",
     ) -> None:
-        """Generate and save a diary entry for the finished session."""
+        """Generate and save a diary entry for the finished session.
+
+        ``persona`` is the character's system prompt; when provided the diary
+        is written in the character's voice rather than a generic narrator.
+        """
         try:
             if not history_messages:
                 return
@@ -202,7 +229,9 @@ class PersistentMemoryManager:
             if header_parts:
                 conv_text = "[セッション情報]\n" + "\n".join(header_parts) + "\n\n" + conv_text
 
-            content = await self._call_llm(llm, _DIARY_SYSTEM, conv_text)
+            content = await self._call_llm(
+                llm, self._with_persona(_DIARY_SYSTEM, persona), conv_text
+            )
             content = content.strip()
             if not content:
                 return
@@ -228,21 +257,24 @@ class PersistentMemoryManager:
         history_messages: List[Dict[str, Any]],
         history_uid: str,
         llm: Any,
+        persona: str = "",
     ) -> None:
         """Run diary generation and fact extraction concurrently at session end.
 
         Both tasks receive the full session history so neither is starved of
-        context. Runs as a fire-and-forget background task.
+        context. ``persona`` is forwarded so the diary is in-character and
+        fact selection / pruning reflect the character's perspective.
+        Runs as a fire-and-forget background task.
         """
         await asyncio.gather(
-            self.create_diary_async(history_messages, history_uid, llm),
-            self.extract_facts_async(history_messages, llm),
+            self.create_diary_async(history_messages, history_uid, llm, persona=persona),
+            self.extract_facts_async(history_messages, llm, persona=persona),
             return_exceptions=True,
         )
         # Mark diary so backfill knows this session's facts were already extracted.
         self._mark_diary_facts_extracted(history_uid)
 
-    async def backfill_async(self, conf_uid: str, llm: Any) -> None:
+    async def backfill_async(self, conf_uid: str, llm: Any, persona: str = "") -> None:
         """Generate diaries and facts for sessions that don't have them yet.
 
         Diary backfill: creates a diary for each session that has messages but
@@ -282,7 +314,7 @@ class PersistentMemoryManager:
                 for uid in missing_diaries:
                     messages = get_history(conf_uid, uid)
                     if messages:
-                        await self.create_diary_async(messages, uid, llm)
+                        await self.create_diary_async(messages, uid, llm, persona=persona)
                 logger.info("[memory] Diary backfill complete.")
 
             # --- Fact backfill: sessions whose diary lacks facts_extracted=True ---
@@ -343,7 +375,7 @@ class PersistentMemoryManager:
                     f"{len(older_parts)} older diary summary/summaries)…"
                 )
                 await self.extract_facts_async(
-                    recent_messages, llm, diary_context=diary_context
+                    recent_messages, llm, diary_context=diary_context, persona=persona
                 )
                 # Mark all processed diaries so this doesn't repeat next startup.
                 for uid in unprocessed_uids:
@@ -483,6 +515,71 @@ class PersistentMemoryManager:
             elif isinstance(event, dict) and event.get("type") == "text_delta":
                 result += event.get("text", "")
         return result
+
+    @staticmethod
+    def _with_persona(base_system: str, persona: str) -> str:
+        """Prepend the character persona block to a memory-task system prompt."""
+        if not persona or not persona.strip():
+            return base_system
+        return f"あなたの人格設定:\n{persona.strip()}\n\n---\n\n{base_system}"
+
+    @staticmethod
+    def _parse_int_list(text: str) -> List[int]:
+        """Extract a JSON array of integers from LLM output."""
+        text = text.strip()
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1:
+            return []
+        try:
+            data = json.loads(text[start : end + 1])
+            return [int(x) for x in data if isinstance(x, (int, float))]
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return []
+
+    async def _prune_facts_with_llm(
+        self,
+        facts: List[Dict[str, Any]],
+        target_count: int,
+        llm: Any,
+        persona: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Ask the LLM to drop the N least-important facts (N = excess).
+
+        Falls back to FIFO trimming (drop oldest) if the LLM output is
+        malformed or returns the wrong number of indices.
+        """
+        excess = len(facts) - target_count
+        if excess <= 0:
+            return facts
+        numbered = "\n".join(f"{i}: {f['fact']}" for i, f in enumerate(facts))
+        prompt = (
+            f"現在{len(facts)}個の事実があり、上限は{target_count}個です。\n"
+            f"最も重要度の低い{excess}個を選んで削除してください。\n\n"
+            f"事実リスト:\n{numbered}\n\n"
+            f"削除する{excess}個のインデックスをJSON配列で出力: [n, n, ...]"
+        )
+        try:
+            raw = await self._call_llm(
+                llm, self._with_persona(_FACT_PRUNE_SYSTEM, persona), prompt
+            )
+            indices = sorted(
+                {i for i in self._parse_int_list(raw) if 0 <= i < len(facts)}
+            )
+            if len(indices) != excess:
+                logger.warning(
+                    f"[memory] Fact-prune LLM returned {len(indices)} indices, "
+                    f"expected {excess}; falling back to FIFO trimming."
+                )
+                return facts[-target_count:]
+            dropped = [facts[i]["fact"] for i in indices]
+            logger.info(f"[memory] LLM-pruned {excess} fact(s): {dropped}")
+            return [f for i, f in enumerate(facts) if i not in set(indices)]
+        except Exception as e:
+            logger.warning(
+                f"[memory] Fact pruning failed ({e}); falling back to FIFO trimming."
+            )
+            return facts[-target_count:]
 
     @staticmethod
     def _parse_json_list(text: str) -> List[Dict[str, Any]]:
