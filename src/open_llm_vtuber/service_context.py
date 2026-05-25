@@ -257,10 +257,11 @@ class ServiceContext:
         # connection — only the first one will actually do work.
         if self.memory_manager:
             llm = getattr(self.agent_engine, "_llm", None)
+            persona = getattr(self.agent_engine, "_system", "") or ""
             if llm:
                 asyncio.create_task(
                     self.memory_manager.backfill_async(
-                        self.character_config.conf_uid, llm
+                        self.character_config.conf_uid, llm, persona=persona
                     )
                 )
 
