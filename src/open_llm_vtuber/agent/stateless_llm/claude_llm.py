@@ -12,6 +12,26 @@ from anthropic import AsyncAnthropic, NOT_GIVEN
 from .stateless_llm_interface import StatelessLLMInterface
 
 
+def _sniff_image_media_type(base64_data: str, declared: str) -> str:
+    """Return the actual media type by inspecting base64 magic bytes.
+
+    Anthropic strictly validates the declared media_type against image bytes
+    and rejects mismatches with HTTP 400. Discord (and browser paste of
+    screenshots) sometimes mislabel PNG as JPEG, so we override the declared
+    type when the magic bytes contradict it.
+    """
+    sample = base64_data[:24]
+    if sample.startswith("iVBORw0KGgo"):
+        return "image/png"
+    if sample.startswith("/9j/"):
+        return "image/jpeg"
+    if sample.startswith("R0lGOD"):
+        return "image/gif"
+    if sample.startswith("UklGR") and "V0VCUF" in base64_data[:64]:
+        return "image/webp"
+    return declared
+
+
 class AsyncLLM(StatelessLLMInterface):
     def __init__(
         self,
@@ -57,7 +77,17 @@ class AsyncLLM(StatelessLLMInterface):
                     # Split 'data:image/jpeg;base64,/9j/4AAQ...' into parts
                     header, base64_data = data_url.split(",", 1)
                     # Extract media type from 'data:image/jpeg;base64'
-                    media_type = header.split(":")[1].split(";")[0]
+                    declared_media_type = header.split(":")[1].split(";")[0]
+                    # Discord (and pasted screenshots) sometimes mislabel PNG
+                    # as JPEG; Anthropic rejects mismatches, so we sniff the
+                    # actual bytes and correct the declaration here.
+                    media_type = _sniff_image_media_type(
+                        base64_data, declared_media_type
+                    )
+                    if media_type != declared_media_type:
+                        logger.debug(
+                            f"Image media type corrected: {declared_media_type} → {media_type}"
+                        )
 
                     new_content.append(
                         {
