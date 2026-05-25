@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Set
 from loguru import logger
@@ -52,13 +53,19 @@ _DIARY_SYSTEM = (
 
 _FACT_PRUNE_SYSTEM = (
     "あなたは記憶アシスタントです。ユーザーに関する事実リストが保存上限を超えました。"
-    "AIキャラクターの視点から、最も重要度の低い項目を選んで削除する必要があります。\n\n"
-    "判断基準：\n"
-    "- 残すべき：個人的に重要な情報（出身、学歴、職業、人間関係、価値観など）\n"
-    "- 残すべき：長期的に変わらない情報（性格、趣味、習慣など）\n"
-    "- 削除対象：一時的・状況依存の情報（今やっているタスク、その時の気分など）\n"
-    "- 削除対象：同じトピックで重複する場合は古い方\n"
-    "- 削除対象：人格設定の視点から、ユーザーとの関係に最も影響が薄いもの\n\n"
+    "AIキャラクターの視点から、最も価値の低い項目を選んで削除する必要があります。\n\n"
+    "各事実には更新日時が付いています。以下の優先順位で削除対象を選んでください：\n\n"
+    "【優先的に削除】\n"
+    "- 新しい事実によって上書き・無効化された古い情報\n"
+    "  （例: 古い「プロジェクトA取り組み中」と新しい「プロジェクトBに移行」が両方ある場合、古い方）\n"
+    "- 時間の経過により時効・陳腐化した情報（古い日時のその場限りのタスク・状況など）\n"
+    "- 一時的・状況依存で今後参照する可能性が低い情報\n"
+    "- 同じ内容の重複（古い方）\n"
+    "- 人格設定の視点から、ユーザーとの関係に影響が薄い些細な情報\n\n"
+    "【残すべき】\n"
+    "- 出身、学歴、職業、人間関係など長期的に変わらない個人情報\n"
+    "- 価値観・性格・趣味・習慣など\n"
+    "- 新しい日時の情報（古い情報より優先）\n\n"
     "削除するインデックス（数字）のみをJSON配列で出力してください: [3, 7, 12]\n"
     "他のテキストは一切出力しないこと。"
 )
@@ -402,6 +409,14 @@ class PersistentMemoryManager:
 
     def _save_facts(self, facts: List[Dict[str, Any]]) -> None:
         os.makedirs(self._base_dir, exist_ok=True)
+        # Backup current file before overwriting so accidental pruning can be
+        # manually rolled back by renaming facts.json.bak → facts.json.
+        if os.path.exists(self._facts_path):
+            bak = self._facts_path + ".bak"
+            try:
+                shutil.copy2(self._facts_path, bak)
+            except Exception as e:
+                logger.warning(f"[memory] Failed to backup facts.json: {e}")
         with open(self._facts_path, "w", encoding="utf-8") as f:
             json.dump(facts, f, ensure_ascii=False, indent=2)
 
@@ -552,11 +567,15 @@ class PersistentMemoryManager:
         excess = len(facts) - target_count
         if excess <= 0:
             return facts
-        numbered = "\n".join(f"{i}: {f['fact']}" for i, f in enumerate(facts))
+        # Include timestamp so the LLM can judge staleness / supersession.
+        numbered = "\n".join(
+            f"{i} [{f.get('updated', '不明')}]: {f['fact']}"
+            for i, f in enumerate(facts)
+        )
         prompt = (
             f"現在{len(facts)}個の事実があり、上限は{target_count}個です。\n"
-            f"最も重要度の低い{excess}個を選んで削除してください。\n\n"
-            f"事実リスト:\n{numbered}\n\n"
+            f"最も価値の低い{excess}個を選んで削除してください。\n\n"
+            f"事実リスト（形式: インデックス [更新日時]: 内容）:\n{numbered}\n\n"
             f"削除する{excess}個のインデックスをJSON配列で出力: [n, n, ...]"
         )
         try:
