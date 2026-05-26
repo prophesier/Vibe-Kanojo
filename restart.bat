@@ -39,13 +39,16 @@ if exist pids\discord.pid (
 )
 
 echo Pulling latest code...
-git pull --ff-only
+REM -c core.editor=true ensures git never blocks waiting for a merge commit
+REM message (replaces VS Code / Vim with a no-op).
+REM --no-edit takes the default merge commit message silently if a merge happens.
+git -c core.editor=true pull --no-edit
 if errorlevel 1 (
     echo.
-    echo *** Git pull failed. Services are stopped. Resolve the issue manually ***
-    echo *** and re-run start_all.bat. ***
-    pause
-    exit /b 1
+    echo *** Git pull failed. Aborting any in-progress merge. ***
+    git merge --abort 2>nul
+    echo *** Restarting services with the current (pre-pull) code anyway. ***
+    echo.
 )
 
 echo Re-launching OLV and Discord bot in new wt tabs...
