@@ -219,6 +219,11 @@ class BasicMemoryAgent(AgentInterface):
         "直近のやりとりが一つのストリームに混在している。"
         "各ターンが「いつ」発生したかは、冒頭の "
         "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
+        "各セッションの最初のメッセージには `【セッション開始: 日時】` または "
+        "`【現在進行中のセッション開始: 日時】` という見出しが挿入されている。"
+        "これがセッションの境界を示すので、これより前のターンと後のターンは"
+        "**別の会話セッション**だと認識すること。"
+        "見出しが無い間のターンは、同じセッション内の連続したやりとりである。\n\n"
         "現在のターンが直前のターンの「直後」だと自動的に仮定してはいけない。"
         "二つのターンの間に数時間・数日・数週間の空白があり得る。\n\n"
         "【時間に関する厳格なルール】\n\n"
@@ -356,6 +361,30 @@ class BasicMemoryAgent(AgentInterface):
         new_messages[-1] = new_last
         return new_messages
 
+    @staticmethod
+    def _session_header_text(uid: str, is_current: bool = False) -> str:
+        """Format a session-boundary banner from a history UID.
+
+        UID format: ``YYYY-MM-DD_HH-MM-SS_<hex>``. The banner is prepended
+        to the first message of each session so the LLM can distinguish
+        independent sessions in the otherwise-flat message stream.
+        """
+        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        label = "現在進行中のセッション" if is_current else "セッション"
+        parts = uid.split("_")
+        if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
+            try:
+                dt = datetime.strptime(
+                    f"{parts[0]}_{parts[1]}", "%Y-%m-%d_%H-%M-%S"
+                )
+                timestamp = (
+                    f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}"
+                )
+                return f"【{label}開始: {timestamp}】"
+            except ValueError:
+                pass
+        return f"【{label}開始: {uid}】"
+
     def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
         """Convert a stored history record into a memory entry.
 
@@ -400,20 +429,36 @@ class BasicMemoryAgent(AgentInterface):
         loaded_uids = []
         for uid, messages in sessions:
             loaded_uids.append(uid)
+            first_in_session = True
             for msg in messages:
                 entry = self._msg_from_history_record(msg)
-                if entry:
-                    self._memory.append(entry)
+                if not entry:
+                    continue
+                if first_in_session:
+                    # Prepend a session-boundary banner so the LLM can tell
+                    # where one past session ends and the next begins.
+                    banner = self._session_header_text(uid, is_current=False)
+                    entry["content"] = f"{banner}\n{entry['content']}"
+                    first_in_session = False
+                self._memory.append(entry)
 
         # Always append the current session last so conversation continuity
         # is preserved even for clients that join mid-session.
         if current_uid:
             current_messages = get_history(conf_uid, current_uid)
             if current_messages:
+                first_in_session = True
                 for msg in current_messages:
                     entry = self._msg_from_history_record(msg)
-                    if entry:
-                        self._memory.append(entry)
+                    if not entry:
+                        continue
+                    if first_in_session:
+                        banner = self._session_header_text(
+                            current_uid, is_current=True
+                        )
+                        entry["content"] = f"{banner}\n{entry['content']}"
+                        first_in_session = False
+                    self._memory.append(entry)
             loaded_uids.append(current_uid)
 
         if self._memory_manager:
