@@ -47,7 +47,7 @@ if errorlevel 1 (
     echo.
     echo *** Git pull failed. Aborting any in-progress merge. ***
     git merge --abort 2>nul
-    echo *** Restarting services with the current (pre-pull) code anyway. ***
+    echo *** Restarting services with the existing code anyway. ***
     echo.
 )
 
