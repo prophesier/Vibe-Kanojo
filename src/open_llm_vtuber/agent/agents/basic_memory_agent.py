@@ -196,9 +196,15 @@ class BasicMemoryAgent(AgentInterface):
 
     _TIMESTAMP_NOTE = (
         "Note on timestamps: user messages are prefixed with "
-        "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know when each message "
-        "was sent. These tags are metadata for your reference only — do NOT "
-        "include any such timestamp tag in your own replies."
+        "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know exactly when each "
+        "message was sent. Whenever the conversation touches on time — "
+        "questions like \"when did we talk about X\", \"how long ago\", "
+        "\"what day is it\", greetings that depend on time of day, gaps "
+        "between sessions, or any reasoning about recency or duration — "
+        "actively consult these tags BEFORE answering. Do not assume the "
+        "current turn is \"now\" relative to earlier turns; check the "
+        "timestamps. These tags are metadata for your reference only — do "
+        "NOT include any such timestamp tag in your own replies."
     )
 
     def _build_runtime_system(self) -> str:
