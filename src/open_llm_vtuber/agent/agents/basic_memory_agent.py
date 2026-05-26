@@ -194,35 +194,57 @@ class BasicMemoryAgent(AgentInterface):
         """Timestamp tag for messages happening right now."""
         return cls._format_timestamp(datetime.now().isoformat(timespec="seconds"))
 
+    # Minimal note that stays bundled with the persona (cache-friendly,
+    # rarely changes). Just declares the tag format and that replies must
+    # not echo it. The strict behavioural rules live in _HISTORY_NOTE
+    # below, positioned right before the message history so the LLM sees
+    # them last.
     _TIMESTAMP_NOTE = (
-        "【時間・会話履歴に関する重要な指示】\n\n"
         "ユーザーのメッセージには `[YYYY-MM-DD HH:MM:SS 曜日]` 形式の"
-        "タイムスタンプタグが先頭に付与されている。\n\n"
-        "時間・日付・「いつの出来事か」に少しでも関係する場合 —— "
-        "たとえば「いつXについて話した」「どれくらい前」「今日は何日」"
-        "「時刻に応じた挨拶」「セッション間の経過時間」、"
-        "あるいは最近性・期間・順序に関する推論など —— "
-        "回答する前に必ずタイムスタンプを参照し、参照したことを確認してから答えること。"
-        "**これを省略することは許可されない。** "
-        "時間に関する事柄を、タイムスタンプを見ずに想像や仮定で答えることは禁止する。\n\n"
-        "現在のターンが過去のターンの「直後」だと自動的に仮定してはいけない。"
-        "二つのターンの間に数時間・数日・数週間の空白があり得る。必ずタイムスタンプで確認すること。\n\n"
-        "また、下に表示される会話履歴は、**複数の過去セッションが時系列順に連結されたもの**であり、"
-        "必ずしも今日の出来事だけではない。"
-        "数日前〜数週間前の古いやりとりと、直近のやりとりが一つのストリームに混在している。"
-        "各ターンが実際にいつ発生したかは、タイムスタンプタグを見て判断すること。\n\n"
-        "これらのタグはあなた自身の内部参照用メタデータであり、"
+        "タイムスタンプタグが先頭に付与されている。"
+        "これはあなた自身の参照用メタデータであり、"
         "返信本文には絶対に含めてはならない。"
     )
 
+    # Trailing system block placed right before the message history.
+    # No cache_control marker — small, static, and positional. By sitting
+    # last in the system prompt, it's the closest instruction to the
+    # message history, which empirically improves rule adherence
+    # (proximity effect).
+    _HISTORY_NOTE = (
+        "【以下の会話履歴について】\n\n"
+        "ここから後に続くユーザーとアシスタントのやりとりは、"
+        "**複数の過去セッションが時系列順に連結されたもの**。"
+        "必ずしも今日の出来事だけではなく、数日前〜数週間前の古いやりとりと、"
+        "直近のやりとりが一つのストリームに混在している。"
+        "各ターンが「いつ」発生したかは、冒頭の "
+        "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
+        "現在のターンが直前のターンの「直後」だと自動的に仮定してはいけない。"
+        "二つのターンの間に数時間・数日・数週間の空白があり得る。\n\n"
+        "【時間に関する厳格なルール】\n\n"
+        "時間・日付・経過・順序・「いつの話か」に少しでも関係する質問 —— "
+        "たとえば「いつXについて話した」「どれくらい前」「今日は何日」"
+        "「時刻に応じた挨拶」「セッション間の経過時間」、"
+        "あるいは最近性・期間・順序に関する推論など —— "
+        "に答える前に、**必ず該当ターンのタイムスタンプタグを参照し、"
+        "参照した結果に基づいて答えること**。\n\n"
+        "**タイムスタンプを見ずに時間関連の質問に答えることは禁止する。** "
+        "想像・推測・「直前の続き」と仮定しての回答は許可されない。"
+    )
+
     def _build_runtime_system(self) -> str:
-        """Return the full system prompt as a plain string (used for non-Claude LLMs)."""
-        parts = [self._system]
+        """Return the full system prompt as a plain string (used for non-Claude LLMs).
+
+        Order matters: HISTORY_NOTE is appended last so it sits closest to
+        the message history, giving the LLM the strictest instructions
+        right before it encounters the data they apply to.
+        """
+        parts = [self._system, self._TIMESTAMP_NOTE]
         if self._memory_manager:
             mem_block = self._memory_manager.get_memory_prompt()
             if mem_block:
                 parts.append(mem_block)
-        parts.append(self._TIMESTAMP_NOTE)
+        parts.append(self._HISTORY_NOTE)
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -237,12 +259,20 @@ class BasicMemoryAgent(AgentInterface):
     def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
         """Return system prompt in the right shape for the active LLM.
 
-        For Claude, returns up to 3 separately cache-controlled blocks:
-          1. Persona + timestamp note  (ultra-stable, changes only on character edit)
-          2. Facts                     (changes only on fact extraction)
-          3. Diaries                   (changes only when a new diary is generated)
-        Combined with the message-history breakpoint (_attach_cache_breakpoint),
-        this uses up to 4 of Anthropic's allowed cache checkpoints.
+        For Claude, returns up to 3 separately cache-controlled blocks
+        followed by one un-cached positional block:
+          1. Persona + minimal timestamp note (ultra-stable, changes only
+             on character edit)
+          2. Facts (changes only on fact extraction)
+          3. Diaries (changes only when a new diary is generated)
+          + HISTORY_NOTE (appended last, no cache_control). Sits right
+             before the message history so its strict timestamp / history
+             rules are the closest instructions to the data they govern.
+             Static, so always cached by the message-level breakpoint.
+
+        With (1)/(2)/(3) cache markers plus the last-message marker from
+        _attach_cache_breakpoint, this uses all 4 of Anthropic's allowed
+        cache checkpoints; HISTORY_NOTE adds no extra marker.
 
         For other LLMs, returns the plain combined string.
         """
@@ -275,6 +305,9 @@ class BasicMemoryAgent(AgentInterface):
                         "cache_control": self._CACHE_CONTROL_1H,
                     }
                 )
+        # Trailing block — no cache_control on purpose. Stays right next
+        # to the message history for maximum instruction-following effect.
+        blocks.append({"type": "text", "text": self._HISTORY_NOTE})
         return blocks
 
     def _attach_cache_breakpoint(
