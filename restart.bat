@@ -17,6 +17,11 @@ REM === EDIT THIS ===
 set "CONDA_ENV=openllmvtuber"
 REM =================
 
+REM Strip trailing backslash from %~dp0 so quoting the path for `wt -d`
+REM doesn't accidentally escape the closing quote (which breaks arg parsing).
+set "PROJECT_DIR=%~dp0"
+if "%PROJECT_DIR:~-1%"=="\" set "PROJECT_DIR=%PROJECT_DIR:~0,-1%"
+
 echo Waiting for services to exit cleanly...
 timeout /t 3 /nobreak >nul
 
@@ -52,7 +57,7 @@ if errorlevel 1 (
 )
 
 echo Re-launching OLV and Discord bot in new wt tabs...
-wt new-tab --title OLV -d "%~dp0" cmd /k "call conda activate %CONDA_ENV% && python run_server.py" ; new-tab --title Discord -d "%~dp0" cmd /k "timeout /t 5 && call conda activate %CONDA_ENV% && python scripts\run_discord_bot.py"
+wt new-tab --title OLV -d "%PROJECT_DIR%" cmd /k "call conda activate %CONDA_ENV% && python run_server.py" ; new-tab --title Discord -d "%PROJECT_DIR%" cmd /k "timeout /t 5 && call conda activate %CONDA_ENV% && python scripts\run_discord_bot.py"
 
 endlocal
 exit /b 0
