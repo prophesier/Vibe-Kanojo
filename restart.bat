@@ -13,9 +13,14 @@ REM ============================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
-REM === EDIT THIS ===
+REM === EDIT THESE ===
 set "CONDA_ENV=openllmvtuber"
-REM =================
+REM Branch to pull from. Leave empty to use the current branch's upstream
+REM (i.e. plain `git pull`). Set to a specific branch name if your local
+REM working branch (e.g. master) is different from the dev branch you want
+REM to track. The pull becomes `git pull origin <branch>` in that case.
+set "GIT_BRANCH="
+REM ==================
 
 REM Strip trailing backslash from %~dp0 so quoting the path for `wt -d`
 REM doesn't accidentally escape the closing quote (which breaks arg parsing).
@@ -43,11 +48,14 @@ if exist pids\discord.pid (
     del /f /q pids\discord.pid 2>nul
 )
 
+set "PULL_ARGS="
+if defined GIT_BRANCH set "PULL_ARGS=origin %GIT_BRANCH%"
+
 echo Pulling latest code...
 REM -c core.editor=true ensures git never blocks waiting for a merge commit
 REM message (replaces VS Code / Vim with a no-op).
 REM --no-edit takes the default merge commit message silently if a merge happens.
-git -c core.editor=true pull --no-edit
+git -c core.editor=true pull --no-edit %PULL_ARGS%
 if errorlevel 1 (
     echo.
     echo *** Git pull failed. Aborting any in-progress merge. ***
