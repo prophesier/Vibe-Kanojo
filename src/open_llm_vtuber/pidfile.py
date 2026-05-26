@@ -4,6 +4,9 @@ Each long-running service writes its PID to ``pids/<name>.pid`` at the
 project root on startup and removes the file on clean exit. ``restart.bat``
 reads these files to know which processes to kill before pulling new code
 and re-launching everything.
+
+The ``pids/`` directory is gitignored — these files are transient runtime
+state, not configuration.
 """
 
 from __future__ import annotations
