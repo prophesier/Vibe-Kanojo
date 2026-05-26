@@ -195,16 +195,24 @@ class BasicMemoryAgent(AgentInterface):
         return cls._format_timestamp(datetime.now().isoformat(timespec="seconds"))
 
     _TIMESTAMP_NOTE = (
-        "Note on timestamps: user messages are prefixed with "
-        "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know exactly when each "
-        "message was sent. Whenever the conversation touches on time — "
-        "questions like \"when did we talk about X\", \"how long ago\", "
-        "\"what day is it\", greetings that depend on time of day, gaps "
-        "between sessions, or any reasoning about recency or duration — "
-        "actively consult these tags BEFORE answering. Do not assume the "
-        "current turn is \"now\" relative to earlier turns; check the "
-        "timestamps. These tags are metadata for your reference only — do "
-        "NOT include any such timestamp tag in your own replies."
+        "【時間・会話履歴に関する重要な指示】\n\n"
+        "ユーザーのメッセージには `[YYYY-MM-DD HH:MM:SS 曜日]` 形式の"
+        "タイムスタンプタグが先頭に付与されている。\n\n"
+        "時間・日付・「いつの出来事か」に少しでも関係する場合 —— "
+        "たとえば「いつXについて話した」「どれくらい前」「今日は何日」"
+        "「時刻に応じた挨拶」「セッション間の経過時間」、"
+        "あるいは最近性・期間・順序に関する推論など —— "
+        "回答する前に必ずタイムスタンプを参照し、参照したことを確認してから答えること。"
+        "**これを省略することは許可されない。** "
+        "時間に関する事柄を、タイムスタンプを見ずに想像や仮定で答えることは禁止する。\n\n"
+        "現在のターンが過去のターンの「直後」だと自動的に仮定してはいけない。"
+        "二つのターンの間に数時間・数日・数週間の空白があり得る。必ずタイムスタンプで確認すること。\n\n"
+        "また、下に表示される会話履歴は、**複数の過去セッションが時系列順に連結されたもの**であり、"
+        "必ずしも今日の出来事だけではない。"
+        "数日前〜数週間前の古いやりとりと、直近のやりとりが一つのストリームに混在している。"
+        "各ターンが実際にいつ発生したかは、タイムスタンプタグを見て判断すること。\n\n"
+        "これらのタグはあなた自身の内部参照用メタデータであり、"
+        "返信本文には絶対に含めてはならない。"
     )
 
     def _build_runtime_system(self) -> str:
