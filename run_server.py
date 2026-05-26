@@ -12,6 +12,7 @@ from upgrade_codes.upgrade_manager import UpgradeManager
 
 from src.open_llm_vtuber.server import WebSocketServer
 from src.open_llm_vtuber.config_manager import Config, read_yaml, validate_config
+from src.open_llm_vtuber.pidfile import write_pid
 
 os.environ["HF_HOME"] = str(Path(__file__).parent / "models")
 os.environ["MODELSCOPE_CACHE"] = str(Path(__file__).parent / "models")
@@ -120,6 +121,10 @@ def parse_args():
 def run(console_log_level: str):
     init_logger(console_log_level)
     logger.info(f"Open-LLM-VTuber, version v{get_version()}")
+
+    # Write PID file so restart.bat (triggered by Discord /restart) can
+    # cleanly target this process. The file is removed on graceful exit.
+    write_pid("olv")
 
     # Get selected language
     lang = upgrade_manager.lang

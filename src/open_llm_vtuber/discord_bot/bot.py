@@ -7,10 +7,14 @@ here (see ``README.md``).
 from __future__ import annotations
 
 import base64
+import subprocess
+import sys
 import uuid
+from pathlib import Path
 from typing import Iterable, Optional
 
 import discord
+from discord import app_commands
 from loguru import logger
 
 from .bridge import OLVBridge, TurnResult
@@ -84,6 +88,8 @@ class DiscordVTuberBot(discord.Client):
         channel_ids: Optional[Iterable[int]] = None,
         respond_to_mentions_only: bool = False,
         command_prefix: Optional[str] = None,
+        admin_user_id: int = 0,
+        project_root: Optional[Path] = None,
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
@@ -94,6 +100,92 @@ class DiscordVTuberBot(discord.Client):
         self._channel_ids = list(channel_ids or [])
         self._mentions_only = respond_to_mentions_only
         self._prefix = command_prefix or ""
+        self._admin_user_id = int(admin_user_id or 0)
+        self._project_root = Path(project_root) if project_root else Path.cwd()
+        self._tree = app_commands.CommandTree(self)
+        if self._admin_user_id:
+            self._register_admin_commands()
+
+    def _register_admin_commands(self) -> None:
+        """Register slash commands restricted to the configured admin user."""
+
+        @self._tree.command(
+            name="restart",
+            description="Pull latest code and restart OLV + Discord bot (admin only)",
+        )
+        async def restart(interaction: discord.Interaction) -> None:  # noqa: ARG001
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message(
+                    "Unauthorized.", ephemeral=True
+                )
+                return
+            restart_bat = self._project_root / "restart.bat"
+            if not restart_bat.exists():
+                await interaction.response.send_message(
+                    f"restart.bat not found at {restart_bat}. "
+                    "Copy it from the repo root to your project root first.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.send_message(
+                "🔄 Pulling latest code and restarting OLV + Discord bot. "
+                "Expect ~10-20s of downtime.",
+                ephemeral=True,
+            )
+            self._spawn_detached_restart(restart_bat)
+            # Bot will be killed by restart.bat shortly; close gracefully so
+            # the PID file atexit cleanup runs.
+            logger.info("Restart requested by admin; shutting down bot.")
+            await self.close()
+
+    def _spawn_detached_restart(self, restart_bat: Path) -> None:
+        """Launch restart.bat in a detached process so it outlives this bot."""
+        if sys.platform == "win32":
+            flags = (
+                subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
+                | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+            subprocess.Popen(
+                [str(restart_bat)],
+                creationflags=flags,
+                close_fds=True,
+                cwd=str(self._project_root),
+                shell=True,
+            )
+        else:
+            # Non-Windows fallback: best-effort, expects a restart.sh script.
+            restart_sh = self._project_root / "restart.sh"
+            if restart_sh.exists():
+                subprocess.Popen(
+                    ["bash", str(restart_sh)],
+                    start_new_session=True,
+                    close_fds=True,
+                    cwd=str(self._project_root),
+                )
+            else:
+                logger.error("Non-Windows platform but restart.sh not found.")
+
+    async def setup_hook(self) -> None:
+        """Sync slash commands once on startup."""
+        if not self._admin_user_id:
+            return
+        try:
+            if self._guild_ids:
+                # Per-guild sync is instant (no propagation delay).
+                for gid in self._guild_ids:
+                    guild = discord.Object(id=int(gid))
+                    self._tree.copy_global_to(guild=guild)
+                    await self._tree.sync(guild=guild)
+                logger.info(
+                    f"Slash commands synced to {len(self._guild_ids)} guild(s)."
+                )
+            else:
+                await self._tree.sync()
+                logger.info(
+                    "Slash commands synced globally (may take up to 1h to propagate)."
+                )
+        except Exception as e:
+            logger.warning(f"Failed to sync slash commands: {e}")
 
     async def on_ready(self) -> None:
         user = self.user
