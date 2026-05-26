@@ -194,27 +194,68 @@ class BasicMemoryAgent(AgentInterface):
         """Timestamp tag for messages happening right now."""
         return cls._format_timestamp(datetime.now().isoformat(timespec="seconds"))
 
+    # Minimal note that stays bundled with the persona (cache-friendly,
+    # rarely changes). Just declares the tag format and that replies must
+    # not echo it. The strict behavioural rules live in _HISTORY_NOTE
+    # below, positioned right before the message history so the LLM sees
+    # them last.
     _TIMESTAMP_NOTE = (
-        "Note on timestamps: user messages are prefixed with "
-        "[YYYY-MM-DD HH:MM:SS Weekday] tags so you know exactly when each "
-        "message was sent. Whenever the conversation touches on time — "
-        "questions like \"when did we talk about X\", \"how long ago\", "
-        "\"what day is it\", greetings that depend on time of day, gaps "
-        "between sessions, or any reasoning about recency or duration — "
-        "actively consult these tags BEFORE answering. Do not assume the "
-        "current turn is \"now\" relative to earlier turns; check the "
-        "timestamps. These tags are metadata for your reference only — do "
-        "NOT include any such timestamp tag in your own replies."
+        "ユーザーのメッセージには `[YYYY-MM-DD HH:MM:SS 曜日]` 形式の"
+        "タイムスタンプタグが先頭に付与されている。"
+        "これはあなた自身の参照用メタデータであり、"
+        "返信本文には絶対に含めてはならない。"
+    )
+
+    # Trailing system block placed right before the message history.
+    # No cache_control marker — small, static, and positional. By sitting
+    # last in the system prompt, it's the closest instruction to the
+    # message history, which empirically improves rule adherence
+    # (proximity effect).
+    _HISTORY_NOTE = (
+        "【以下の会話履歴について】\n\n"
+        "ここから後に続くユーザーとアシスタントのやりとりは、"
+        "**複数の過去セッションが時系列順に連結されたもの**。"
+        "必ずしも今日の出来事だけではなく、数日前〜数週間前の古いやりとりと、"
+        "直近のやりとりが一つのストリームに混在している。"
+        "各ターンが「いつ」発生したかは、冒頭の "
+        "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
+        "各セッションの最初のメッセージには `【セッション開始: 日時】` または "
+        "`【現在進行中のセッション開始: 日時】` という見出しが挿入されている。"
+        "これがセッションの境界を示すので、これより前のターンと後のターンは"
+        "**別の会話セッション**だと認識すること。"
+        "見出しが無い間のターンは、同じセッション内の連続したやりとりである。\n\n"
+        "現在のターンが直前のターンの「直後」だと自動的に仮定してはいけない。"
+        "二つのターンの間に数時間・数日・数週間の空白があり得る。\n\n"
+        "【時間に関する厳格なルール】\n\n"
+        "時間・日付・経過・順序・「いつの話か」に少しでも関わる"
+        "**あらゆる発言**を行う前に、必ず関連するタイムスタンプタグを参照すること。"
+        "ユーザーの質問に答える時だけでなく、以下のすべての場合に適用される：\n"
+        "- 自分から時刻・日付・経過時間・最近性に言及する時"
+        "（「さっき」「先日」「今日は」「久しぶり」など）\n"
+        "- 時刻に応じた挨拶をする時（おはよう・こんばんは等）\n"
+        "- ユーザーに対して時間関連の質問・確認をする時"
+        "（「今は何時頃？」「あれから〇日経った？」など）\n"
+        "- 過去の出来事の時期や、二つの出来事の時間差を述べる時\n"
+        "- 「現在」「最近」「以前」を基準とした推論をする時\n\n"
+        "**タイムスタンプを見ずに時間関連の発言・質問を行うことは禁止する。** "
+        "想像・推測・「直前の続き」と仮定して時間に言及することは許可されない。\n\n"
+        "現在時刻が必要な場合は、"
+        "**最新のユーザーメッセージのタイムスタンプを「現在」の基準とする**こと。"
     )
 
     def _build_runtime_system(self) -> str:
-        """Return the full system prompt as a plain string (used for non-Claude LLMs)."""
-        parts = [self._system]
+        """Return the full system prompt as a plain string (used for non-Claude LLMs).
+
+        Order matters: HISTORY_NOTE is appended last so it sits closest to
+        the message history, giving the LLM the strictest instructions
+        right before it encounters the data they apply to.
+        """
+        parts = [self._system, self._TIMESTAMP_NOTE]
         if self._memory_manager:
             mem_block = self._memory_manager.get_memory_prompt()
             if mem_block:
                 parts.append(mem_block)
-        parts.append(self._TIMESTAMP_NOTE)
+        parts.append(self._HISTORY_NOTE)
         return "\n\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -229,12 +270,20 @@ class BasicMemoryAgent(AgentInterface):
     def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
         """Return system prompt in the right shape for the active LLM.
 
-        For Claude, returns up to 3 separately cache-controlled blocks:
-          1. Persona + timestamp note  (ultra-stable, changes only on character edit)
-          2. Facts                     (changes only on fact extraction)
-          3. Diaries                   (changes only when a new diary is generated)
-        Combined with the message-history breakpoint (_attach_cache_breakpoint),
-        this uses up to 4 of Anthropic's allowed cache checkpoints.
+        For Claude, returns up to 3 separately cache-controlled blocks
+        followed by one un-cached positional block:
+          1. Persona + minimal timestamp note (ultra-stable, changes only
+             on character edit)
+          2. Facts (changes only on fact extraction)
+          3. Diaries (changes only when a new diary is generated)
+          + HISTORY_NOTE (appended last, no cache_control). Sits right
+             before the message history so its strict timestamp / history
+             rules are the closest instructions to the data they govern.
+             Static, so always cached by the message-level breakpoint.
+
+        With (1)/(2)/(3) cache markers plus the last-message marker from
+        _attach_cache_breakpoint, this uses all 4 of Anthropic's allowed
+        cache checkpoints; HISTORY_NOTE adds no extra marker.
 
         For other LLMs, returns the plain combined string.
         """
@@ -267,6 +316,9 @@ class BasicMemoryAgent(AgentInterface):
                         "cache_control": self._CACHE_CONTROL_1H,
                     }
                 )
+        # Trailing block — no cache_control on purpose. Stays right next
+        # to the message history for maximum instruction-following effect.
+        blocks.append({"type": "text", "text": self._HISTORY_NOTE})
         return blocks
 
     def _attach_cache_breakpoint(
@@ -308,6 +360,30 @@ class BasicMemoryAgent(AgentInterface):
 
         new_messages[-1] = new_last
         return new_messages
+
+    @staticmethod
+    def _session_header_text(uid: str, is_current: bool = False) -> str:
+        """Format a session-boundary banner from a history UID.
+
+        UID format: ``YYYY-MM-DD_HH-MM-SS_<hex>``. The banner is prepended
+        to the first message of each session so the LLM can distinguish
+        independent sessions in the otherwise-flat message stream.
+        """
+        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        label = "現在進行中のセッション" if is_current else "セッション"
+        parts = uid.split("_")
+        if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
+            try:
+                dt = datetime.strptime(
+                    f"{parts[0]}_{parts[1]}", "%Y-%m-%d_%H-%M-%S"
+                )
+                timestamp = (
+                    f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}"
+                )
+                return f"【{label}開始: {timestamp}】"
+            except ValueError:
+                pass
+        return f"【{label}開始: {uid}】"
 
     def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
         """Convert a stored history record into a memory entry.
@@ -353,20 +429,36 @@ class BasicMemoryAgent(AgentInterface):
         loaded_uids = []
         for uid, messages in sessions:
             loaded_uids.append(uid)
+            first_in_session = True
             for msg in messages:
                 entry = self._msg_from_history_record(msg)
-                if entry:
-                    self._memory.append(entry)
+                if not entry:
+                    continue
+                if first_in_session:
+                    # Prepend a session-boundary banner so the LLM can tell
+                    # where one past session ends and the next begins.
+                    banner = self._session_header_text(uid, is_current=False)
+                    entry["content"] = f"{banner}\n{entry['content']}"
+                    first_in_session = False
+                self._memory.append(entry)
 
         # Always append the current session last so conversation continuity
         # is preserved even for clients that join mid-session.
         if current_uid:
             current_messages = get_history(conf_uid, current_uid)
             if current_messages:
+                first_in_session = True
                 for msg in current_messages:
                     entry = self._msg_from_history_record(msg)
-                    if entry:
-                        self._memory.append(entry)
+                    if not entry:
+                        continue
+                    if first_in_session:
+                        banner = self._session_header_text(
+                            current_uid, is_current=True
+                        )
+                        entry["content"] = f"{banner}\n{entry['content']}"
+                        first_in_session = False
+                    self._memory.append(entry)
             loaded_uids.append(current_uid)
 
         if self._memory_manager:

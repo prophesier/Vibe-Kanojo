@@ -125,7 +125,7 @@ class PersistentMemoryManager:
         if not facts:
             return ""
         lines = "\n".join(f"- {f['fact']}" for f in facts)
-        return f"## Long-term memory: facts about the user\n{lines}"
+        return f"## ユーザーに関する長期記憶（事実）\n{lines}"
 
     def get_diaries_prompt(self) -> str:
         """Return the diary block for the system prompt (empty string if no diaries)."""
@@ -133,7 +133,12 @@ class PersistentMemoryManager:
         if not diaries:
             return ""
         entries = "\n\n".join(f"[{d['date']}]\n{d['content']}" for d in diaries)
-        return f"## Recent session memories\n{entries}"
+        return (
+            "## 過去セッションの日記\n"
+            "後続の会話履歴より前に行われたセッションの要約。"
+            "各エントリ冒頭の日付がそのセッションの実時間。\n\n"
+            f"{entries}"
+        )
 
     def get_memory_prompt(self) -> str:
         """Return the combined memory block (facts + diaries) for non-Claude LLMs."""
