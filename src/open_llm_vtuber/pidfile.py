@@ -24,7 +24,12 @@ def _pid_dir(root: Optional[Path] = None) -> Path:
 
 
 def write_pid(name: str, root: Optional[Path] = None) -> None:
-    """Write the current process PID to pids/<name>.pid and clean it up on exit."""
+    """Write the current process PID to pids/<name>.pid and clean it up on exit.
+
+    The atexit hook ensures graceful shutdowns leave no stale file behind.
+    Hard kills (taskkill /F) bypass atexit, so restart.bat treats a present
+    PID file as best-effort and deletes it after the kill attempt regardless.
+    """
     path = _pid_dir(root) / f"{name}.pid"
     path.write_text(str(os.getpid()))
     atexit.register(_cleanup, path)
