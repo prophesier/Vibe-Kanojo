@@ -141,17 +141,20 @@ class DiscordVTuberBot(discord.Client):
     def _spawn_detached_restart(self, restart_bat: Path) -> None:
         """Launch restart.bat in a detached process so it outlives this bot."""
         if sys.platform == "win32":
-            flags = (
-                subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
-                | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
-            subprocess.Popen(
-                [str(restart_bat)],
-                creationflags=flags,
-                close_fds=True,
-                cwd=str(self._project_root),
-                shell=True,
-            )
+            # `cmd /c start "" "path"` spawns a brand-new cmd window for the
+            # bat. The window is independent of this Python process, so it
+            # survives the bot's imminent shutdown. Keeping the window
+            # visible (rather than DETACHED_PROCESS) lets the user see git
+            # pull / launch output if something goes wrong.
+            try:
+                subprocess.Popen(
+                    ["cmd", "/c", "start", "", str(restart_bat)],
+                    cwd=str(self._project_root),
+                    close_fds=True,
+                )
+                logger.info(f"Spawned restart script: {restart_bat}")
+            except Exception as e:
+                logger.exception(f"Failed to spawn restart script: {e}")
         else:
             # Non-Windows fallback: best-effort, expects a restart.sh script.
             restart_sh = self._project_root / "restart.sh"
