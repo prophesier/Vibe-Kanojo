@@ -13,6 +13,7 @@ class DiscordConfig(I18nMixin):
     respond_to_mentions_only: bool = Field(False, alias="respond_to_mentions_only")
     command_prefix: Optional[str] = Field("", alias="command_prefix")
     olv_ws_url: Optional[str] = Field("", alias="olv_ws_url")
+    admin_user_id: int = Field(0, alias="admin_user_id")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "token": Description(
@@ -61,6 +62,19 @@ class DiscordConfig(I18nMixin):
             zh=(
                 "覆盖 OLV WebSocket 地址。留空时根据 system_config.host/port 自动拼接 "
                 "(ws://<host>:<port>/proxy-ws)。"
+            ),
+        ),
+        "admin_user_id": Description(
+            en=(
+                "Discord user ID authorized to use admin slash commands like "
+                "/restart. Set to 0 (default) to disable admin commands "
+                "entirely. Enable Discord developer mode, right-click your "
+                "profile, and 'Copy User ID' to obtain it."
+            ),
+            zh=(
+                "可使用 /restart 等管理员斜杠命令的 Discord 用户 ID。设为 0（默认）"
+                "则完全禁用管理命令。开启 Discord 开发者模式后，右键自己头像 → "
+                "「复制用户 ID」获取。"
             ),
         ),
     }

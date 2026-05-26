@@ -524,3 +524,7 @@ discord_config:
   # 覆盖 OLV WebSocket 地址。留空则根据 system_config 自动拼接:
   # ws://{system_config.host}:{system_config.port}/proxy-ws
   olv_ws_url: ""
+  # 允许使用 /restart 等管理员斜杠命令的 Discord 用户 ID。0 = 完全禁用。
+  # 获取方式：Discord 设置 → 高级 → 开启开发者模式，右键自己头像 → "复制用户 ID"。
+  # 切勿提交真实 ID — 只在本地 conf.yaml 里填。
+  admin_user_id: 0
