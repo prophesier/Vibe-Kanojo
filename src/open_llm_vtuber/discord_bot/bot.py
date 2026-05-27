@@ -7,8 +7,10 @@ here (see ``README.md``).
 from __future__ import annotations
 
 import base64
+import json
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Iterable, Optional
@@ -132,11 +134,34 @@ class DiscordVTuberBot(discord.Client):
                 "Expect ~10-20s of downtime.",
                 ephemeral=True,
             )
+            # Persist context so the post-restart bot can announce completion
+            # in the same channel. Written before close() so it's saved even
+            # if the bot is taskkilled before atexit hooks run.
+            self._save_restart_pending(
+                channel_id=interaction.channel_id,
+                user_id=interaction.user.id,
+            )
             self._spawn_detached_restart(restart_bat)
             # Bot will be killed by restart.bat shortly; close gracefully so
             # the PID file atexit cleanup runs.
             logger.info("Restart requested by admin; shutting down bot.")
             await self.close()
+
+    def _restart_state_path(self) -> Path:
+        return self._project_root / "pids" / "restart_pending.json"
+
+    def _save_restart_pending(self, *, channel_id: int, user_id: int) -> None:
+        path = self._restart_state_path()
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "channel_id": channel_id,
+                    "user_id": user_id,
+                    "initiated_at": time.time(),
+                }
+            )
+        )
 
     def _spawn_detached_restart(self, restart_bat: Path) -> None:
         """Launch restart.bat in a detached process so it outlives this bot."""
@@ -193,6 +218,73 @@ class DiscordVTuberBot(discord.Client):
     async def on_ready(self) -> None:
         user = self.user
         logger.info(f"Discord bot ready as {user} (id={getattr(user, 'id', '?')})")
+        # If we got here via /restart, announce completion in the originating
+        # channel. This is a one-shot: the state file is deleted after the
+        # attempt regardless of success.
+        await self._maybe_announce_restart_complete()
+
+    async def _maybe_announce_restart_complete(self) -> None:
+        state_path = self._restart_state_path()
+        if not state_path.exists():
+            return
+        data: dict = {}
+        try:
+            data = json.loads(state_path.read_text())
+        except Exception as e:
+            logger.warning(f"Failed to read restart_pending.json: {e}")
+            try:
+                state_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+
+        channel_id = data.get("channel_id")
+        user_id = data.get("user_id")
+        elapsed = time.time() - float(data.get("initiated_at") or time.time())
+
+        # Build a system-style embed. Bot-authored messages never re-enter
+        # on_message (filtered by message.author.bot), so this notification
+        # cannot trigger the OLV conversation pipeline or pollute chat history.
+        embed = discord.Embed(
+            title="✅ 再起動完了",
+            description="OLV と Discord bot の再起動が完了し、両方とも稼働中です。",
+            color=0x57F287,
+        )
+        embed.add_field(name="所要時間", value=f"{elapsed:.1f} 秒", inline=True)
+        embed.set_footer(text="このメッセージはシステム通知であり、会話履歴には記録されません。")
+
+        channel = None
+        if channel_id:
+            channel = self.get_channel(int(channel_id))
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(int(channel_id))
+                except Exception as e:
+                    logger.warning(f"fetch_channel({channel_id}) failed: {e}")
+
+        # Fallback: DM the admin if the original channel can't be reached.
+        if channel is None and user_id:
+            try:
+                user = await self.fetch_user(int(user_id))
+                channel = await user.create_dm()
+            except Exception as e:
+                logger.warning(f"DM fallback to {user_id} failed: {e}")
+
+        if channel is not None:
+            try:
+                await channel.send(embed=embed)
+                logger.info("Sent restart-complete notification.")
+            except Exception as e:
+                logger.warning(f"Failed to send restart-complete embed: {e}")
+        else:
+            logger.warning(
+                "Could not resolve a channel to announce restart completion."
+            )
+
+        try:
+            state_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.author == self.user:
