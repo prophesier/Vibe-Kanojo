@@ -303,10 +303,27 @@ class AsyncLLM(StatelessLLMInterface):
                             server_tool_index is not None
                             and event.index == server_tool_index
                         ):
+                            query_str = ""
+                            try:
+                                if server_tool_query.strip():
+                                    parsed = json.loads(server_tool_query)
+                                    query_str = str(parsed.get("query", "")).strip()
+                            except json.JSONDecodeError:
+                                query_str = ""
                             logger.info(
-                                f"[web_search] query: {server_tool_query.strip() or '(empty)'}"
+                                f"[web_search] query: {query_str or '(empty)'}"
                             )
+                            # Inline marker at the exact position the search was
+                            # triggered, so the reply shows where it looked things
+                            # up. Display-only (see basic_memory_agent handling).
+                            if server_tool_name == "web_search":
+                                shown = query_str[:80] if query_str else "..."
+                                yield {
+                                    "type": "web_search_marker",
+                                    "text": f"\n🔍 *Web検索: {shown}*\n",
+                                }
                             server_tool_index = None
+                            server_tool_name = ""
                             server_tool_query = ""
                         # Check if this stop corresponds to the active tool call
                         if (
