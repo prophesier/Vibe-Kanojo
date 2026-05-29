@@ -6,6 +6,8 @@ for language generation.
 import json
 from typing import AsyncIterator, List, Dict, Any, Union
 
+import anthropic
+import httpx
 from loguru import logger
 from anthropic import AsyncAnthropic, NOT_GIVEN
 
@@ -55,10 +57,19 @@ class AsyncLLM(StatelessLLMInterface):
         # Initialize Claude client. The extended-cache-ttl beta header lets us
         # request 1-hour prompt cache TTL on cache_control blocks; without it
         # only the default 5-minute TTL is accepted.
+        #
+        # timeout/max_retries harden the connection against flaky networks:
+        # the SDK retries connection failures and retryable statuses (429/5xx,
+        # incl. 529 overload) BEFORE the stream starts consuming. A generous
+        # read timeout accommodates long time-to-first-token on large cached
+        # contexts. (Mid-stream disconnects can't be retried — they'd
+        # duplicate already-streamed text — so the partial reply is kept.)
         self.client = AsyncAnthropic(
             api_key=llm_api_key,
             base_url=base_url if base_url else None,
             default_headers={"anthropic-beta": "extended-cache-ttl-2025-04-11"},
+            timeout=httpx.Timeout(120.0, connect=10.0),
+            max_retries=4,
         )
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
@@ -144,6 +155,7 @@ class AsyncLLM(StatelessLLMInterface):
             - {"type": "message_stop"}
             - {"type": "error", "message": "..."}
         """
+        text_emitted = False
         try:
             # Filter out system messages and convert message format
             converted_messages = [
@@ -211,6 +223,7 @@ class AsyncLLM(StatelessLLMInterface):
                             f"Stream: content_block_delta - Index: {event.index}, Delta Type: {event.delta.type}"
                         )
                         if event.delta.type == "text_delta":
+                            text_emitted = True
                             yield {"type": "text_delta", "text": event.delta.text}
                         elif event.delta.type == "input_json_delta":
                             if (
@@ -285,7 +298,23 @@ class AsyncLLM(StatelessLLMInterface):
                     # The outer try/except handles SDK-level errors.
 
         except Exception as e:
-            logger.error(f"Claude API error occurred: {str(e)}")
+            is_transient = isinstance(
+                e, (httpx.TransportError, anthropic.APIConnectionError)
+            ) or type(e).__name__ in {"BrokenResourceError", "ReadError"}
+            if is_transient and text_emitted:
+                # Connection dropped mid-stream after we'd already streamed
+                # part of the reply. Retrying would duplicate text, so finish
+                # gracefully with whatever was delivered instead of raising
+                # (which would surface a bare error and discard the partial).
+                logger.warning(
+                    f"Claude stream dropped mid-reply ({type(e).__name__}: {e}); "
+                    "delivering partial response and ending turn cleanly."
+                )
+                yield {"type": "message_stop"}
+                logger.debug("Chat completion stream processing finished (partial).")
+                return
+
+            logger.error(f"Claude API error occurred: {type(e).__name__}: {e}")
             logger.info(f"Model: {self.model}")
             # Yield an error event before raising
             yield {"type": "error", "message": f"Claude API error: {str(e)}"}
