@@ -49,16 +49,7 @@ class AsyncLLM(StatelessLLMInterface):
             llm_api_key (str): Claude API key
             system (str): System prompt
         """
-        # TEMPORARY OVERRIDE: force Opus 4.7 regardless of conf.yaml.
-        # Revert this block to `self.model = model` when done.
-        _FORCED_MODEL = "claude-opus-4-7"
-        if model != _FORCED_MODEL:
-            logger.warning(
-                f"[TEMP OVERRIDE] Model from config ({model!r}) overridden "
-                f"to {_FORCED_MODEL!r}. Remove this block in claude_llm.py "
-                "__init__ to restore config-driven model selection."
-            )
-        self.model = _FORCED_MODEL
+        self.model = model
         self.system = system
 
         # Initialize Claude client. The extended-cache-ttl beta header lets us
