@@ -132,6 +132,11 @@ character_config:
         base_url: 'https://api.anthropic.com'
         llm_api_key: 'YOUR API KEY HERE'
         model: 'claude-3-haiku-20240307'
+        # Let Claude search the web on its own when it needs current info.
+        # Billed per search (~$10/1000) on top of token cost. Default off.
+        enable_web_search: false
+        # Max searches Claude may run per single reply.
+        max_web_searches: 3
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>'
