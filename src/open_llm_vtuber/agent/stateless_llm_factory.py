@@ -73,6 +73,8 @@ class LLMFactory:
                 base_url=kwargs.get("base_url"),
                 model=kwargs.get("model"),
                 llm_api_key=kwargs.get("llm_api_key"),
+                enable_web_search=kwargs.get("enable_web_search", False),
+                max_web_searches=kwargs.get("max_web_searches", 3),
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {llm_provider}")

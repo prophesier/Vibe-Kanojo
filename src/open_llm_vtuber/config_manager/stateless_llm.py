@@ -192,6 +192,8 @@ class ClaudeConfig(StatelessLLMBaseConfig):
     interrupt_method: Literal["system", "user"] = Field(
         "user", alias="interrupt_method"
     )
+    enable_web_search: bool = Field(False, alias="enable_web_search")
+    max_web_searches: int = Field(3, alias="max_web_searches")
 
     _CLAUDE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(
@@ -200,6 +202,21 @@ class ClaudeConfig(StatelessLLMBaseConfig):
         "llm_api_key": Description(en="API key for authentication", zh="API 认证密钥"),
         "model": Description(
             en="Name of the Claude model to use", zh="要使用的 Claude 模型名称"
+        ),
+        "enable_web_search": Description(
+            en=(
+                "Enable Anthropic's native web search tool. When on, Claude "
+                "decides on its own when to search the web. Billed per search "
+                "(~$10/1000) on top of token cost."
+            ),
+            zh=(
+                "启用 Anthropic 原生网页搜索工具。开启后由 Claude 自行决定何时联网搜索。"
+                "按搜索次数计费（约 $10/1000 次），在 token 费用之外额外收取。"
+            ),
+        ),
+        "max_web_searches": Description(
+            en="Maximum number of web searches Claude may run per reply.",
+            zh="单次回复中 Claude 最多可执行的网页搜索次数。",
         ),
     }
 
