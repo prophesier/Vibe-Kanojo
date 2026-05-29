@@ -156,9 +156,18 @@ class OLVBridge:
 
                 try:
                     await asyncio.wait_for(turn.done.wait(), timeout=self._turn_timeout)
+                    logger.debug(
+                        f"Turn {request_id} complete: "
+                        f"{len(turn.result.text)} chars accumulated"
+                    )
                 except asyncio.TimeoutError:
                     turn.result.error = (
                         f"timed out waiting for reply after {self._turn_timeout:.0f}s"
+                    )
+                    logger.warning(
+                        f"Turn {request_id} timed out after {self._turn_timeout:.0f}s "
+                        f"with {len(turn.result.text)} chars accumulated so far "
+                        "(no conversation-chain-end received)"
                     )
             except Exception as e:
                 turn.result.error = f"send failed: {e}"

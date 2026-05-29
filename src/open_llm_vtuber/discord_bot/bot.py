@@ -6,6 +6,7 @@ here (see ``README.md``).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -488,6 +489,10 @@ class DiscordVTuberBot(discord.Client):
             await self._safe_reply(message, f"(bridge error: {e})")
 
     async def _post_reply(self, source: discord.Message, result: TurnResult) -> None:
+        logger.info(
+            f"Posting reply for req={result.request_id}: "
+            f"{len(result.text)} chars, error={result.error!r}"
+        )
         if result.error and not result.text:
             await self._safe_reply(source, f"(error: {result.error})")
             return
@@ -495,19 +500,47 @@ class DiscordVTuberBot(discord.Client):
             await self._safe_reply(source, "(no reply)")
             return
 
+        delivered = True
         for chunk in _chunk_for_discord(result.text):
-            await self._safe_reply(source, chunk)
+            if not await self._safe_reply(source, chunk):
+                delivered = False
+
+        if delivered:
+            logger.info(f"Reply for req={result.request_id} delivered to Discord.")
+        else:
+            logger.error(
+                f"Reply for req={result.request_id} FAILED to deliver to Discord "
+                "(see warnings above)."
+            )
 
         if result.error:
             logger.warning(
                 f"Reply for req={result.request_id} had partial error: {result.error}"
             )
 
-    async def _safe_reply(self, source: discord.Message, content: str) -> None:
-        try:
-            await source.channel.send(content)
-        except discord.DiscordException as e:
-            logger.warning(f"Failed to post Discord reply: {e}")
+    async def _safe_reply(self, source: discord.Message, content: str) -> bool:
+        """Send a message to the channel, retrying transient failures.
+
+        Returns True if the message was delivered, False otherwise.
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                await source.channel.send(content)
+                return True
+            except Exception as e:  # noqa: BLE001 — log and retry any send error
+                last_err = e
+                logger.warning(
+                    f"Failed to post Discord reply (attempt {attempt + 1}/3): "
+                    f"{type(e).__name__}: {e}"
+                )
+                if attempt < 2:
+                    await asyncio.sleep(1.5 * (attempt + 1))
+        logger.error(
+            f"Giving up posting Discord reply after 3 attempts: "
+            f"{type(last_err).__name__}: {last_err}"
+        )
+        return False
 
     def _strip_mention(self, content: str) -> str:
         if self.user is None:
