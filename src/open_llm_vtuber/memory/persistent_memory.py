@@ -349,50 +349,54 @@ class PersistentMemoryManager:
                     except Exception:
                         continue
 
-            if not unprocessed_uids:
-                return
-
-            logger.info(
-                f"[memory] {len(unprocessed_uids)} session(s) pending fact extraction."
-            )
-
-            # Use the most recent N unprocessed sessions in full; the rest as
-            # diary summaries to keep token cost bounded.
-            unprocessed_uids.sort()  # lexicographic = chronological
-            recent_uids = set(unprocessed_uids[-self._recent_sessions :])
-            recent_messages: List[Dict[str, Any]] = []
-            for uid in unprocessed_uids[-self._recent_sessions :]:
-                msgs = get_history(conf_uid, uid)
-                if msgs:
-                    recent_messages.extend(msgs)
-
-            older_parts: List[str] = []
-            for uid in unprocessed_uids:
-                if uid in recent_uids:
-                    continue
-                path = os.path.join(self._diaries_dir, f"{uid}.json")
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        d = json.load(f)
-                    if "content" in d:
-                        older_parts.append(f"[{d.get('date', uid)}]\n{d['content']}")
-                except Exception:
-                    continue
-            diary_context = "\n\n".join(older_parts)
-
-            if recent_messages or diary_context:
+            # Fact extraction only runs when there are unprocessed sessions.
+            # Note: we do NOT early-return here — the fact-limit enforcement
+            # below must run on every startup regardless.
+            if unprocessed_uids:
                 logger.info(
-                    f"[memory] Running fact extraction backfill "
-                    f"({len(recent_uids)} recent session(s) full, "
-                    f"{len(older_parts)} older diary summary/summaries)…"
+                    f"[memory] {len(unprocessed_uids)} session(s) pending fact extraction."
                 )
-                await self.extract_facts_async(
-                    recent_messages, llm, diary_context=diary_context, persona=persona
-                )
-                # Mark all processed diaries so this doesn't repeat next startup.
+
+                # Use the most recent N unprocessed sessions in full; the rest
+                # as diary summaries to keep token cost bounded.
+                unprocessed_uids.sort()  # lexicographic = chronological
+                recent_uids = set(unprocessed_uids[-self._recent_sessions :])
+                recent_messages: List[Dict[str, Any]] = []
+                for uid in unprocessed_uids[-self._recent_sessions :]:
+                    msgs = get_history(conf_uid, uid)
+                    if msgs:
+                        recent_messages.extend(msgs)
+
+                older_parts: List[str] = []
                 for uid in unprocessed_uids:
-                    self._mark_diary_facts_extracted(uid)
-                logger.info("[memory] Fact backfill complete.")
+                    if uid in recent_uids:
+                        continue
+                    path = os.path.join(self._diaries_dir, f"{uid}.json")
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            d = json.load(f)
+                        if "content" in d:
+                            older_parts.append(f"[{d.get('date', uid)}]\n{d['content']}")
+                    except Exception:
+                        continue
+                diary_context = "\n\n".join(older_parts)
+
+                if recent_messages or diary_context:
+                    logger.info(
+                        f"[memory] Running fact extraction backfill "
+                        f"({len(recent_uids)} recent session(s) full, "
+                        f"{len(older_parts)} older diary summary/summaries)…"
+                    )
+                    await self.extract_facts_async(
+                        recent_messages,
+                        llm,
+                        diary_context=diary_context,
+                        persona=persona,
+                    )
+                    # Mark all processed diaries so this doesn't repeat next startup.
+                    for uid in unprocessed_uids:
+                        self._mark_diary_facts_extracted(uid)
+                    logger.info("[memory] Fact backfill complete.")
 
             # Enforce the fact cap unconditionally — covers the case where the
             # user lowered max_facts in config but no new facts were extracted
