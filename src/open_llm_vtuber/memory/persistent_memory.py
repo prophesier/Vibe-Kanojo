@@ -393,6 +393,12 @@ class PersistentMemoryManager:
                 for uid in unprocessed_uids:
                     self._mark_diary_facts_extracted(uid)
                 logger.info("[memory] Fact backfill complete.")
+
+            # Enforce the fact cap unconditionally — covers the case where the
+            # user lowered max_facts in config but no new facts were extracted
+            # this run (in-place pruning otherwise only triggers when a fact is
+            # added, so an oversized file would keep injecting every entry).
+            await self._enforce_fact_limit_async(llm, persona=persona)
         except Exception as e:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
@@ -556,6 +562,27 @@ class PersistentMemoryManager:
             return [int(x) for x in data if isinstance(x, (int, float))]
         except (json.JSONDecodeError, TypeError, ValueError):
             return []
+
+    async def _enforce_fact_limit_async(self, llm: Any, persona: str = "") -> None:
+        """Trim facts.json down to max_facts if it currently exceeds the cap.
+
+        In-place pruning otherwise only runs when a new fact is added, so a
+        file that became oversized (e.g. the user lowered max_facts in config)
+        would keep injecting every entry into the prompt until the next
+        extraction. This is called once per startup from backfill_async.
+        """
+        facts = self._load_facts()
+        if len(facts) <= self._max_facts:
+            return
+        logger.info(
+            f"[memory] facts.json has {len(facts)} entries, over the "
+            f"max_facts={self._max_facts} cap; pruning down."
+        )
+        pruned = await self._prune_facts_with_llm(
+            facts, self._max_facts, llm, persona=persona
+        )
+        self._save_facts(pruned)
+        logger.info(f"[memory] Pruned facts to {len(pruned)} entries.")
 
     async def _prune_facts_with_llm(
         self,
