@@ -939,6 +939,18 @@ class BasicMemoryAgent(AgentInterface):
                     text_chunk = ""
                     if isinstance(event, dict) and event.get("type") == "text_delta":
                         text_chunk = event.get("text", "")
+                    elif (
+                        isinstance(event, dict)
+                        and event.get("type") == "web_search_marker"
+                    ):
+                        # Inline "searched the web" indicator. Streamed for
+                        # display (Discord + web stay in sync) but deliberately
+                        # NOT added to complete_response, so it isn't saved to
+                        # history and the model can't learn to fake the marker.
+                        marker = event.get("text", "")
+                        if marker:
+                            yield marker
+                        continue
                     elif isinstance(event, str):
                         text_chunk = event
                     else:
