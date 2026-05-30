@@ -187,9 +187,13 @@ class PersistentMemoryManager:
                 f"({len(conv_text)} chars conversation, {len(diary_context)} chars diary context)"
             )
             logger.debug(f"[memory] Fact extraction conversation preview: {conv_text[:400]!r}")
-            raw = await self._call_llm(
-                llm, self._with_persona(_FACT_EXTRACT_SYSTEM, persona), prompt
-            )
+            # NOTE: fact extraction deliberately does NOT prepend persona.
+            # Persona context was tried but conflicts directly with the
+            # "no roleplay / no [tag] markers / raw JSON only" instructions
+            # (the persona tells the model to be the character with tags),
+            # causing it to defensively output []. Fact extraction wants an
+            # objective, neutral lens on the user, not a character lens.
+            raw = await self._call_llm(llm, _FACT_EXTRACT_SYSTEM, prompt)
             logger.info(f"[memory] Fact-extraction LLM raw output: {raw[:500]!r}")
             new_facts = self._parse_json_list(raw)
             if not new_facts:
@@ -629,9 +633,9 @@ class PersistentMemoryManager:
             f"削除する{excess}個のインデックスをJSON配列で出力: [n, n, ...]"
         )
         try:
-            raw = await self._call_llm(
-                llm, self._with_persona(_FACT_PRUNE_SYSTEM, persona), prompt
-            )
+            # Same rationale as extract_facts_async: skip persona prefix to
+            # avoid the "be in character / output only raw JSON" contradiction.
+            raw = await self._call_llm(llm, _FACT_PRUNE_SYSTEM, prompt)
             indices = sorted(
                 {i for i in self._parse_int_list(raw) if 0 <= i < len(facts)}
             )
