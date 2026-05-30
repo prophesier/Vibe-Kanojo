@@ -142,6 +142,7 @@ class AsyncLLM(StatelessLLMInterface):
         messages: List[Dict[str, Any]],
         system: Union[str, List[Dict[str, Any]]] = None,
         tools: List[Dict[str, Any]] = None,
+        max_tokens: int = 1024,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a chat completion using the Claude API asynchronously,
@@ -196,7 +197,7 @@ class AsyncLLM(StatelessLLMInterface):
                 messages=converted_messages,
                 system=system if system else (self.system if self.system else ""),
                 model=self.model,
-                max_tokens=1024,
+                max_tokens=max_tokens,
                 tools=final_tools if final_tools else NOT_GIVEN,
             ) as stream:
                 current_tool_call_info = None

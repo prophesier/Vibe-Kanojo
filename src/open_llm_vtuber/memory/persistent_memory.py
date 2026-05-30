@@ -13,7 +13,7 @@ import os
 import re
 import shutil
 from datetime import datetime
-from typing import Any, ClassVar, Dict, List, Set
+from typing import Any, ClassVar, Dict, List, Optional, Set
 from loguru import logger
 
 # Matches timestamp tags injected by _to_text_prompt: "[YYYY-MM-DD HH:MM:SS Weekday]"
@@ -21,7 +21,11 @@ _TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", r
 
 
 _FACT_EXTRACT_SYSTEM = (
-    "あなたは記憶アシスタントです。会話からユーザーに関する持続的な事実を抽出してください。\n"
+    "あなたはメモリ抽出ツールです。これは会話ではありません。"
+    "ロールプレイ、キャラクターとしての応答、感情表現タグ（[neutral]、[smirk]等）、"
+    "前置き、コメント、Markdown装飾、コードフェンス（```）は一切禁止です。\n"
+    "出力は**生のJSON配列のみ**。それ以外のテキストを1文字でも含めると失敗とみなされます。\n\n"
+    "タスク：会話からユーザーに関する持続的な事実を抽出する。\n"
     "抽出すべき情報（これに限らない）：\n"
     "- 個人情報：出身地、学歴（学部・専攻など）、職業、年齢層\n"
     "- 好み・趣味・習慣\n"
@@ -29,15 +33,16 @@ _FACT_EXTRACT_SYSTEM = (
     "- 進行中のプロジェクト、使用ツール・技術\n"
     "- 約束・合意事項\n"
     "- ユーザーの目標・課題・悩み\n\n"
-    "重要なガイドライン：\n"
+    "ガイドライン：\n"
     "- 会話の大半が技術的な内容でも、その中に1回だけ出てきたユーザー自身の情報も必ず抽出する\n"
     "- 中国語・日本語・英語が混在していても、すべての言語の発言を対象にする\n"
     "- 判断に迷うなら抽出する（省略するより多めに拾う方が良い）\n"
     "- 真に一時的・文脈依存で今後役に立たない情報だけをスキップする\n\n"
-    "既存の事実リストが提供される場合、それらを繰り返さないこと。新しい情報のみ抽出してください。\n"
-    "出力はJSONの配列のみ（日本語で記述）: "
+    "既存の事実リストが提供される場合、それらを繰り返さないこと。新しい情報のみ抽出する。\n\n"
+    "**出力形式（厳守）**：\n"
     '[{"fact": "ユーザーは物理学部出身"}, {"fact": "ユーザーはWindowsを使用している"}]\n'
-    "本当に新しい事実が1件もない場合のみ、空の配列を出力してください: []"
+    "本当に新しい事実が1件もない場合のみ、空の配列のみを出力する: []\n"
+    "繰り返す：JSON配列のみ。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。"
 )
 
 _DIARY_SYSTEM = (
@@ -539,7 +544,16 @@ class PersistentMemoryManager:
     async def _call_llm(llm: Any, system: str, prompt: str) -> str:
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         result = ""
-        async for event in llm.chat_completion(messages, system):
+        # Memory tasks (fact extraction, diary summary, fact pruning) can
+        # produce long JSON arrays or multi-sentence diary text. The default
+        # chat max_tokens=1024 has truncated fact arrays mid-entry; give
+        # these calls more headroom.
+        try:
+            stream = llm.chat_completion(messages, system, max_tokens=4096)
+        except TypeError:
+            # Older LLM impls without max_tokens param — fall back silently.
+            stream = llm.chat_completion(messages, system)
+        async for event in stream:
             if isinstance(event, str):
                 result += event
             elif isinstance(event, dict) and event.get("type") == "text_delta":
@@ -638,13 +652,99 @@ class PersistentMemoryManager:
 
     @staticmethod
     def _parse_json_list(text: str) -> List[Dict[str, Any]]:
+        """Extract a JSON array of {"fact": ...} objects from LLM output.
+
+        Robust to two failure modes seen in the wild:
+        1) The LLM prefaces its response with in-character text containing
+           [neutral] / [smirk] / etc. — naive "first [ to last ]" would span
+           the whole thing and fail to parse.
+        2) The LLM wraps the array in a ```json fenced block.
+        3) The LLM is cut off mid-array by max_tokens, so the final entry
+           is partial — recover everything up to the last complete object.
+        """
         text = text.strip()
-        # Find the first '[' and last ']'
-        start = text.find("[")
-        end = text.rfind("]")
-        if start == -1 or end == -1:
+        if not text:
             return []
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
+
+        # Prefer a ```json ... ``` fence if present.
+        fence_start = text.find("```json")
+        if fence_start != -1:
+            after = text[fence_start + len("```json") :]
+            fence_end = after.find("```")
+            candidate = after[:fence_end] if fence_end != -1 else after
+            parsed = PersistentMemoryManager._try_parse_fact_array(candidate)
+            if parsed is not None:
+                return parsed
+
+        # Otherwise look for "[{" — the only legitimate start of a JSON
+        # array-of-objects of facts. This skips any leading [tag] markers
+        # the model emitted in-character before the real array.
+        start = text.find("[{")
+        if start == -1:
+            # Maybe it's the empty array "[]" or a truncated start.
+            start = text.find("[]")
+            if start != -1:
+                return []
             return []
+        candidate = text[start:]
+        parsed = PersistentMemoryManager._try_parse_fact_array(candidate)
+        return parsed if parsed is not None else []
+
+    @staticmethod
+    def _try_parse_fact_array(candidate: str) -> Optional[List[Dict[str, Any]]]:
+        """Try strict JSON first; on failure, recover entries object-by-object.
+
+        Returns None if nothing useful could be parsed.
+        """
+        candidate = candidate.strip()
+        if not candidate:
+            return None
+        # Strict parse: works when the LLM closed the array cleanly.
+        end = candidate.rfind("]")
+        if end != -1:
+            try:
+                data = json.loads(candidate[: end + 1])
+                if isinstance(data, list):
+                    return [x for x in data if isinstance(x, dict)]
+            except json.JSONDecodeError:
+                pass
+        # Lenient parse: walk the string and extract balanced {...} objects.
+        # Handles max_tokens truncation that left the array unclosed.
+        results: List[Dict[str, Any]] = []
+        i = 0
+        n = len(candidate)
+        while i < n:
+            if candidate[i] != "{":
+                i += 1
+                continue
+            depth = 0
+            in_str = False
+            esc = False
+            j = i
+            while j < n:
+                c = candidate[j]
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            try:
+                                obj = json.loads(candidate[i : j + 1])
+                                if isinstance(obj, dict):
+                                    results.append(obj)
+                            except json.JSONDecodeError:
+                                pass
+                            break
+                j += 1
+            else:
+                # Reached end without closing — truncated final object, drop it.
+                break
+            i = j + 1
+        return results if results else None
