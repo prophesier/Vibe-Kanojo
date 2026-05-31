@@ -129,8 +129,20 @@ class PersistentMemoryManager:
         facts = self._load_facts()
         if not facts:
             return ""
-        lines = "\n".join(f"- {f['fact']}" for f in facts)
-        return f"## ユーザーに関する長期記憶（事実）\n{lines}"
+        lines = []
+        for f in facts:
+            updated = str(f.get("updated", ""))
+            date = updated[:10] if len(updated) >= 10 else "不明"
+            lines.append(f"- [{date}] {f['fact']}")
+        body = "\n".join(lines)
+        header = (
+            "## ユーザーに関する長期記憶（事実）\n"
+            "各事実の冒頭の `[YYYY-MM-DD]` は、その事実が**このリストに記録された日**で"
+            "あり、出来事が実際に起きた日ではない。"
+            "事実抽出は次のセッション開始時にまとめて行われるため、"
+            "実際の出来事はその数時間〜数日前に起きている可能性がある点に注意。"
+        )
+        return f"{header}\n\n{body}"
 
     def get_diaries_prompt(self) -> str:
         """Return the diary block for the system prompt (empty string if no diaries)."""
