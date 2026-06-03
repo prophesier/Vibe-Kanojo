@@ -80,6 +80,7 @@ async def _main() -> int:
         command_prefix=discord_cfg.command_prefix,
         admin_user_id=discord_cfg.admin_user_id,
         project_root=project_root,
+        full_config=config,
     )
 
     await bridge.start()
