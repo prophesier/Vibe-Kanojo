@@ -860,16 +860,23 @@ class PersistentMemoryManager:
         Called at the very start of backfill_async so the consolidated file
         becomes the base for any subsequent extraction/pruning in the same
         backfill run. Returns True if a promotion happened.
+
+        The pre-consolidation snapshot is saved with a timestamped name so
+        each manual consolidation's "before" state is preserved permanently
+        (consolidations are manual + rare, so the backup files won't
+        accumulate excessively — and the user explicitly wants the ability
+        to review or roll back later).
         """
         staged = self._staged_facts_path
         if not os.path.exists(staged):
             return False
         try:
-            # Backup current facts.json before overwriting.
             if os.path.exists(self._facts_path):
-                bak = self._facts_path + ".bak.before-consolidation"
+                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+                bak = f"{self._facts_path}.bak.pre-consolidation-{ts}"
                 try:
                     shutil.copy2(self._facts_path, bak)
+                    logger.info(f"[memory] Pre-consolidation backup → {bak}")
                 except Exception as e:
                     logger.warning(
                         f"[memory] Could not back up before consolidation: {e}"
