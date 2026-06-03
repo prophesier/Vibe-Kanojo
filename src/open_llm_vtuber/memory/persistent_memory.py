@@ -57,22 +57,27 @@ _DIARY_SYSTEM = (
 )
 
 _FACT_PRUNE_SYSTEM = (
-    "あなたは記憶アシスタントです。ユーザーに関する事実リストが保存上限を超えました。"
-    "AIキャラクターの視点から、最も価値の低い項目を選んで削除する必要があります。\n\n"
-    "各事実には更新日時が付いています。以下の優先順位で削除対象を選んでください：\n\n"
+    "あなたはメモリ整理ツールです。これは会話ではありません。"
+    "ロールプレイ、キャラクターとしての応答、感情表現タグ（[neutral]、[smirk]等）、"
+    "前置き、コメント、Markdown装飾、コードフェンス（```）は一切禁止です。\n"
+    "出力は**生のJSON配列のみ**。それ以外のテキストを1文字でも含めると失敗とみなされます。\n\n"
+    "タスク：ユーザーに関する事実リストが保存上限を超えたため、"
+    "最も価値の低い項目を選んで削除する。\n\n"
+    "各事実には更新日時が付いている。以下の優先順位で削除対象を選ぶこと：\n\n"
     "【優先的に削除】\n"
     "- 新しい事実によって上書き・無効化された古い情報\n"
     "  （例: 古い「プロジェクトA取り組み中」と新しい「プロジェクトBに移行」が両方ある場合、古い方）\n"
     "- 時間の経過により時効・陳腐化した情報（古い日時のその場限りのタスク・状況など）\n"
     "- 一時的・状況依存で今後参照する可能性が低い情報\n"
     "- 同じ内容の重複（古い方）\n"
-    "- 人格設定の視点から、ユーザーとの関係に影響が薄い些細な情報\n\n"
+    "- ユーザー像を理解する上で重要性が低い些細な情報\n\n"
     "【残すべき】\n"
     "- 出身、学歴、職業、人間関係など長期的に変わらない個人情報\n"
     "- 価値観・性格・趣味・習慣など\n"
     "- 新しい日時の情報（古い情報より優先）\n\n"
-    "削除するインデックス（数字）のみをJSON配列で出力してください: [3, 7, 12]\n"
-    "他のテキストは一切出力しないこと。"
+    "**出力形式（厳守）**：\n"
+    "削除するインデックス（数字）のみをJSON配列で出力する: [3, 7, 12]\n"
+    "繰り返す：JSON配列のみ。他のテキスト・記号は一切含めない。"
 )
 
 
@@ -206,7 +211,9 @@ class PersistentMemoryManager:
             # causing it to defensively output []. Fact extraction wants an
             # objective, neutral lens on the user, not a character lens.
             raw = await self._call_llm(llm, _FACT_EXTRACT_SYSTEM, prompt)
-            logger.info(f"[memory] Fact-extraction LLM raw output: {raw[:500]!r}")
+            # Full raw output (not truncated): we want to see exactly what
+            # the LLM returned, including any preamble that fooled the parser.
+            logger.info(f"[memory] Fact-extraction LLM raw output:\n{raw}")
             new_facts = self._parse_json_list(raw)
             if not new_facts:
                 logger.info("[memory] No new facts extracted.")
@@ -215,16 +222,29 @@ class PersistentMemoryManager:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             tagged = [{"fact": f["fact"], "updated": now} for f in new_facts if "fact" in f]
             merged = existing + tagged
-            # Smart trim: ask the LLM (in-character) to drop least-important
-            # entries when over the cap, instead of blindly dropping by age.
+            # Smart trim: ask the LLM to drop least-important entries when
+            # over the cap. The whole merged pool (old + new) is the
+            # candidate set — newly extracted facts are NOT privileged.
             if len(merged) > self._max_facts:
                 merged = await self._prune_facts_with_llm(
                     merged, self._max_facts, llm, persona=persona
                 )
             self._save_facts(merged)
-            logger.info(
-                f"[memory] Added {len(tagged)} new fact(s) → {self._facts_path} "
-                f"(total: {len(merged)})"
+
+            # Detailed multi-line summary: distinguish which newly-extracted
+            # facts survived, which were dropped right after extraction, and
+            # which existing facts were displaced.
+            final_text = {m["fact"] for m in merged}
+            new_kept = [t for t in tagged if t["fact"] in final_text]
+            new_dropped = [t for t in tagged if t["fact"] not in final_text]
+            existing_dropped = [
+                e for e in existing if e["fact"] not in final_text
+            ]
+            self._log_fact_update(
+                added=new_kept,
+                discarded_new=new_dropped,
+                dropped_existing=existing_dropped,
+                total=len(merged),
             )
         except Exception as e:
             logger.warning(f"[memory] Fact extraction failed: {e}", exc_info=True)
@@ -597,6 +617,43 @@ class PersistentMemoryManager:
         except (json.JSONDecodeError, TypeError, ValueError):
             return []
 
+    def _log_fact_update(
+        self,
+        *,
+        added: List[Dict[str, Any]],
+        discarded_new: List[Dict[str, Any]],
+        dropped_existing: List[Dict[str, Any]],
+        total: int,
+    ) -> None:
+        """Multi-line summary of an extraction/pruning round.
+
+        Each fact gets its own line so long updates stay readable in the
+        log. Three buckets are reported separately:
+          - added: newly extracted facts that survived any concurrent pruning
+          - discarded_new: just-extracted facts that the prune step dropped
+          - dropped_existing: pre-existing facts that the prune step dropped
+        """
+        lines = [f"[memory] Fact update → {self._facts_path} (total: {total})"]
+        if added:
+            lines.append(f"  Added {len(added)} new fact(s):")
+            for f in added:
+                lines.append(f"    + {f['fact']}")
+        if discarded_new:
+            lines.append(
+                f"  Discarded {len(discarded_new)} newly-extracted fact(s) "
+                "(judged less valuable than alternatives):"
+            )
+            for f in discarded_new:
+                lines.append(f"    - {f['fact']}")
+        if dropped_existing:
+            lines.append(f"  Dropped {len(dropped_existing)} existing fact(s):")
+            for f in dropped_existing:
+                date = str(f.get("updated", ""))[:10] or "不明"
+                lines.append(f"    - [{date}] {f['fact']}")
+        if not (added or discarded_new or dropped_existing):
+            lines.append("  (no changes)")
+        logger.info("\n".join(lines))
+
     async def _enforce_fact_limit_async(self, llm: Any, persona: str = "") -> None:
         """Trim facts.json down to max_facts if it currently exceeds the cap.
 
@@ -616,7 +673,14 @@ class PersistentMemoryManager:
             facts, self._max_facts, llm, persona=persona
         )
         self._save_facts(pruned)
-        logger.info(f"[memory] Pruned facts to {len(pruned)} entries.")
+        pruned_text = {p["fact"] for p in pruned}
+        dropped = [f for f in facts if f["fact"] not in pruned_text]
+        self._log_fact_update(
+            added=[],
+            discarded_new=[],
+            dropped_existing=dropped,
+            total=len(pruned),
+        )
 
     async def _prune_facts_with_llm(
         self,
@@ -657,8 +721,12 @@ class PersistentMemoryManager:
                     f"expected {excess}; falling back to FIFO trimming."
                 )
                 return facts[-target_count:]
-            dropped = [facts[i]["fact"] for i in indices]
-            logger.info(f"[memory] LLM-pruned {excess} fact(s): {dropped}")
+            # Verbose per-fact reporting is done by the caller via
+            # _log_fact_update; keep only a debug breadcrumb here.
+            logger.debug(
+                f"[memory] LLM-prune picked indices {sorted(indices)} "
+                f"of {len(facts)} fact(s) for removal."
+            )
             return [f for i, f in enumerate(facts) if i not in set(indices)]
         except Exception as e:
             logger.warning(
