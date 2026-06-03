@@ -45,6 +45,47 @@ _FACT_EXTRACT_SYSTEM = (
     "繰り返す：JSON配列のみ。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。"
 )
 
+_CONSOLIDATE_SYSTEM = (
+    "あなたはメモリ整理ツールです。これは会話ではありません。"
+    "ロールプレイ、キャラクターとしての応答、感情表現タグ（[neutral]等）、"
+    "前置き、コメント、Markdown装飾、コードフェンス（```）は一切禁止です。\n"
+    "出力は**生のJSON配列のみ**。それ以外のテキストを1文字でも含めると失敗とみなされます。\n\n"
+    "タスク：ユーザーに関する事実リストを整理し、関連性の高い項目を1つに統合する。"
+    "総数を減らしつつ情報量は保つことが目的。\n\n"
+    "【統合の対象例】\n"
+    "- 同じカテゴリの列挙系：\n"
+    "  例：複数の「視聴したアニメ」→「ユーザーは A, B, C を視聴した」\n"
+    "  例：複数の「使用ツール」→「ユーザーは X, Y, Z を使用している」\n"
+    "- 同じテーマの周辺事実を要約：\n"
+    "  例：「物理学部出身」+「物理学を専攻」→「ユーザーは物理学部出身で物理学を専攻していた」\n"
+    "- 微妙な重複・言い換え（古い方を新しい表現に統合）\n\n"
+    "【統合の厳格なルール】\n"
+    "- 元の情報を**全て**保持すること。情報の削除・歪曲・過度な要約は禁止。\n"
+    "- 推測で情報を追加してはならない。元の事実に明記されていない内容は書かない。\n"
+    "- 単独で意味を持つ重要な事実は無理に統合しない：\n"
+    "  - 個人情報（出身、学歴、資格、職業、年齢、家族）\n"
+    "  - 約束・合意事項\n"
+    "  - 人生の節目・重要な出来事・トラウマ\n"
+    "  - 価値観・信念\n"
+    "- 統合すると元の情報の特異性が失われる場合は統合しない。\n"
+    "- 各統合グループには**少なくとも2個**のインデックスを含めること（1個だけは統合ではない）。\n"
+    "- 同じインデックスを複数のグループに含めてはならない。\n"
+    "- 統合候補が無ければ空の配列 `[]` を出力する。\n\n"
+    "**出力形式（厳守）**：\n"
+    "[\n"
+    '  {"merge": [元のインデックス1, インデックス2, ...], "into": "統合後の事実文"},\n'
+    '  {"merge": [...], "into": "..."},\n'
+    "  ...\n"
+    "]\n\n"
+    "例：\n"
+    "[\n"
+    '  {"merge": [3, 7, 12], "into": "ユーザーは『ひぐらしのなく頃に』『サマータイムレンダ』『xxx』を視聴した"},\n'
+    '  {"merge": [5, 9], "into": "ユーザーは物理学部出身で物理学を専攻していた"}\n'
+    "]\n\n"
+    "繰り返す：JSON配列のみ。前置き・コメント・Markdownは禁止。"
+)
+
+
 _DIARY_SYSTEM = (
     "あなたは記憶アシスタントです。AIキャラクターの一人称視点から、"
     "この会話セッションを簡潔な日記として2〜4文でまとめてください。"
@@ -63,18 +104,36 @@ _FACT_PRUNE_SYSTEM = (
     "出力は**生のJSON配列のみ**。それ以外のテキストを1文字でも含めると失敗とみなされます。\n\n"
     "タスク：ユーザーに関する事実リストが保存上限を超えたため、"
     "最も価値の低い項目を選んで削除する。\n\n"
-    "各事実には更新日時が付いている。以下の優先順位で削除対象を選ぶこと：\n\n"
+    "各事実には記録日が付いている（形式: [YYYY-MM-DD]）。"
+    "この日付は事実が記録された日であり、出来事が起きた日ではない点に注意。\n\n"
+    "【絶対に削除してはならない（最高優先度で保持）】\n"
+    "記録日に関わらず、以下に該当する情報はユーザーの本質を定義する：\n"
+    "- 学歴・資格・試験合格（JLPT合格、IT資格、卒業学部・専攻など）\n"
+    "- 職業・キャリア上の達成、専門スキル\n"
+    "- 出身地、年齢層、家族構成、重要な人間関係\n"
+    "- 価値観、信念、性格特性、長期的な趣味\n"
+    "- 過去の重要な経験・トラウマ・転機となった出来事\n"
+    "- 健康状態・宗教・政治信条など個人を定義する基本属性\n"
+    "これらは「古いから」「最近触れていないから」「日付が古いから」"
+    "という理由で削除してはならない。\n\n"
     "【優先的に削除】\n"
     "- 新しい事実によって上書き・無効化された古い情報\n"
-    "  （例: 古い「プロジェクトA取り組み中」と新しい「プロジェクトBに移行」が両方ある場合、古い方）\n"
-    "- 時間の経過により時効・陳腐化した情報（古い日時のその場限りのタスク・状況など）\n"
-    "- 一時的・状況依存で今後参照する可能性が低い情報\n"
+    "  （例: 古い「Aプロジェクト取り組み中」と新しい「Bプロジェクトに移行」が両方ある場合、古い方）\n"
+    "- 時間の経過により時効・陳腐化した一時的情報\n"
+    "  （例: 数週間前の「明日締切のタスク」、過去の一日限りの予定）\n"
     "- 同じ内容の重複（古い方）\n"
-    "- ユーザー像を理解する上で重要性が低い些細な情報\n\n"
-    "【残すべき】\n"
-    "- 出身、学歴、職業、人間関係など長期的に変わらない個人情報\n"
-    "- 価値観・性格・趣味・習慣など\n"
-    "- 新しい日時の情報（古い情報より優先）\n\n"
+    "- 今この瞬間の状況・行動のうち、ユーザー像を理解する上で重要でないもの\n"
+    "  （例: 「今プレイ中のゲーム名」「今夜食べたメニュー」など）\n\n"
+    "【重要原則】\n"
+    "「新しい」ことそれ自体は重要性の指標ではない。"
+    "**新しいが些細な情報より、古いが本質的な情報の方が常に価値が高い**。\n"
+    "例：「[2026-03-01] JLPT N1合格」のような達成事項は、"
+    "「[2026-05-30] 今プレイ中のゲーム名」のような一時情報より、"
+    "たとえ前者が古くても優先的に保持する。\n\n"
+    "【記録日の使い方】\n"
+    "削除候補の重要性が完全に同じレベルで甲乙つけがたい場合に限り、"
+    "「より新しい記録日のものを残す」をタイブレーカーとして使ってよい。"
+    "それ以外で日付を主要な判断基準にしてはならない。\n\n"
     "**出力形式（厳守）**：\n"
     "削除するインデックス（数字）のみをJSON配列で出力する: [3, 7, 12]\n"
     "繰り返す：JSON配列のみ。他のテキスト・記号は一切含めない。"
@@ -344,6 +403,11 @@ class PersistentMemoryManager:
         PersistentMemoryManager._backfill_in_progress.add(conf_uid)
         try:
             from ..chat_history_manager import get_history_list, get_history
+
+            # Promote any pending consolidation result BEFORE the rest of
+            # backfill, so subsequent extraction/pruning operates on the
+            # consolidated baseline rather than the pre-consolidation one.
+            self._promote_staged_facts_if_present()
 
             history_list = get_history_list(conf_uid)
 
@@ -654,6 +718,173 @@ class PersistentMemoryManager:
             lines.append("  (no changes)")
         logger.info("\n".join(lines))
 
+    @property
+    def _staged_facts_path(self) -> str:
+        """Path to the pending consolidated facts file."""
+        return os.path.join(self._base_dir, "facts.consolidated.json")
+
+    async def consolidate_facts_to_staged(self, llm: Any) -> Dict[str, Any]:
+        """Run LLM-based fact consolidation and write the result to a staged
+        file alongside facts.json.
+
+        The current facts.json is **not modified** — the active session
+        keeps using it. On the next OLV startup, backfill_async detects the
+        staged file and promotes it to facts.json before running the
+        normal extraction/pruning passes.
+
+        Returns a dict with stats and per-merge breakdown for the caller
+        (Discord bot) to surface to the user.
+        """
+        facts = self._load_facts()
+        result: Dict[str, Any] = {
+            "ok": False,
+            "before": len(facts),
+            "after": len(facts),
+            "merges": [],
+            "message": "",
+        }
+        if len(facts) < 2:
+            result["message"] = "Need at least 2 facts to consolidate."
+            return result
+
+        numbered = "\n".join(
+            f"{i} [{str(f.get('updated', ''))[:10] or '不明'}]: {f['fact']}"
+            for i, f in enumerate(facts)
+        )
+        prompt = (
+            f"現在 {len(facts)} 個の事実がある。\n\n"
+            f"事実リスト（形式: インデックス [記録日]: 内容）:\n{numbered}\n\n"
+            "統合できる項目があれば指定形式で出力。なければ `[]`。"
+        )
+
+        try:
+            raw = await self._call_llm(llm, _CONSOLIDATE_SYSTEM, prompt)
+            logger.info(f"[memory] Fact-consolidation LLM raw output:\n{raw}")
+            proposals = self._parse_json_list(raw)
+        except Exception as e:
+            logger.warning(f"[memory] Consolidation LLM call failed: {e}", exc_info=True)
+            result["message"] = f"LLM call failed: {e}"
+            return result
+
+        # Validate proposals: each merge needs ≥2 valid indices, into must
+        # be a non-empty string, no index reused across groups.
+        used_indices: set = set()
+        valid: List[Dict[str, Any]] = []
+        for m in proposals:
+            into = m.get("into", "")
+            if not isinstance(into, str) or not into.strip():
+                continue
+            raw_indices = m.get("merge", [])
+            if not isinstance(raw_indices, list):
+                continue
+            indices = [
+                i for i in raw_indices
+                if isinstance(i, int) and 0 <= i < len(facts) and i not in used_indices
+            ]
+            if len(indices) < 2:
+                continue
+            used_indices.update(indices)
+            valid.append({"merge": indices, "into": into.strip()})
+
+        if not valid:
+            logger.info("[memory] No valid consolidations proposed.")
+            result["ok"] = True
+            result["message"] = "No consolidation opportunities found."
+            return result
+
+        # Build the new fact list: keep unmerged entries; append one entry
+        # per valid merge with `updated` set to the newest date among the
+        # source facts (no new fact was created, just reorganised).
+        merged_text_set = used_indices
+        survivors = [
+            f for i, f in enumerate(facts) if i not in merged_text_set
+        ]
+        new_merged: List[Dict[str, Any]] = []
+        for m in valid:
+            source_dates = [
+                str(facts[i].get("updated", "")) for i in m["merge"]
+            ]
+            source_dates = [d for d in source_dates if d]
+            newest = max(source_dates) if source_dates else (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            )
+            new_merged.append({"fact": m["into"], "updated": newest})
+
+        new_facts = survivors + new_merged
+
+        # Write to staged file (NOT facts.json). Backfill will promote it
+        # atomically at the next OLV startup.
+        try:
+            os.makedirs(self._base_dir, exist_ok=True)
+            with open(self._staged_facts_path, "w", encoding="utf-8") as f:
+                json.dump(new_facts, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"[memory] Failed to write staged facts file: {e}")
+            result["message"] = f"Failed to write staged file: {e}"
+            return result
+
+        # Build per-merge log + return payload.
+        log_lines = [
+            f"[memory] Consolidation staged → {self._staged_facts_path} "
+            f"({len(facts)} → {len(new_facts)}, {len(valid)} merge group(s))"
+        ]
+        merges_summary: List[Dict[str, Any]] = []
+        for m in valid:
+            sources = [
+                {
+                    "date": str(facts[i].get("updated", ""))[:10] or "不明",
+                    "fact": facts[i]["fact"],
+                }
+                for i in m["merge"]
+            ]
+            merges_summary.append({"into": m["into"], "sources": sources})
+            log_lines.append(f"  Merged {len(m['merge'])} fact(s) into:")
+            log_lines.append(f"    + {m['into']}")
+            for s in sources:
+                log_lines.append(f"    ← [{s['date']}] {s['fact']}")
+        logger.info("\n".join(log_lines))
+
+        result["ok"] = True
+        result["after"] = len(new_facts)
+        result["merges"] = merges_summary
+        result["message"] = (
+            f"Consolidated {len(facts)} → {len(new_facts)} fact(s) in "
+            f"{len(valid)} merge group(s). Will take effect on next OLV restart."
+        )
+        return result
+
+    def _promote_staged_facts_if_present(self) -> bool:
+        """If a staged consolidated facts file exists, atomically replace
+        facts.json with it (after backing up the current file).
+
+        Called at the very start of backfill_async so the consolidated file
+        becomes the base for any subsequent extraction/pruning in the same
+        backfill run. Returns True if a promotion happened.
+        """
+        staged = self._staged_facts_path
+        if not os.path.exists(staged):
+            return False
+        try:
+            # Backup current facts.json before overwriting.
+            if os.path.exists(self._facts_path):
+                bak = self._facts_path + ".bak.before-consolidation"
+                try:
+                    shutil.copy2(self._facts_path, bak)
+                except Exception as e:
+                    logger.warning(
+                        f"[memory] Could not back up before consolidation: {e}"
+                    )
+            os.replace(staged, self._facts_path)
+            logger.info(
+                f"[memory] Promoted staged consolidated facts → {self._facts_path}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[memory] Failed to promote staged consolidated facts: {e}"
+            )
+            return False
+
     async def _enforce_fact_limit_async(self, llm: Any, persona: str = "") -> None:
         """Trim facts.json down to max_facts if it currently exceeds the cap.
 
@@ -760,17 +991,20 @@ class PersistentMemoryManager:
             if parsed is not None:
                 return parsed
 
-        # Otherwise look for "[{" — the only legitimate start of a JSON
-        # array-of-objects of facts. This skips any leading [tag] markers
-        # the model emitted in-character before the real array.
-        start = text.find("[{")
-        if start == -1:
-            # Maybe it's the empty array "[]" or a truncated start.
-            start = text.find("[]")
-            if start != -1:
+        # Otherwise look for "[" followed (after any whitespace) by "{" —
+        # the start of a JSON array-of-objects. Allow whitespace/newlines
+        # between bracket and brace so cleanly-formatted multi-line output
+        # parses too, while still skipping leading [tag] in-character
+        # markers that have non-whitespace immediately after "[".
+        import re
+
+        m = re.search(r"\[\s*\{", text)
+        if m is None:
+            # Maybe the LLM correctly produced an empty array "[]".
+            if re.search(r"\[\s*\]", text):
                 return []
             return []
-        candidate = text[start:]
+        candidate = text[m.start():]
         parsed = PersistentMemoryManager._try_parse_fact_array(candidate)
         return parsed if parsed is not None else []
 
