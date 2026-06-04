@@ -70,6 +70,13 @@ class BasicMemoryAgent(AgentInterface):
         self._json_detector = StreamJSONDetector()
         self._memory_manager = None  # set via set_memory_manager()
 
+        # Tracks whether the current session's banner has already been
+        # prepended in _memory. Set by set_memory_from_recent_histories
+        # when the current session had pre-existing messages, OR by
+        # _add_message when injecting it onto the first user message of
+        # a freshly-started (empty-on-load) session.
+        self._current_session_banner_added = False
+
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
         if self._tool_manager:
@@ -154,6 +161,22 @@ class BasicMemoryAgent(AgentInterface):
 
         if not text_content and role == "assistant":
             return
+
+        # Inject the current-session banner onto the FIRST user message of
+        # a freshly-started session. set_memory_from_recent_histories
+        # cannot add it when the session is empty at load time, so this is
+        # the only point where a brand-new session gets its visible boundary.
+        if (
+            role == "user"
+            and text_content
+            and not self._current_session_banner_added
+            and self._memory_manager
+        ):
+            current_uid = getattr(self._memory_manager, "_current_session_uid", "")
+            if current_uid:
+                banner = self._session_header_text(current_uid, is_current=True)
+                text_content = f"{banner}\n{text_content}"
+                self._current_session_banner_added = True
 
         message_data = {
             "role": role,
@@ -449,6 +472,10 @@ class BasicMemoryAgent(AgentInterface):
         """
         sessions = get_recent_histories(conf_uid, n, exclude_uid=current_uid)
         self._memory = []
+        # Reset banner state; will be set True below if the current
+        # session already has messages here, or later by _add_message
+        # when the first user message of a fresh session comes in.
+        self._current_session_banner_added = False
         loaded_uids = []
         for uid, messages in sessions:
             loaded_uids.append(uid)
@@ -481,6 +508,7 @@ class BasicMemoryAgent(AgentInterface):
                         )
                         entry["content"] = f"{banner}\n{entry['content']}"
                         first_in_session = False
+                        self._current_session_banner_added = True
                     self._memory.append(entry)
             loaded_uids.append(current_uid)
 

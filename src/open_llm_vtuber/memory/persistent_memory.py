@@ -58,11 +58,30 @@ _CONSOLIDATE_SYSTEM = (
     "  例：複数の「使用ツール」→「ユーザーは X, Y, Z を使用している」\n"
     "- 同じテーマの周辺事実を要約：\n"
     "  例：「物理学部出身」+「物理学を専攻」→「ユーザーは物理学部出身で物理学を専攻していた」\n"
-    "- 微妙な重複・言い換え（古い方を新しい表現に統合）\n\n"
+    "- 微妙な重複・言い換え（古い方を新しい表現に統合）\n"
+    "- **矛盾・状態更新**：新しい事実が古い事実を無効化している場合、"
+    "新しい状態を反映するように統合する。どう統合するかは内容で判断：\n"
+    "  ・**単純な進捗・状態の上書き** → 新しい状態のみ残し、古いものは捨てる\n"
+    "    例：「ゼロエスケープの2章をプレイ中」+「3章をプレイ中」→「3章をプレイ中」\n"
+    "    例：「Aタスクに取り組み中」+「Aタスクを完了した」→「Aタスクを完了した」\n"
+    "  ・**経過自体に意味がある変化** → 「以前X、現在Y」の形で経過を残す\n"
+    "    例：「就職活動中」+「会社Aに内定」→「就職活動を経て会社Aに内定した」\n"
+    "    例：「雨が好き」+「雨が嫌いになった」→「以前は雨が好きだったが、今は嫌い」\n"
+    "    例：「東京在住」+「大阪に引っ越した」→「以前は東京、現在は大阪在住」\n"
+    "  ・判断基準：古い状態自体が**今後も参照する価値がある履歴か**。"
+    "達成、価値観の変化、人生の節目、好みの変化、住所・職業の変遷などは履歴として残す。"
+    "単なる進捗や状況の更新は上書きで構わない。\n"
+    "- **複合事実の部分更新（外科的修正）**：1つの事実に複数の独立した情報が含まれていて、"
+    "その**一部だけ**が新しい事実で無効化されている場合、その部分だけを更新する。"
+    "事実全体を捨てない。\n"
+    "  例：古い「ユーザーはAプロジェクト中で、Bツールを使用している」+ 新しい「Bプロジェクトに移行」\n"
+    "  → 「ユーザーはBプロジェクト中で、Bツールを使用している」（Bツール部分は保持、A部分のみ更新）\n\n"
     "【統合の厳格なルール】\n"
-    "- 元の情報を**全て**保持すること。情報の削除・歪曲・過度な要約は禁止。\n"
+    "- 統合元のうち**まだ有効な情報**は全て保持すること。"
+    "新しい事実で明示的に無効化された古い情報は捨ててよいが、"
+    "それ以外の意図的な省略・歪曲・過度な要約は禁止。\n"
     "- 推測で情報を追加してはならない。元の事実に明記されていない内容は書かない。\n"
-    "- 単独で意味を持つ重要な事実は無理に統合しない：\n"
+    "- 単独で意味を持つ重要な事実は無理に統合しない（矛盾・更新がある場合は別）：\n"
     "  - 個人情報（出身、学歴、資格、職業、年齢、家族）\n"
     "  - 約束・合意事項\n"
     "  - 人生の節目・重要な出来事・トラウマ\n"
@@ -134,6 +153,15 @@ _FACT_PRUNE_SYSTEM = (
     "削除候補の重要性が完全に同じレベルで甲乙つけがたい場合に限り、"
     "「より新しい記録日のものを残す」をタイブレーカーとして使ってよい。"
     "それ以外で日付を主要な判断基準にしてはならない。\n\n"
+    "【複合事実の扱い（重要）】\n"
+    "1つの事実に複数の独立した情報がまとまっている場合、"
+    "**その一部だけが古くなっていても削除しない**。"
+    "全体を削除すると、まだ有効な情報まで失うため。\n"
+    "例：「ユーザーはAプロジェクトに取り組み中で、Bツールを使用している」のうち、"
+    "Aだけが古い情報になっていても、Bツールの情報は現在も有効。"
+    "このような複合事実は削除候補から除外し、後から /facts-consolidate で"
+    "外科的に部分更新するのが正しい処理。\n"
+    "削除してよいのは**事実全体が陳腐化・無効化されている**ケースのみ。\n\n"
     "**出力形式（厳守）**：\n"
     "削除するインデックス（数字）のみをJSON配列で出力する: [3, 7, 12]\n"
     "繰り返す：JSON配列のみ。他のテキスト・記号は一切含めない。"
@@ -527,6 +555,16 @@ class PersistentMemoryManager:
         except Exception:
             return []
 
+    @staticmethod
+    def _sort_facts(facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Return a copy of facts sorted by `updated` ascending (oldest first).
+
+        Stored timestamps are ISO `YYYY-MM-DD HH:MM:SS`, so lexicographic
+        sort = chronological sort. Entries with missing/empty `updated`
+        sort first (treated as "earliest known").
+        """
+        return sorted(facts, key=lambda f: str(f.get("updated", "")))
+
     def _save_facts(self, facts: List[Dict[str, Any]]) -> None:
         os.makedirs(self._base_dir, exist_ok=True)
         # Backup current file before overwriting so accidental pruning can be
@@ -537,8 +575,11 @@ class PersistentMemoryManager:
                 shutil.copy2(self._facts_path, bak)
             except Exception as e:
                 logger.warning(f"[memory] Failed to backup facts.json: {e}")
+        # Always persist in chronological order so the file is predictable
+        # both for the LLM (oldest-first reading) and human review.
+        ordered = self._sort_facts(facts)
         with open(self._facts_path, "w", encoding="utf-8") as f:
-            json.dump(facts, f, ensure_ascii=False, indent=2)
+            json.dump(ordered, f, ensure_ascii=False, indent=2)
 
     def _mark_diary_facts_extracted(self, history_uid: str) -> None:
         """Set facts_extracted=True on the diary file for history_uid (no-op if missing)."""
@@ -813,11 +854,14 @@ class PersistentMemoryManager:
         new_facts = survivors + new_merged
 
         # Write to staged file (NOT facts.json). Backfill will promote it
-        # atomically at the next OLV startup.
+        # atomically at the next OLV startup. Same chronological sort as
+        # the main _save_facts path so the staged + promoted file is
+        # immediately ordered.
         try:
             os.makedirs(self._base_dir, exist_ok=True)
+            ordered = self._sort_facts(new_facts)
             with open(self._staged_facts_path, "w", encoding="utf-8") as f:
-                json.dump(new_facts, f, ensure_ascii=False, indent=2)
+                json.dump(ordered, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"[memory] Failed to write staged facts file: {e}")
             result["message"] = f"Failed to write staged file: {e}"
