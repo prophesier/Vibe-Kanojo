@@ -495,7 +495,12 @@ class BasicMemoryAgent(AgentInterface):
         # Always append the current session last so conversation continuity
         # is preserved even for clients that join mid-session.
         if current_uid:
-            current_messages = get_history(conf_uid, current_uid)
+            # quiet=True: the current session's empty metadata file may have
+            # just been cleaned up by get_history_list (called inside
+            # get_recent_histories above), which is harmless — we'd just
+            # treat it as "no messages yet" — but the missing-file warning
+            # would otherwise fire on every fresh-session startup.
+            current_messages = get_history(conf_uid, current_uid, quiet=True)
             if current_messages:
                 first_in_session = True
                 for msg in current_messages:
