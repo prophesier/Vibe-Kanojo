@@ -206,8 +206,16 @@ def update_metadate(conf_uid: str, history_uid: str, metadata: dict) -> bool:
     return False
 
 
-def get_history(conf_uid: str, history_uid: str) -> List[HistoryMessage]:
-    """Read chat history for the given conf_uid and history_uid"""
+def get_history(
+    conf_uid: str, history_uid: str, *, quiet: bool = False
+) -> List[HistoryMessage]:
+    """Read chat history for the given conf_uid and history_uid.
+
+    ``quiet=True`` suppresses the "file not found" warning for callers
+    that legitimately expect the file might not exist (e.g. probing a
+    freshly-created session whose empty metadata file was just cleaned
+    up by get_history_list).
+    """
     if not conf_uid or not history_uid:
         if not conf_uid:
             logger.warning("Missing conf_uid")
@@ -218,7 +226,8 @@ def get_history(conf_uid: str, history_uid: str) -> List[HistoryMessage]:
     filepath = _get_safe_history_path(conf_uid, history_uid)
 
     if not os.path.exists(filepath):
-        logger.warning(f"History file not found: {filepath}")
+        if not quiet:
+            logger.warning(f"History file not found: {filepath}")
         return []
 
     try:
