@@ -75,6 +75,9 @@ class LLMFactory:
                 llm_api_key=kwargs.get("llm_api_key"),
                 enable_web_search=kwargs.get("enable_web_search", False),
                 max_web_searches=kwargs.get("max_web_searches", 3),
+                enable_web_fetch=kwargs.get("enable_web_fetch", False),
+                max_web_fetches=kwargs.get("max_web_fetches", 5),
+                max_fetch_tokens=kwargs.get("max_fetch_tokens", 30000),
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {llm_provider}")

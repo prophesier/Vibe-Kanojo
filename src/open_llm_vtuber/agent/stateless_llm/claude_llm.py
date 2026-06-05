@@ -43,6 +43,9 @@ class AsyncLLM(StatelessLLMInterface):
         system: str = None,
         enable_web_search: bool = False,
         max_web_searches: int = 3,
+        enable_web_fetch: bool = False,
+        max_web_fetches: int = 5,
+        max_fetch_tokens: int = 30000,
     ):
         """
         Initialize Claude LLM.
@@ -55,14 +58,28 @@ class AsyncLLM(StatelessLLMInterface):
             enable_web_search (bool): Declare Anthropic's native web_search
                 server tool so Claude can search the web on its own decision.
             max_web_searches (int): Cap on searches per reply when enabled.
+            enable_web_fetch (bool): Declare Anthropic's native web_fetch
+                server tool so Claude can read full content from URLs
+                already present in the conversation.
+            max_web_fetches (int): Cap on URL fetches per reply when enabled.
+            max_fetch_tokens (int): Truncate any single fetched page above
+                this many tokens to bound per-turn input cost.
         """
         self.model = model
         self.system = system
         self._enable_web_search = enable_web_search
         self._max_web_searches = max_web_searches
+        self._enable_web_fetch = enable_web_fetch
+        self._max_web_fetches = max_web_fetches
+        self._max_fetch_tokens = max_fetch_tokens
         if enable_web_search:
             logger.info(
                 f"Claude native web search enabled (max {max_web_searches}/reply)."
+            )
+        if enable_web_fetch:
+            logger.info(
+                f"Claude native web fetch enabled "
+                f"(max {max_web_fetches}/reply, max {max_fetch_tokens} tokens/page)."
             )
 
         # Initialize Claude client. The extended-cache-ttl beta header lets us
@@ -177,9 +194,10 @@ class AsyncLLM(StatelessLLMInterface):
             ]
 
             # Build the tool list: caller-supplied tools plus Anthropic's
-            # native web_search server tool when enabled. Web search runs
-            # server-side within this same stream — no client round-trip —
-            # so we just declare it and parse the extra result blocks below.
+            # native server tools when enabled. Both web_search and
+            # web_fetch run server-side within this same stream — no client
+            # round-trip — so we just declare them and parse the extra
+            # result blocks below.
             final_tools = list(tools) if tools else []
             if self._enable_web_search:
                 final_tools.append(
@@ -187,6 +205,20 @@ class AsyncLLM(StatelessLLMInterface):
                         "type": "web_search_20250305",
                         "name": "web_search",
                         "max_uses": self._max_web_searches,
+                    }
+                )
+            if self._enable_web_fetch:
+                # Stay on the basic web_fetch version: the newer
+                # web_fetch_20260209 adds dynamic filtering but requires
+                # the code_execution tool to be enabled, which we don't
+                # use here. max_content_tokens caps how big each fetched
+                # page is allowed to grow in our context window.
+                final_tools.append(
+                    {
+                        "type": "web_fetch_20250910",
+                        "name": "web_fetch",
+                        "max_uses": self._max_web_fetches,
+                        "max_content_tokens": self._max_fetch_tokens,
                     }
                 )
 
@@ -202,11 +234,13 @@ class AsyncLLM(StatelessLLMInterface):
             ) as stream:
                 current_tool_call_info = None
                 partial_json_accumulator = ""
-                # Track an in-flight server-side tool call (e.g. web_search)
-                # so its query-JSON deltas don't trip the client-tool path.
+                # Track an in-flight server-side tool call (web_search or
+                # web_fetch) so its input-JSON deltas don't trip the
+                # client-tool path. The accumulator collects the raw JSON;
+                # the parse-and-log happens at content_block_stop.
                 server_tool_index = None
                 server_tool_name = ""
-                server_tool_query = ""
+                server_tool_input_json = ""
 
                 async for event in stream:
                     if event.type == "message_start":
@@ -256,9 +290,14 @@ class AsyncLLM(StatelessLLMInterface):
                             server_tool_name = getattr(
                                 event.content_block, "name", "?"
                             )
-                            server_tool_query = ""
+                            server_tool_input_json = ""
+                            tag = (
+                                "web_fetch"
+                                if server_tool_name == "web_fetch"
+                                else "web_search"
+                            )
                             logger.info(
-                                f"[web_search] model invoked server tool "
+                                f"[{tag}] model invoked server tool "
                                 f"'{server_tool_name}'"
                             )
                         elif event.content_block.type == "web_search_tool_result":
@@ -269,6 +308,22 @@ class AsyncLLM(StatelessLLMInterface):
                             logger.info(
                                 f"[web_search] received results ({count} item(s))"
                             )
+                        elif event.content_block.type == "web_fetch_tool_result":
+                            # Fetched page content from Anthropic. Same as
+                            # search result: not surfaced as text, the model
+                            # weaves it into its next text output.
+                            inner = getattr(event.content_block, "content", None)
+                            url = getattr(inner, "url", None) if inner else None
+                            err = getattr(inner, "error_code", None) if inner else None
+                            if err:
+                                logger.info(
+                                    f"[web_fetch] fetch failed: {err} "
+                                    f"(url={url or '?'})"
+                                )
+                            else:
+                                logger.info(
+                                    f"[web_fetch] received content from {url or '?'}"
+                                )
                     elif event.type == "content_block_delta":
                         logger.debug(
                             f"Stream: content_block_delta - Index: {event.index}, Delta Type: {event.delta.type}"
@@ -289,8 +344,10 @@ class AsyncLLM(StatelessLLMInterface):
                                 server_tool_index is not None
                                 and event.index == server_tool_index
                             ):
-                                # Accumulate the server tool's query JSON for logging.
-                                server_tool_query += event.delta.partial_json
+                                # Accumulate the server tool's input JSON
+                                # ({"query":"..."} for web_search,
+                                # {"url":"..."} for web_fetch).
+                                server_tool_input_json += event.delta.partial_json
                             else:
                                 logger.warning(
                                     f"Received input_json_delta but no active tool call matching index {event.index}"
@@ -299,33 +356,45 @@ class AsyncLLM(StatelessLLMInterface):
                         logger.debug(
                             f"Stream: content_block_stop - Index: {event.index}"
                         )
-                        # Server-side tool query finished — log what was searched.
+                        # Server-side tool input finished — parse the JSON,
+                        # log it, and emit the appropriate inline marker.
                         if (
                             server_tool_index is not None
                             and event.index == server_tool_index
                         ):
-                            query_str = ""
+                            parsed: Dict[str, Any] = {}
                             try:
-                                if server_tool_query.strip():
-                                    parsed = json.loads(server_tool_query)
-                                    query_str = str(parsed.get("query", "")).strip()
+                                if server_tool_input_json.strip():
+                                    parsed = json.loads(server_tool_input_json)
                             except json.JSONDecodeError:
-                                query_str = ""
-                            logger.info(
-                                f"[web_search] query: {query_str or '(empty)'}"
-                            )
-                            # Inline marker at the exact position the search was
-                            # triggered, so the reply shows where it looked things
-                            # up. Display-only (see basic_memory_agent handling).
+                                parsed = {}
+
                             if server_tool_name == "web_search":
+                                query_str = str(parsed.get("query", "")).strip()
+                                logger.info(
+                                    f"[web_search] query: {query_str or '(empty)'}"
+                                )
+                                # Inline marker shown to the user at the exact
+                                # position the search was triggered (display
+                                # only — see basic_memory_agent handling).
                                 shown = query_str[:80] if query_str else "..."
                                 yield {
                                     "type": "web_search_marker",
                                     "text": f"\n🔍 *Web検索: {shown}*\n",
                                 }
+                            elif server_tool_name == "web_fetch":
+                                url_str = str(parsed.get("url", "")).strip()
+                                logger.info(
+                                    f"[web_fetch] url: {url_str or '(empty)'}"
+                                )
+                                shown = url_str[:200] if url_str else "..."
+                                yield {
+                                    "type": "web_search_marker",
+                                    "text": f"\n🔗 *Web取得: {shown}*\n",
+                                }
                             server_tool_index = None
                             server_tool_name = ""
-                            server_tool_query = ""
+                            server_tool_input_json = ""
                         # Check if this stop corresponds to the active tool call
                         if (
                             current_tool_call_info
@@ -364,16 +433,26 @@ class AsyncLLM(StatelessLLMInterface):
                         logger.debug(
                             f"Stream: message_delta - Delta: {event.delta.model_dump(exclude_none=True)}, Usage: {event.usage}"
                         )
-                        # Report how many web searches this reply actually used.
+                        # Report how many server-tool calls this reply made.
+                        # Search counts toward the per-request billing tier;
+                        # fetch is free but content tokens hit input.
                         server_use = getattr(event.usage, "server_tool_use", None)
                         if server_use:
                             n_searches = getattr(
                                 server_use, "web_search_requests", 0
                             )
+                            n_fetches = getattr(
+                                server_use, "web_fetch_requests", 0
+                            )
                             if n_searches:
                                 logger.info(
                                     f"[web_search] this reply used {n_searches} "
                                     "web search request(s)"
+                                )
+                            if n_fetches:
+                                logger.info(
+                                    f"[web_fetch] this reply used {n_fetches} "
+                                    "web fetch request(s)"
                                 )
                         yield {
                             "type": "message_delta",
