@@ -194,6 +194,9 @@ class ClaudeConfig(StatelessLLMBaseConfig):
     )
     enable_web_search: bool = Field(False, alias="enable_web_search")
     max_web_searches: int = Field(3, alias="max_web_searches")
+    enable_web_fetch: bool = Field(False, alias="enable_web_fetch")
+    max_web_fetches: int = Field(5, alias="max_web_fetches")
+    max_fetch_tokens: int = Field(30000, alias="max_fetch_tokens")
 
     _CLAUDE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(
@@ -217,6 +220,34 @@ class ClaudeConfig(StatelessLLMBaseConfig):
         "max_web_searches": Description(
             en="Maximum number of web searches Claude may run per reply.",
             zh="单次回复中 Claude 最多可执行的网页搜索次数。",
+        ),
+        "enable_web_fetch": Description(
+            en=(
+                "Enable Anthropic's native web_fetch server tool. When on, "
+                "Claude can read full content from URLs that appear in the "
+                "conversation (user message, search results, prior fetches). "
+                "No per-fetch fee — only the fetched page's tokens are "
+                "billed as input."
+            ),
+            zh=(
+                "启用 Anthropic 原生 web_fetch 工具。开启后 Claude 可以读取对话中"
+                "出现的 URL 的完整内容（用户消息、搜索结果、之前的 fetch）。"
+                "fetch 调用本身免费，只有获取到的页面 token 会计入 input。"
+            ),
+        ),
+        "max_web_fetches": Description(
+            en="Maximum number of URL fetches Claude may run per reply.",
+            zh="单次回复中 Claude 最多可执行的 URL 抓取次数。",
+        ),
+        "max_fetch_tokens": Description(
+            en=(
+                "Per-page truncation cap. Any fetched page above this many "
+                "tokens is truncated to bound input cost on huge documents."
+            ),
+            zh=(
+                "单页内容截断上限。超过这个 token 数的页面会被自动截断，"
+                "避免大文档把 input 成本撑爆。"
+            ),
         ),
     }
 

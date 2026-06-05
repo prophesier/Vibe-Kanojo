@@ -137,6 +137,15 @@ character_config:
         enable_web_search: false
         # Max searches Claude may run per single reply.
         max_web_searches: 3
+        # Let Claude read full content from URLs already in the
+        # conversation (user-pasted, search results, previous fetches).
+        # No per-fetch fee — only fetched page tokens are billed.
+        enable_web_fetch: false
+        # Max URL fetches Claude may run per single reply.
+        max_web_fetches: 5
+        # Per-page truncation cap: any fetched page over this many tokens
+        # is truncated. Caps input cost on huge docs / PDFs.
+        max_fetch_tokens: 30000
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>'
