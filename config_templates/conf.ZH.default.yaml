@@ -133,6 +133,14 @@ character_config:
         enable_web_search: false
         # 单次回复中最多可执行的搜索次数。
         max_web_searches: 3
+        # 让 Claude 读取对话中已经出现的 URL（你贴的、搜索返回的、之前 fetch 过的）
+        # 的完整正文。fetch 本身免费，只有抓到的页面 token 会计入 input。默认关闭。
+        enable_web_fetch: false
+        # 单次回复中最多可执行的 URL 抓取次数。
+        max_web_fetches: 5
+        # 单页内容截断上限：超过该 token 数的页面会被自动截断，
+        # 防止大文档/PDF 把 input 成本撑爆。
+        max_fetch_tokens: 30000
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>' # GGUF 模型文件路径
