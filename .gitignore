@@ -63,6 +63,7 @@ legacy/
 chat_history/
 knowledge_base/
 pids/
+notes/
 submodules/MeloTTS
 openapi_assistants.json
 openapi_memgpt.json
