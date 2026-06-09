@@ -740,15 +740,26 @@ class PersistentMemoryManager:
     async def _call_llm(llm: Any, system: str, prompt: str) -> str:
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         result = ""
-        # Memory tasks (fact extraction, diary summary, fact pruning) can
-        # produce long JSON arrays or multi-sentence diary text. The default
-        # chat max_tokens=1024 has truncated fact arrays mid-entry; give
-        # these calls more headroom.
+        # Memory tasks (fact extraction, diary summary, fact pruning,
+        # consolidation) are one-shot tool-style calls with no cache and no
+        # need for the chat agent's web tools. Pass:
+        #   max_tokens=4096 — default 1024 has truncated long fact arrays
+        #     mid-entry; these calls need more headroom.
+        #   disable_server_tools=True — keeps the web_search / web_fetch
+        #     tool definitions out of the request, saving ~200-300 tokens
+        #     per memory call when those tools are enabled for chat. Both
+        #     kwargs fall back gracefully on LLM impls that don't accept
+        #     them (TypeError → retry with positional-only args).
         try:
-            stream = llm.chat_completion(messages, system, max_tokens=4096)
+            stream = llm.chat_completion(
+                messages, system, max_tokens=4096, disable_server_tools=True
+            )
         except TypeError:
-            # Older LLM impls without max_tokens param — fall back silently.
-            stream = llm.chat_completion(messages, system)
+            try:
+                stream = llm.chat_completion(messages, system, max_tokens=4096)
+            except TypeError:
+                # Older LLM impls without max_tokens or disable_server_tools.
+                stream = llm.chat_completion(messages, system)
         async for event in stream:
             if isinstance(event, str):
                 result += event
