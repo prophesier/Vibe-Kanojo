@@ -160,6 +160,7 @@ class AsyncLLM(StatelessLLMInterface):
         system: Union[str, List[Dict[str, Any]]] = None,
         tools: List[Dict[str, Any]] = None,
         max_tokens: int = 1024,
+        disable_server_tools: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a chat completion using the Claude API asynchronously,
@@ -198,8 +199,14 @@ class AsyncLLM(StatelessLLMInterface):
             # web_fetch run server-side within this same stream — no client
             # round-trip — so we just declare them and parse the extra
             # result blocks below.
+            #
+            # disable_server_tools=True skips auto-injection: callers that
+            # do one-shot non-chat work (fact extraction, diary creation,
+            # fact pruning, consolidation) don't want or need web tools,
+            # and we'd otherwise pay a couple hundred wasted tokens per
+            # call shipping the unused tool defns.
             final_tools = list(tools) if tools else []
-            if self._enable_web_search:
+            if not disable_server_tools and self._enable_web_search:
                 final_tools.append(
                     {
                         "type": "web_search_20250305",
@@ -207,7 +214,7 @@ class AsyncLLM(StatelessLLMInterface):
                         "max_uses": self._max_web_searches,
                     }
                 )
-            if self._enable_web_fetch:
+            if not disable_server_tools and self._enable_web_fetch:
                 # Stay on the basic web_fetch version: the newer
                 # web_fetch_20260209 adds dynamic filtering but requires
                 # the code_execution tool to be enabled, which we don't
