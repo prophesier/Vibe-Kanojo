@@ -25,6 +25,19 @@ from loguru import logger
 from .bridge import OLVBridge, TurnResult
 
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_CONSOLIDATION_LLM_PROVIDERS = frozenset(
+    {
+        "claude_llm",
+        "openai_compatible_llm",
+        "openai_llm",
+        "gemini_llm",
+        "zhipu_llm",
+        "deepseek_llm",
+        "groq_llm",
+        "mistral_llm",
+        "lmstudio_llm",
+    }
+)
 
 
 async def _collect_images(
@@ -306,7 +319,7 @@ class DiscordVTuberBot(discord.Client):
             await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _run_facts_consolidation(self) -> dict:
-        """Build a fresh PersistentMemoryManager + Claude LLM from the loaded
+        """Build a fresh PersistentMemoryManager + active LLM from the loaded
         config and run consolidation. Returns the result dict.
 
         Runs in the bot's own process — separate from OLV's running
@@ -316,25 +329,39 @@ class DiscordVTuberBot(discord.Client):
         """
         # Imports are local to keep bot startup fast when the command is unused.
         from ..config_manager.utils import scan_config_alts_directory  # noqa: F401
+        from ..agent.stateless_llm_factory import LLMFactory as StatelessLLMFactory
         from ..memory.persistent_memory import PersistentMemoryManager
-        from ..agent.stateless_llm.claude_llm import AsyncLLM as ClaudeLLM
 
         cfg = self._full_config
         char_cfg = cfg.character_config
         agent_cfg = char_cfg.agent_config
         llm_provider = agent_cfg.agent_settings.basic_memory_agent.llm_provider
-        if llm_provider != "claude_llm":
+        if llm_provider not in _CONSOLIDATION_LLM_PROVIDERS:
             return {
                 "ok": False,
                 "before": 0,
                 "after": 0,
                 "merges": [],
                 "message": (
-                    f"Active LLM provider is {llm_provider!r}, "
-                    "only claude_llm is supported for consolidation."
+                    f"Active LLM provider is {llm_provider!r}; facts consolidation "
+                    "is currently enabled only for Claude and OpenAI-compatible "
+                    "chat-completion providers."
                 ),
             }
-        llm_cfg = agent_cfg.llm_configs.claude_llm
+
+        llm_cfg = getattr(agent_cfg.llm_configs, llm_provider, None)
+        if llm_cfg is None:
+            return {
+                "ok": False,
+                "before": 0,
+                "after": 0,
+                "merges": [],
+                "message": (
+                    f"Active LLM provider is {llm_provider!r}, but no matching "
+                    "LLM config was found."
+                ),
+            }
+        llm_kwargs = llm_cfg.model_dump(by_alias=True, exclude_none=True)
 
         # Memory config lives at the system level.
         mem_cfg = cfg.system_config.persistent_memory
@@ -345,11 +372,10 @@ class DiscordVTuberBot(discord.Client):
             diary_count=mem_cfg.diary_count,
             recent_sessions=mem_cfg.recent_sessions,
         )
-        llm = ClaudeLLM(
-            model=llm_cfg.model,
-            base_url=llm_cfg.base_url,
-            llm_api_key=llm_cfg.llm_api_key,
-            system=None,
+        llm = StatelessLLMFactory.create_llm(
+            llm_provider=llm_provider,
+            system_prompt=None,
+            **llm_kwargs,
         )
         return await mem.consolidate_facts_to_staged(llm)
 
