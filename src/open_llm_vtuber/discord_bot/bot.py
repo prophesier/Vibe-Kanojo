@@ -25,6 +25,19 @@ from loguru import logger
 from .bridge import OLVBridge, TurnResult
 
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+_CONSOLIDATION_LLM_PROVIDERS = frozenset(
+    {
+        "claude_llm",
+        "openai_compatible_llm",
+        "openai_llm",
+        "gemini_llm",
+        "zhipu_llm",
+        "deepseek_llm",
+        "groq_llm",
+        "mistral_llm",
+        "lmstudio_llm",
+    }
+)
 
 
 async def _collect_images(
@@ -323,6 +336,19 @@ class DiscordVTuberBot(discord.Client):
         char_cfg = cfg.character_config
         agent_cfg = char_cfg.agent_config
         llm_provider = agent_cfg.agent_settings.basic_memory_agent.llm_provider
+        if llm_provider not in _CONSOLIDATION_LLM_PROVIDERS:
+            return {
+                "ok": False,
+                "before": 0,
+                "after": 0,
+                "merges": [],
+                "message": (
+                    f"Active LLM provider is {llm_provider!r}; facts consolidation "
+                    "is currently enabled only for Claude and OpenAI-compatible "
+                    "chat-completion providers."
+                ),
+            }
+
         llm_cfg = getattr(agent_cfg.llm_configs, llm_provider, None)
         if llm_cfg is None:
             return {
