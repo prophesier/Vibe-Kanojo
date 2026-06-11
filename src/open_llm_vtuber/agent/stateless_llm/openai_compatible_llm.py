@@ -22,6 +22,8 @@ from ...mcpp.types import ToolCallObject
 
 
 class AsyncLLM(StatelessLLMInterface):
+    _MAX_COMPLETION_TOKEN_MULTIPLIER = 4
+
     def __init__(
         self,
         model: str,
@@ -75,12 +77,19 @@ class AsyncLLM(StatelessLLMInterface):
         completion_tokens = cls._get_usage_value(usage, "completion_tokens", 0) or 0
         prompt_details = cls._get_usage_value(usage, "prompt_tokens_details", None)
         cached = cls._get_usage_value(prompt_details, "cached_tokens", 0) or 0
+        completion_details = cls._get_usage_value(
+            usage, "completion_tokens_details", None
+        )
+        reasoning = (
+            cls._get_usage_value(completion_details, "reasoning_tokens", 0) or 0
+        )
 
         fresh = max(prompt_tokens - cached, 0)
         hit_pct = (cached / prompt_tokens * 100) if prompt_tokens else 0
         logger.info(
             f"[cache] read={cached} write=0 fresh={fresh} "
-            f"(hit {hit_pct:.0f}%, input={prompt_tokens}, output={completion_tokens})"
+            f"(hit {hit_pct:.0f}%, input={prompt_tokens}, "
+            f"output={completion_tokens}, reasoning={reasoning})"
         )
 
     @staticmethod
@@ -125,6 +134,18 @@ class AsyncLLM(StatelessLLMInterface):
             f"approx_content_chars={total_chars}"
         )
 
+    def _completion_token_limit(self, max_tokens: int) -> int:
+        """Map visible-output budget to OpenAI's total completion budget.
+
+        Newer OpenAI reasoning models count hidden reasoning tokens against
+        max_completion_tokens. Memory tasks pass max_tokens as the desired
+        visible JSON headroom, so give those models extra room for reasoning
+        while preserving exact max_tokens behavior for compatible endpoints.
+        """
+        if self._completion_token_param != "max_completion_tokens":
+            return max_tokens
+        return max_tokens * self._MAX_COMPLETION_TOKEN_MULTIPLIER
+
     async def chat_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -161,6 +182,8 @@ class AsyncLLM(StatelessLLMInterface):
         # Tool call related state variables
         accumulated_tool_calls = {}
         in_tool_call = False
+        emitted_text_chars = 0
+        last_finish_reason = None
 
         try:
             # If system prompt is provided, add it to the messages
@@ -182,7 +205,9 @@ class AsyncLLM(StatelessLLMInterface):
                 "tools": available_tools,
             }
             if max_tokens:
-                request_kwargs[self._completion_token_param] = max_tokens
+                request_kwargs[self._completion_token_param] = (
+                    self._completion_token_limit(max_tokens)
+                )
             if self._include_usage_supported:
                 request_kwargs["stream_options"] = {"include_usage": True}
 
@@ -216,7 +241,9 @@ class AsyncLLM(StatelessLLMInterface):
                             "max_completion_tokens for this and future requests."
                         )
                         request_kwargs.pop("max_tokens", None)
-                        request_kwargs["max_completion_tokens"] = max_tokens
+                        request_kwargs["max_completion_tokens"] = (
+                            self._completion_token_limit(max_tokens)
+                        )
                         continue
                     raise
             logger.debug(
@@ -231,6 +258,10 @@ class AsyncLLM(StatelessLLMInterface):
                 # Guard against chunks with missing choices field (e.g., from OpenWebUI)
                 if not chunk.choices:
                     continue
+
+                finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                if finish_reason:
+                    last_finish_reason = finish_reason
 
                 if self.support_tools:
                     has_tool_calls = (
@@ -304,7 +335,9 @@ class AsyncLLM(StatelessLLMInterface):
                     continue
                 elif chunk.choices[0].delta.content is None:
                     chunk.choices[0].delta.content = ""
-                yield chunk.choices[0].delta.content
+                content = chunk.choices[0].delta.content
+                emitted_text_chars += len(content)
+                yield content
 
             # If stream ends while still in a tool call, make sure to yield the tool call
             if in_tool_call and accumulated_tool_calls:
@@ -317,6 +350,14 @@ class AsyncLLM(StatelessLLMInterface):
                 ]
 
                 yield complete_tool_calls
+
+            if last_finish_reason == "length":
+                logger.warning(
+                    "OpenAI stream stopped because it reached the completion token "
+                    f"limit; emitted_text_chars={emitted_text_chars}. "
+                    "If this happens during memory tasks, increase their "
+                    "max_tokens budget."
+                )
 
         except APIConnectionError as e:
             logger.error(
