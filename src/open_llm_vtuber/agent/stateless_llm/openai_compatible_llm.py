@@ -48,7 +48,11 @@ class AsyncLLM(StatelessLLMInterface):
         self.model = model
         self.temperature = temperature
         self._include_usage_supported = True
-        self._completion_token_param = "max_tokens"
+        self._completion_token_param = (
+            "max_completion_tokens"
+            if self._uses_official_openai_endpoint(base_url)
+            else "max_tokens"
+        )
         self.client = AsyncOpenAI(
             base_url=base_url,
             organization=organization_id,
@@ -60,6 +64,10 @@ class AsyncLLM(StatelessLLMInterface):
         logger.info(
             f"Initialized AsyncLLM with the parameters: {self.base_url}, {self.model}"
         )
+
+    @staticmethod
+    def _uses_official_openai_endpoint(base_url: str) -> bool:
+        return bool(base_url and "api.openai.com" in base_url.lower())
 
     @staticmethod
     def _get_usage_value(obj: Any, key: str, default: Any = 0) -> Any:
