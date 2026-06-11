@@ -34,6 +34,17 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     use_mcpp: Optional[bool] = Field(False, alias="use_mcpp")
     mcp_enabled_servers: Optional[List[str]] = Field([], alias="mcp_enabled_servers")
 
+    # Client-side web tools (used by the OpenAI path; the Claude path uses
+    # Anthropic's native server tools configured under claude_llm instead).
+    enable_web_tools: Optional[bool] = Field(False, alias="enable_web_tools")
+    web_search_provider: Literal["brave", "tavily"] = Field(
+        "brave", alias="web_search_provider"
+    )
+    web_search_api_key: Optional[str] = Field("", alias="web_search_api_key")
+    max_web_searches: Optional[int] = Field(3, alias="max_web_searches")
+    max_web_fetches: Optional[int] = Field(3, alias="max_web_fetches")
+    max_fetch_chars: Optional[int] = Field(20000, alias="max_fetch_chars")
+
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
             en="LLM provider to use for this agent",
@@ -54,6 +65,39 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "mcp_enabled_servers": Description(
             en="List of MCP servers to enable for the agent",
             zh="为智能体启用 MCP 服务器列表",
+        ),
+        "enable_web_tools": Description(
+            en=(
+                "Enable client-side web search + fetch tools (OpenAI path). "
+                "The model can search the web and read URL content. Search "
+                "needs a free API key from Brave or Tavily; fetch is "
+                "self-contained (no key, no cost)."
+            ),
+            zh=(
+                "启用客户端网页搜索+抓取工具（OpenAI 路径）。模型可联网搜索并读取 "
+                "URL 正文。搜索需要 Brave 或 Tavily 的免费 API key；抓取自带实现"
+                "（无需 key、无成本）。"
+            ),
+        ),
+        "web_search_provider": Description(
+            en="Search backend: 'brave' (2000 free/mo) or 'tavily' (1000 free/mo).",
+            zh="搜索后端：'brave'（每月免费 2000 次）或 'tavily'（每月免费 1000 次）。",
+        ),
+        "web_search_api_key": Description(
+            en="API key for the chosen search provider. Empty disables search (fetch still works).",
+            zh="所选搜索提供商的 API key。留空则禁用搜索（抓取仍可用）。",
+        ),
+        "max_web_searches": Description(
+            en="Max search calls per reply.",
+            zh="单次回复最多搜索次数。",
+        ),
+        "max_web_fetches": Description(
+            en="Max URL fetches per reply.",
+            zh="单次回复最多抓取 URL 次数。",
+        ),
+        "max_fetch_chars": Description(
+            en="Truncate each fetched page to this many characters.",
+            zh="每个抓取页面截断到的字符数。",
         ),
     }
 

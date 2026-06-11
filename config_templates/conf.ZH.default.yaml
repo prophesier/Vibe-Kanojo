@@ -76,6 +76,16 @@ character_config:
         # 'Plus' 意味着它包含了通过 OpenAI API 调用工具的能力。
         use_mcpp: False
         mcp_enabled_servers: ["time", "ddg-search"] # 启用的 MCP 服务器
+        # 客户端网页工具（仅 OpenAI 路径；Claude 路径用 llm_configs.claude_llm
+        # 下的 Anthropic 原生工具）。模型可自行联网搜索并读取 URL 正文。
+        enable_web_tools: false
+        # 搜索后端：'brave'（每月免费 2000 次）或 'tavily'（每月免费 1000 次）。
+        # 去对应官网免费申请 key。抓取无需 key。
+        web_search_provider: 'brave'
+        web_search_api_key: ''   # 留空则禁用搜索（抓取仍可用）
+        max_web_searches: 3      # 单次回复上限
+        max_web_fetches: 3       # 单次回复上限
+        max_fetch_chars: 20000   # 每个抓取页面截断到的字符数
 
       hume_ai_agent:
         api_key: ''
