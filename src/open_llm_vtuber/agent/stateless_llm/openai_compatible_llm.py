@@ -62,6 +62,8 @@ class AsyncLLM(StatelessLLMInterface):
         messages: List[Dict[str, Any]],
         system: str = None,
         tools: List[Dict[str, Any]] | NotGiven = NOT_GIVEN,
+        max_tokens: int = None,
+        disable_server_tools: bool = False,
     ) -> AsyncIterator[str | List[ChoiceDeltaToolCall]]:
         """
         Generates a chat completion using the OpenAI API asynchronously.
@@ -70,6 +72,13 @@ class AsyncLLM(StatelessLLMInterface):
         - messages (List[Dict[str, Any]]): The list of messages to send to the API.
         - system (str, optional): System prompt to use for this completion.
         - tools (List[Dict[str, str]], optional): List of tools to use for this completion.
+        - max_tokens (int, optional): Cap on generated tokens. Memory tasks
+          (diary/fact extraction) pass a large value so long JSON/diary
+          output isn't truncated; chat leaves it None (provider default).
+        - disable_server_tools (bool): Accepted for signature parity with the
+          Claude LLM. OpenAI-compatible endpoints don't auto-inject server
+          tools, so this is a no-op here — present only so callers like
+          PersistentMemoryManager._call_llm can pass it uniformly.
 
         Yields:
         - str: The content of each chunk from the API response.
@@ -105,6 +114,7 @@ class AsyncLLM(StatelessLLMInterface):
                 stream=True,
                 temperature=self.temperature,
                 tools=available_tools,
+                max_tokens=max_tokens if max_tokens else NOT_GIVEN,
             )
             logger.debug(
                 f"Tool Support: {self.support_tools}, Available tools: {available_tools}"

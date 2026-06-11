@@ -83,6 +83,18 @@ class AgentFactory:
                 tool_manager=tool_manager,
                 tool_executor=tool_executor,
                 mcp_prompt_string=mcp_prompt_string,
+                web_tools_config={
+                    "enabled": basic_memory_settings.get("enable_web_tools", False),
+                    "provider": basic_memory_settings.get(
+                        "web_search_provider", "brave"
+                    ),
+                    "api_key": basic_memory_settings.get("web_search_api_key", ""),
+                    "max_searches": basic_memory_settings.get("max_web_searches", 3),
+                    "max_fetches": basic_memory_settings.get("max_web_fetches", 3),
+                    "max_fetch_chars": basic_memory_settings.get(
+                        "max_fetch_chars", 20000
+                    ),
+                },
             )
 
         elif conversation_agent_choice == "mem0_agent":
