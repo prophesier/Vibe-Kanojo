@@ -737,7 +737,9 @@ class PersistentMemoryManager:
         return "\n".join(lines)
 
     @staticmethod
-    async def _call_llm(llm: Any, system: str, prompt: str) -> str:
+    async def _call_llm(
+        llm: Any, system: str, prompt: str, max_tokens: int = 4096
+    ) -> str:
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         result = ""
         # Memory tasks (fact extraction, diary summary, fact pruning,
@@ -752,11 +754,11 @@ class PersistentMemoryManager:
         #     them (TypeError → retry with positional-only args).
         try:
             stream = llm.chat_completion(
-                messages, system, max_tokens=4096, disable_server_tools=True
+                messages, system, max_tokens=max_tokens, disable_server_tools=True
             )
         except TypeError:
             try:
-                stream = llm.chat_completion(messages, system, max_tokens=4096)
+                stream = llm.chat_completion(messages, system, max_tokens=max_tokens)
             except TypeError:
                 # Older LLM impls without max_tokens or disable_server_tools.
                 stream = llm.chat_completion(messages, system)
@@ -867,6 +869,10 @@ class PersistentMemoryManager:
         try:
             raw = await self._call_llm(llm, _CONSOLIDATE_SYSTEM, prompt)
             logger.info(f"[memory] Fact-consolidation LLM raw output:\n{raw}")
+            if not raw.strip():
+                result["message"] = "Consolidation LLM returned empty output."
+                logger.warning(f"[memory] {result['message']}")
+                return result
             proposals = self._parse_json_list(raw)
         except Exception as e:
             logger.warning(f"[memory] Consolidation LLM call failed: {e}", exc_info=True)
