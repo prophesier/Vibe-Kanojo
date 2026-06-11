@@ -79,6 +79,17 @@ character_config:
         # 'Plus' means that it has the ability to call tools by using OpenAI API.
         use_mcpp: True
         mcp_enabled_servers: ["time", "ddg-search"] # Enabled MCP servers
+        # Client-side web tools (OpenAI path only; the Claude path uses
+        # Anthropic's native web tools under llm_configs.claude_llm instead).
+        # The model can search the web and read URL contents on its own.
+        enable_web_tools: false
+        # Search backend: 'brave' (2000 free/mo) or 'tavily' (1000 free/mo).
+        # Get a free key from the provider's site. Fetch needs no key.
+        web_search_provider: 'brave'
+        web_search_api_key: ''   # search disabled if empty (fetch still works)
+        max_web_searches: 3      # per reply
+        max_web_fetches: 3       # per reply
+        max_fetch_chars: 20000   # truncate each fetched page to this many chars
 
       letta_agent:
         host: 'localhost' # Host address

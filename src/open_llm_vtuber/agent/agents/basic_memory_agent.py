@@ -8,9 +8,11 @@ from typing import (
     Union,
     Optional,
 )
+import json
 from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
+from ...web_tools import web_search, web_fetch
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
@@ -50,9 +52,11 @@ class BasicMemoryAgent(AgentInterface):
         tool_manager: Optional[ToolManager] = None,
         tool_executor: Optional[ToolExecutor] = None,
         mcp_prompt_string: str = "",
+        web_tools_config: Optional[Dict[str, Any]] = None,
     ):
         """Initialize agent with LLM and configuration."""
         super().__init__()
+        self._web_tools_config = web_tools_config or {"enabled": False}
         self._memory = []
         self._live2d_model = live2d_model
         self._tts_preprocessor_config = tts_preprocessor_config
@@ -993,10 +997,16 @@ class BasicMemoryAgent(AgentInterface):
                     yield output
                 return
             else:
-                logger.info("Starting simple chat completion.")
-                token_stream = self._llm.chat_completion(
-                    messages, self._build_system_for_llm()
-                )
+                if self._should_use_openai_web_tools():
+                    logger.info("Starting chat completion with web tools (OpenAI).")
+                    token_stream = self._openai_web_tool_loop(
+                        messages, self._build_system_for_llm()
+                    )
+                else:
+                    logger.info("Starting simple chat completion.")
+                    token_stream = self._llm.chat_completion(
+                        messages, self._build_system_for_llm()
+                    )
                 complete_response = ""
                 async for event in token_stream:
                     text_chunk = ""
@@ -1025,6 +1035,173 @@ class BasicMemoryAgent(AgentInterface):
                     self._add_message(complete_response, "assistant")
 
         return chat_with_memory
+
+    def _should_use_openai_web_tools(self) -> bool:
+        """Web tools apply only on the OpenAI path, when enabled, no MCP."""
+        return (
+            bool(self._web_tools_config.get("enabled"))
+            and isinstance(self._llm, OpenAICompatibleAsyncLLM)
+            and not self._use_mcpp
+        )
+
+    @staticmethod
+    def _build_web_tools_openai() -> List[Dict[str, Any]]:
+        """OpenAI function-tool definitions for web search and fetch."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": (
+                        "Search the web for current information, news, or "
+                        "facts you're unsure about. Returns a list of results "
+                        "with titles, URLs, and snippets."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query.",
+                            }
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_fetch",
+                    "description": (
+                        "Fetch and read the full text content of a specific "
+                        "URL (e.g. one the user pasted or one from a prior "
+                        "search result). Returns the page's title and text."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "The URL to fetch.",
+                            }
+                        },
+                        "required": ["url"],
+                    },
+                },
+            },
+        ]
+
+    async def _openai_web_tool_loop(
+        self, messages: List[Dict[str, Any]], system: Any
+    ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
+        """Drive an OpenAI tool-calling loop for client-side web tools.
+
+        Yields plain text chunks (str) and inline tool markers
+        ({"type": "web_search_marker"}) — the same event shapes the simple
+        chat consumer already handles, so persistence/display logic is
+        reused unchanged. Tool-call plumbing mutates only the local
+        ``messages`` list, never self._memory.
+        """
+        cfg = self._web_tools_config
+        tools = self._build_web_tools_openai()
+        searches_left = int(cfg.get("max_searches", 3) or 0)
+        fetches_left = int(cfg.get("max_fetches", 3) or 0)
+        provider = cfg.get("provider", "brave")
+        api_key = cfg.get("api_key", "")
+        max_fetch_chars = int(cfg.get("max_fetch_chars", 20000) or 20000)
+        work = list(messages)
+        max_rounds = 6
+
+        for _round in range(max_rounds):
+            round_text = ""
+            tool_calls: Optional[List[ToolCallObject]] = None
+            async for event in self._llm.chat_completion(work, system, tools=tools):
+                if isinstance(event, list):
+                    tool_calls = event
+                elif isinstance(event, str):
+                    if event == "__API_NOT_SUPPORT_TOOLS__":
+                        # Provider rejected tools mid-stream; restart this
+                        # round without tools so the user still gets a reply.
+                        async for ev in self._llm.chat_completion(work, system):
+                            if isinstance(ev, str) and ev:
+                                yield ev
+                                round_text += ev
+                        tool_calls = None
+                        break
+                    if event:
+                        yield event
+                        round_text += event
+
+            if not tool_calls:
+                break
+
+            # Record the assistant's tool-call turn so the follow-up request
+            # has the context the tool results refer back to.
+            work.append(
+                {
+                    "role": "assistant",
+                    "content": round_text or None,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+            )
+
+            for tc in tool_calls:
+                name = tc.function.name
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+
+                if name == "web_search":
+                    query = str(args.get("query", "")).strip()
+                    if searches_left <= 0:
+                        result: Any = {"error": "web search limit reached this turn"}
+                    else:
+                        searches_left -= 1
+                        logger.info(f"[web_search] query: {query or '(empty)'}")
+                        yield {
+                            "type": "web_search_marker",
+                            "text": f"\n🔍 *Web検索: {query[:80] or '...'}*\n",
+                        }
+                        result = await web_search(
+                            query,
+                            provider=provider,
+                            api_key=api_key,
+                            max_results=5,
+                        )
+                elif name == "web_fetch":
+                    url = str(args.get("url", "")).strip()
+                    if fetches_left <= 0:
+                        result = {"error": "web fetch limit reached this turn"}
+                    else:
+                        fetches_left -= 1
+                        logger.info(f"[web_fetch] url: {url or '(empty)'}")
+                        yield {
+                            "type": "web_search_marker",
+                            "text": f"\n🔗 *Web取得: {url[:120] or '...'}*\n",
+                        }
+                        result = await web_fetch(url, max_chars=max_fetch_chars)
+                else:
+                    result = {"error": f"unknown tool {name!r}"}
+
+                work.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": json.dumps(result, ensure_ascii=False),
+                    }
+                )
 
     async def chat(
         self,
