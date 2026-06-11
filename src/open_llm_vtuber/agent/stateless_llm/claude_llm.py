@@ -65,7 +65,16 @@ class AsyncLLM(StatelessLLMInterface):
             max_fetch_tokens (int): Truncate any single fetched page above
                 this many tokens to bound per-turn input cost.
         """
-        self.model = model
+        # TEMPORARY OVERRIDE: force Opus 4.8 regardless of conf.yaml.
+        # Revert this block to `self.model = model` when done.
+        _FORCED_MODEL = "claude-opus-4-8"
+        if model != _FORCED_MODEL:
+            logger.warning(
+                f"[TEMP OVERRIDE] Model from config ({model!r}) overridden "
+                f"to {_FORCED_MODEL!r}. Remove this block in claude_llm.py "
+                "__init__ to restore config-driven model selection."
+            )
+        self.model = _FORCED_MODEL
         self.system = system
         self._enable_web_search = enable_web_search
         self._max_web_searches = max_web_searches
