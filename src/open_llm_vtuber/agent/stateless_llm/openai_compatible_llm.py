@@ -46,6 +46,7 @@ class AsyncLLM(StatelessLLMInterface):
         self.model = model
         self.temperature = temperature
         self._include_usage_supported = True
+        self._completion_token_param = "max_tokens"
         self.client = AsyncOpenAI(
             base_url=base_url,
             organization=organization_id,
@@ -89,6 +90,39 @@ class AsyncLLM(StatelessLLMInterface):
             "stream_options" in message
             or "stream option" in message
             or "include_usage" in message
+        )
+
+    @staticmethod
+    def _is_max_tokens_unsupported(error: APIError) -> bool:
+        message = str(error).lower()
+        return "max_tokens" in message and "max_completion_tokens" in message
+
+    @staticmethod
+    def _summarize_messages(messages: List[Dict[str, Any]]) -> str:
+        """Summarize request messages for error logs without dumping chat text."""
+        total_chars = 0
+        roles = {}
+        for message in messages:
+            role = message.get("role", "unknown")
+            roles[role] = roles.get(role, 0) + 1
+            content = message.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("content") or ""
+                        if isinstance(text, str):
+                            total_chars += len(text)
+                    elif isinstance(part, str):
+                        total_chars += len(part)
+            elif content is not None:
+                total_chars += len(str(content))
+
+        role_summary = ", ".join(f"{role}={count}" for role, count in roles.items())
+        return (
+            f"{len(messages)} message(s), roles: {role_summary or 'none'}, "
+            f"approx_content_chars={total_chars}"
         )
 
     async def chat_completion(
@@ -146,31 +180,44 @@ class AsyncLLM(StatelessLLMInterface):
                 "stream": True,
                 "temperature": self.temperature,
                 "tools": available_tools,
-                "max_tokens": max_tokens if max_tokens else NOT_GIVEN,
             }
+            if max_tokens:
+                request_kwargs[self._completion_token_param] = max_tokens
             if self._include_usage_supported:
                 request_kwargs["stream_options"] = {"include_usage": True}
 
-            try:
-                stream: AsyncStream[
-                    ChatCompletionChunk
-                ] = await self.client.chat.completions.create(**request_kwargs)
-            except APIError as e:
-                if (
-                    self._include_usage_supported
-                    and self._is_usage_stream_option_unsupported(e)
-                ):
-                    self._include_usage_supported = False
-                    logger.warning(
-                        "OpenAI-compatible endpoint does not support "
-                        "stream_options.include_usage; retrying without cache "
-                        "usage logging."
-                    )
-                    request_kwargs.pop("stream_options", None)
-                    stream = await self.client.chat.completions.create(
-                        **request_kwargs
-                    )
-                else:
+            while True:
+                try:
+                    stream: AsyncStream[
+                        ChatCompletionChunk
+                    ] = await self.client.chat.completions.create(**request_kwargs)
+                    break
+                except APIError as e:
+                    if (
+                        self._include_usage_supported
+                        and self._is_usage_stream_option_unsupported(e)
+                    ):
+                        self._include_usage_supported = False
+                        logger.warning(
+                            "OpenAI-compatible endpoint does not support "
+                            "stream_options.include_usage; retrying without cache "
+                            "usage logging."
+                        )
+                        request_kwargs.pop("stream_options", None)
+                        continue
+                    if (
+                        max_tokens
+                        and self._completion_token_param == "max_tokens"
+                        and self._is_max_tokens_unsupported(e)
+                    ):
+                        self._completion_token_param = "max_completion_tokens"
+                        logger.warning(
+                            "OpenAI endpoint rejected max_tokens; retrying with "
+                            "max_completion_tokens for this and future requests."
+                        )
+                        request_kwargs.pop("max_tokens", None)
+                        request_kwargs["max_completion_tokens"] = max_tokens
+                        continue
                     raise
             logger.debug(
                 f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
@@ -294,7 +341,7 @@ class AsyncLLM(StatelessLLMInterface):
             logger.error(f"LLM API: Error occurred: {e}")
             logger.info(f"Base URL: {self.base_url}")
             logger.info(f"Model: {self.model}")
-            logger.info(f"Messages: {messages}")
+            logger.info(f"Messages: {self._summarize_messages(messages)}")
             logger.info(f"temperature: {self.temperature}")
             yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
 
