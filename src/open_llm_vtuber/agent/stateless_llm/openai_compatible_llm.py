@@ -45,6 +45,7 @@ class AsyncLLM(StatelessLLMInterface):
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
+        self._include_usage_supported = True
         self.client = AsyncOpenAI(
             base_url=base_url,
             organization=organization_id,
@@ -55,6 +56,39 @@ class AsyncLLM(StatelessLLMInterface):
 
         logger.info(
             f"Initialized AsyncLLM with the parameters: {self.base_url}, {self.model}"
+        )
+
+    @staticmethod
+    def _get_usage_value(obj: Any, key: str, default: Any = 0) -> Any:
+        """Read a usage field from either OpenAI SDK models or plain dicts."""
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @classmethod
+    def _log_openai_cache_usage(cls, usage: Any) -> None:
+        """Log OpenAI automatic prompt-cache usage from a stream usage chunk."""
+        prompt_tokens = cls._get_usage_value(usage, "prompt_tokens", 0) or 0
+        completion_tokens = cls._get_usage_value(usage, "completion_tokens", 0) or 0
+        prompt_details = cls._get_usage_value(usage, "prompt_tokens_details", None)
+        cached = cls._get_usage_value(prompt_details, "cached_tokens", 0) or 0
+
+        fresh = max(prompt_tokens - cached, 0)
+        hit_pct = (cached / prompt_tokens * 100) if prompt_tokens else 0
+        logger.info(
+            f"[cache] read={cached} write=0 fresh={fresh} "
+            f"(hit {hit_pct:.0f}%, input={prompt_tokens}, output={completion_tokens})"
+        )
+
+    @staticmethod
+    def _is_usage_stream_option_unsupported(error: APIError) -> bool:
+        message = str(error).lower()
+        return (
+            "stream_options" in message
+            or "stream option" in message
+            or "include_usage" in message
         )
 
     async def chat_completion(
@@ -106,21 +140,47 @@ class AsyncLLM(StatelessLLMInterface):
 
             available_tools = tools if self.support_tools else NOT_GIVEN
 
-            stream: AsyncStream[
-                ChatCompletionChunk
-            ] = await self.client.chat.completions.create(
-                messages=messages_with_system,
-                model=self.model,
-                stream=True,
-                temperature=self.temperature,
-                tools=available_tools,
-                max_tokens=max_tokens if max_tokens else NOT_GIVEN,
-            )
+            request_kwargs = {
+                "messages": messages_with_system,
+                "model": self.model,
+                "stream": True,
+                "temperature": self.temperature,
+                "tools": available_tools,
+                "max_tokens": max_tokens if max_tokens else NOT_GIVEN,
+            }
+            if self._include_usage_supported:
+                request_kwargs["stream_options"] = {"include_usage": True}
+
+            try:
+                stream: AsyncStream[
+                    ChatCompletionChunk
+                ] = await self.client.chat.completions.create(**request_kwargs)
+            except APIError as e:
+                if (
+                    self._include_usage_supported
+                    and self._is_usage_stream_option_unsupported(e)
+                ):
+                    self._include_usage_supported = False
+                    logger.warning(
+                        "OpenAI-compatible endpoint does not support "
+                        "stream_options.include_usage; retrying without cache "
+                        "usage logging."
+                    )
+                    request_kwargs.pop("stream_options", None)
+                    stream = await self.client.chat.completions.create(
+                        **request_kwargs
+                    )
+                else:
+                    raise
             logger.debug(
                 f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
             )
 
             async for chunk in stream:
+                usage = getattr(chunk, "usage", None)
+                if usage:
+                    self._log_openai_cache_usage(usage)
+
                 # Guard against chunks with missing choices field (e.g., from OpenWebUI)
                 if not chunk.choices:
                     continue
