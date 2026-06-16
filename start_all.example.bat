@@ -9,10 +9,10 @@ REM Keep start_all.bat in the project root so %~dp0 resolves to the OLV dir.
 REM ============================================================================
 
 REM === EDIT THESE ===
-set "CONDA_ENV=openllmvtuber"
+set "CONDA_ENV="
 REM Path to your local GPT-SoVITS project (the TTS backend). If you don't use
 REM GPT-SoVITS, delete the " ; new-tab --title TTS ..." part at the end.
-set "TTS_DIR=D:\Code\projects\GPTsovits"
+set "TTS_DIR=D:\path\to\GPT-SoVITS"
 REM ==================
 
 REM OLV project dir = wherever this script lives.
