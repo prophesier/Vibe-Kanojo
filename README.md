@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-一个能<b>长期记住你</b>、<b>随时陪你聊</b>的 AI 伴侣。
+一个<b>个人自用</b>的 AI 伴侣项目——在开源的语音 VTuber 框架上，按自己的需求重写了长期记忆，让它能<b>长期记住你</b>、<b>随时陪你聊</b>。
 </p>
 
 > 本项目在 [t41372/Open-LLM-VTuber](https://github.com/t41372/Open-LLM-VTuber) 的基础上开发，
