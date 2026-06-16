@@ -2,6 +2,17 @@
 conf.yaml
 model_dict.json
 
+# local notes (not project documentation)
+handoff.md
+rag_design.md
+
+# local backups (chat history, persona snapshots)
+backup/
+
+# local launcher copies (tracked templates: *.example.bat)
+start_all.bat
+restart.bat
+
 # ignore non-default background images
 /backgrounds/*
 !/backgrounds/README.md
