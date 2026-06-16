@@ -14,11 +14,13 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 REM === EDIT THESE ===
+REM This file is generated from restart.bat.example on first run and is
+REM gitignored, so edit it freely — your changes won't be tracked.
 set "CONDA_ENV=openllmvtuber"
 REM Branch to pull from. Leave empty to use the current branch's upstream
 REM (i.e. plain `git pull`). Set to a specific branch name if your local
-REM working branch (e.g. master) is different from the dev branch you want
-REM to track. The pull becomes `git pull origin <branch>` in that case.
+REM working branch is different from the dev branch you want to track.
+REM The pull becomes `git pull origin <branch>` in that case.
 set "GIT_BRANCH="
 REM ==================
 

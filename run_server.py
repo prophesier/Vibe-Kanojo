@@ -132,6 +132,16 @@ def run(console_log_level: str):
     # Check if the frontend submodule is initialized
     check_frontend_submodule(lang)
 
+    # Seed gitignored config files from their .example templates on first run
+    for name in ("model_dict.json", "mcp_servers.json", "restart.bat"):
+        path = Path(name)
+        example = Path(f"{name}.example")
+        if not path.exists() and example.exists():
+            import shutil
+
+            shutil.copyfile(example, path)
+            logger.info(f"{name} not found; created from {example.name}")
+
     # Sync user config with default config
     try:
         upgrade_manager.sync_user_config()
