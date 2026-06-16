@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-An AI companion that <b>remembers you over the long term</b> and is <b>always reachable</b>.
+This project is modified and developed purely for personal use. Compatibility and availability of any feature are not guaranteed. For questions about the upstream itself, please head over to the original project instead.
 </p>
 
 > Built on top of [t41372/Open-LLM-VTuber](https://github.com/t41372/Open-LLM-VTuber).
