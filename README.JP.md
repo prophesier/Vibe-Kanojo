@@ -1,152 +1,130 @@
-![](./assets/banner.jpg)
+<h1 align="center">Vibe-Kanojo</h1>
 
-<h1 align="center">Open-LLM-VTuber</h1>
-<h3 align="center">
+<p align="center">
+<a href="./README.md">中文</a> | <a href="./README.EN.md">English</a> | 日本語
+</p>
 
-[![GitHub release](https://img.shields.io/github/v/release/Open-LLM-VTuber/Open-LLM-VTuber)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/releases) 
-[![license](https://img.shields.io/github/license/Open-LLM-VTuber/Open-LLM-VTuber)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/blob/master/LICENSE) 
-[![CodeQL](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/codeql.yml/badge.svg)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/codeql.yml)
-[![Ruff](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/ruff.yml/badge.svg)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/ruff.yml)
-[![Docker](https://img.shields.io/badge/Open-LLM-VTuber%2FOpen--LLM--VTuber-%25230db7ed.svg?logo=docker&logoColor=blue&labelColor=white&color=blue)](https://hub.docker.com/r/Open-LLM-VTuber/open-llm-vtuber) 
-[![QQ User Group](https://img.shields.io/badge/QQ_User_Group-792615362-white?style=flat&logo=qq&logoColor=white)](https://qm.qq.com/q/ngvNUQpuKI)
-[![Static Badge](https://img.shields.io/badge/Join%20Chat-Zulip?style=flat&logo=zulip&label=Zulip(dev-community)&color=blue&link=https%3A%2F%2Folv.zulipchat.com)](https://olv.zulipchat.com)
+<p align="center">
+あなたを<b>長く覚えていて</b>、<b>いつでも話しかけられる</b> AI コンパニオン。
+</p>
 
-> **📢 v2.0 開発中**: 現在、Open-LLM-VTuber v2.0の開発に注力しています — これはコードベースの完全な書き直しです。v2.0は現在、初期の議論と計画段階にあります。v1への機能リクエストに関する新しいissueやpull requestの提出はお控えください。v2の議論に参加したい、または貢献したい場合は、[Zulip](https://olv.zulipchat.com)の開発者コミュニティにご参加ください。週次ミーティングのスケジュールはZulipで発表されます。v1のバグ修正と既存のpull requestの対応は継続します。
-
-
-[![BuyMeACoffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/yi.ting)
-[![](https://dcbadge.limes.pink/api/server/3UDA8YFDXx)](https://discord.gg/3UDA8YFDXx)
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Open-LLM-VTuber/Open-LLM-VTuber)
-
-[English README](./README.md) | [中文 README](./README.CN.md) | [한국어 README](./README.KR.md) | 日本語 README
-
-[ドキュメント](https://open-llm-vtuber.github.io/docs/quick-start) | [![Roadmap](https://img.shields.io/badge/Roadmap-GitHub_Project-yellow)](https://github.com/orgs/Open-LLM-VTuber/projects/2)
-
-<a href="https://trendshift.io/repositories/12358" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12358" alt="Open-LLM-VTuber%2FOpen-LLM-VTuber | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-
-</h3>
-
-
-> よくある質問 (中国語で作成): https://docs.qq.com/pdf/DTFZGQXdTUXhIYWRq
+> 本プロジェクトは [t41372/Open-LLM-VTuber](https://github.com/t41372/Open-LLM-VTuber) を
+> ベースに開発しています。上流の音声会話・Live2D アバター・ASR/TTS といった基盤機能を
+> 引き継ぎつつ、記憶システムを書き直し、Discord 連携を追加することで、「使い捨ての音声
+> おもちゃ」を**連続した記憶を持ち、どこからでも会いに行ける**コンパニオンに変えています。
 >
-> ユーザーアンケート: https://forms.gle/w6Y6PiHTZr1nzbtWA
->
-> アンケート(中国語): https://wj.qq.com/s2/16150415/f50a/
+> キャラクター（プロンプト・Live2D モデル・声）はすべて差し替え可能です。リポジトリに
+> 同梱されているのはあくまでサンプルキャラクターなので、好きな設定に置き換えてください。
 
-> :warning: このプロジェクトはまだ初期段階にあり、現在 **活発に開発中** です。
+---
 
-> :warning: サーバーをリモートで実行し、他のデバイス（例：PCでサーバーを実行し、スマホからアクセス）を通じてアクセスするには、`https` 設定が必要です。これはフロントエンドのマイク機能がセキュアな環境（https または localhost）でのみ動作するためです。詳細はこちら-\> [MDN Web Doc](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia)。したがって、リモートデバイス（つまりlocalhost以外の環境）からページにアクセスするには、リバースプロキシを使用してhttpsを設定する必要があります。
+## ✨ 本プロジェクトで追加したもの
 
-## ⭐️ このプロジェクトは何ですか？
+### 🧠 3 層の永続記憶
 
-**Open-LLM-VTuber** は、**リアルタイム音声会話** と **視覚認識** をサポートするだけでなく、生き生きとした **Live2Dアバター** を備えた **音声対話型AIコンパニオン** です。すべての機能はコンピュータ上で完全にオフラインで実行できます！
+毎回ゼロから始めるのではなく、キャラクターが本当にあなたを「覚えている」ようにします。
+3 つの層がそれぞれ役割を持ちます：
 
-個人的なAIコンパニオンとして活用できます — `virtual girlfriend`、`boyfriend`、`cute pet` など、期待に合わせてどのようなキャラクターにもなれます。このプロジェクトは `Windows`、`macOS`、`Linux` を完全にサポートしており、**Webバージョン** と **デスクトップクライアント** の2つの使用モードを提供します。特に **透明背景のデスクトップマスコットモード** をサポートしており、AIコンパニオンが画面上のどこにでも一緒にいることができます。
+- **スライディングウィンドウ** —— 直近のいくつかの完全なセッションの原文をそのまま
+  コンテキストに入れ、短期的な連続性を保ちます。セッションの境目には
+  `【セッション開始: 日時】` マーカーを挿入し、日をまたいだ会話が混ざらないようにします。
+- **facts.json** —— 会話から抽出した**構造化された長期的な事実**（あなたの好み・習慣・
+  大切な人や出来事）を、時系列順にシステムプロンプトへ注入します。各項目には記録日が
+  付き、自動抽出・重複排除・「外科手術的」な統合に対応します。
+- **diaries/** —— 各セッションの終わりに生成される**日記の要約**。正確な時刻ではなく
+  「夕方」「深夜」といった時間帯の言葉で書かれ、より古い記憶へのインデックスとして
+  長期保存されます。
 
-長期記憶機能は一時的に削除されましたが（まもなく再提供予定）、チャットログの **永続保存** のおかげで、以前に終わらなかった会話を **中断することなく続けることができ**、貴重なインタラクションの瞬間を失うことはありません。
+すべての記憶注入は **プロンプトキャッシュ**（Anthropic の 1h キャッシュ / OpenAI の
+自動キャッシュ）に対応し、通常のやり取りでは安定して約 99% のキャッシュヒットを維持
+します。長い記憶＝高コスト、ではありません。
 
-バックエンドサポートの面では、様々なLLM推論、テキスト読み上げ（TTS）、音声認識ソリューションを統合しました。AIコンパニオンをカスタマイズしたい場合は、[Character Customization Guide](https://open-llm-vtuber.github.io/docs/user-guide/live2d)を参照して、AIコンパニオンの外見や性格をカスタマイズできます。
+### ⏰ 時間認識
 
-このプロジェクトが `Open-LLM-Companion` や `Open-LLM-Waifu` ではなく `Open-LLM-Vtuber` という名前である理由は、初期の開発目標が **Windows以外のプラットフォームでもオフラインで実行可能なオープンソースソリューションを活用** し、**クローズドなAI Vtuberである `neuro-sama` を再現** することだったためです。
+キャラクターは「今が何時か」「前回話したのはいつか」を把握し、**時間を勝手に
+でっち上げません**：
 
-### 👀 効果実証
-| ![](assets/i1.jpg) | ![](assets/i2.jpg) |
-|:---:|:---:|
-| ![](assets/i3.jpg) | ![](assets/i4.jpg) |
+- 各ユーザーメッセージに `[YYYY-MM-DD HH:MM:SS 曜日]` のタイムスタンプを付与
+  （モデル専用で、返信には現れません）
+- システムプロンプトに厳格なルール：時間に関する発言の前に必ずタグを確認する
+- 「現在時刻」は最新のユーザーメッセージのタイムスタンプを基準とする
 
+### 💬 Discord 連携
 
-## ✨ 機能 & 主な特徴
+外出先からでもキャラクターに話しかけられ、**web クライアントと同じセッションを共有**
+します（同じ記憶・同じ会話）：
 
-  - 🖥️ **クロスプラットフォーム対応**: `macOS`、`Linux`、`Windows` と完全に互換性があります。NVIDIA GPUおよび非NVIDIA GPUの両方をサポートし、CPU実行やクラウドAPIを活用した高負荷作業の実行オプションも提供します。一部のコンポーネントはmacOSでのGPUアクセラレーションをサポートしています。
+- OLV の WebSocket バックエンドへのテキストブリッジ。画像添付の転送に対応
+- テキストのみの会話では TTS を自動でスキップし、リソースを節約
 
-  - 🔒 **オフラインモード対応**: ローカルモデルを使用して完全にオフラインで実行でき、インターネット接続は必要ありません。会話内容はユーザーのデバイスにのみ保存され、プライバシーとセキュリティが保護されます。
+#### 管理者用スラッシュコマンド
 
-  - 💻 **魅力的で強力なWebおよびデスクトップクライアント**: Webバージョンとデスクトップクライアントの2つの使用モードを提供し、豊富なインタラクション機能とパーソナライズ設定をサポートします。デスクトップクライアントはウィンドウモードとデスクトップマスコットモードを自由に切り替えることができ、AIコンパニオンが常にそばにいることができます。
+| コマンド | 役割 |
+|---|---|
+| `/restart` | 最新コードを取得してサービスをリモート再起動 |
+| `/logs target:bot\|olv\|both lines:N` | ログをリモート確認 |
+| `/status` | プロセス PID・稼働時間・現在のコミット |
+| `/facts-consolidate` | 長期的な事実の統合整理をトリガー |
 
-  - 🎯 **高度なインタラクション機能**:
+### 🔍 Web 検索
 
-      - 👁️ 視覚認識: カメラ、画面録画、スクリーンショットをサポートし、AIコンパニオンがユーザーの姿や画面を見ることができます。
-      - 🎤 ヘッドフォンなしでの音声認識: AIが自分の声を聞かずに、音声を処理できます。
-      - 🫱 タッチフィードバック: クリックやドラッグでAIコンパニオンと対話できます。
-      - 😊 Live2D 表情: バックエンドで感情マッピングを設定し、モデルの表情を制御できます。
-      - 🐱 ペットモード: 透明背景、常に手前に表示、マウスクリック透過をサポートし、AIコンパニオンを画面のどこへでも自由に移動できます。
-      - 💭 AIの内面表現: AIが話さなくても、AIの表情、思考、行動を確認できます。
-      - 🗣️ AI能動発話機能: ユーザーが話さなくてもAIが先に話しかける機能。
-      - 💾 チャットログの永続保存: いつでも以前の会話に切り替えることができます。
-      - 🌍 TTS翻訳サポート: 例：AIは日本語の音声で話しながら、中国語でチャットすることができます。
+雑談の中でキャラクターが自分から情報を調べられます：
 
-  - 🧠 **広範なモデルサポート**:
+- **Claude 経路**：Anthropic ネイティブの `web_search` / `web_fetch` サーバーツール
+- **OpenAI 経路**：クライアント側の自前実装。検索は Brave / Tavily（いずれも無料枠あり）、
+  取得は本文を自前で抽出
 
-      - 🤖 Large Language Models (LLM): Ollama, OpenAI (およびOpenAI互換API), Gemini, Claude, Mistral, DeepSeek, Zhipu AI, GGUF, LM Studio, vLLM, etc.
-      - 🎙️ Automatic Speech Recognition (ASR): sherpa-onnx, FunASR, Faster-Whisper, Whisper.cpp, Whisper, Groq Whisper, Azure ASR, etc.
-      - 🔊 Text-to-Speech (TTS): sherpa-onnx, pyttsx3, MeloTTS, Coqui-TTS, GPTSoVITS, Bark, CosyVoice, Edge TTS, Fish Audio, Azure TTS, etc.
+検索が走ると、トリガー位置にインラインのマーカーが表示され、でっち上げではなく実際に
+ネットを調べたことが分かります。
 
-  - 🔧 **高いカスタマイズの自由度**:
-
-      - ⚙️ **簡単なモジュール構成**: 簡単な設定ファイルの修正だけで様々な機能モジュールを切り替えることができ、コードの修正は必要ありません。
-      - 🎨 **キャラクターカスタマイズ**: カスタムLive2Dモデルを取り込み、AIコンパニオンに固有の外見を与えることができます。Promptを修正してAIコンパニオンの性格を設定し、**ボイスクローニング** を通じて希望の声を与えることができます。
-      - 🧩 **柔軟なAgent実装**: Agentインターフェースを継承・実装し、HumeAI EVI、OpenAI Her、Mem0など、様々なAgentアーキテクチャを統合できます。
-      - 🔌 優れた拡張性: モジュール式設計により、独自のLLM、ASR、TTSなどのモジュールを簡単に追加でき、いつでも新しい機能を拡張できます。
-
-## 👥 ユーザーレビュー
-
-> 開発者の方に感謝します。すべての人が使用できるようにパートナーをオープンソースで共有していただきありがとうございます。
->
-> このパートナーは10万回以上使用されました。
+---
 
 ## 🚀 クイックスタート
 
-インストールについては、ドキュメントの [Quick Start](https://open-llm-vtuber.github.io/docs/quick-start) セクションを参照してください。
+基盤のデプロイ（依存関係のインストール、ASR/TTS/LLM の設定）は上流と同じです。まずは
+[Open-LLM-VTuber 公式ドキュメント](https://open-llm-vtuber.github.io/docs/quick-start)を
+参照してください。
 
+簡単には：
 
+```bash
+uv sync                     # 依存関係をインストール
+uv run run_server.py        # サーバー起動（初回に model_dict.json などを自動生成）
+```
 
-## ☝ アップデート
+本プロジェクト固有の設定（永続記憶・Discord・Web 検索）は
+`config_templates/conf.default.yaml` の該当ブロックのコメントを参照してください。
+Discord bot の有効化方法は `discord_bot/` 以下の説明を参照してください。
 
-> :warning: `v1.0.0` バージョンには **互換性のない変更** があり、再デプロイが必要です。以下の方法でアップデート **することは可能ですが**、`conf.yaml` ファイルに互換性がなく、ほとんどの依存関係を `uv` で再インストールする必要があります。`v1.0.0` 以前のバージョンからアップグレードする場合は、[最新のデプロイガイド](https://open-llm-vtuber.github.io/docs/quick-start)を参照してプロジェクトを再デプロイすることを推奨します。
+初回起動時、`model_dict.json`・`mcp_servers.json`・`restart.bat` は同名の `.example`
+テンプレートから自動生成されます。これらは直接編集できます（git で無視されているため、
+変更がリポジトリに同期されることはありません）。
 
-`v1.0.0` 以降のバージョンをインストールしている場合、アップデートは `uv run update.py` を使用してください。
+### ワンクリック起動（Windows）
 
-## 😢 アンインストール (Uninstall)
+リポジトリには Windows Terminal 用の起動スクリプトのテンプレートが同梱されており、
+OLV サーバー・Discord bot・GPT-SoVITS TTS の 3 タブを同時に立ち上げられます：
 
-ほとんどのファイルは、Pythonの依存関係とモデルを含め、プロジェクトフォルダに保存されます。
+```bat
+copy start_all.example.bat start_all.bat
+```
 
-ただし、ModelScopeやHugging Faceを通じてダウンロードしたモデルは `MODELSCOPE_CACHE` または `HF_HOME` に保存されている可能性があります。プロジェクトの `models` ディレクトリに保管することが目標ですが、一度確認してみることをお勧めします。
+コピー後、`start_all.bat` 冒頭の `CONDA_ENV`（conda 環境名）と `TTS_DIR`（ローカルの
+GPT-SoVITS パス）を編集してください。`start_all.bat` は git で無視されるので、自由に
+編集してもリポジトリを汚しません。
 
-また、インストールガイドを参照して、不要になった追加ツール（`uv`、`ffmpeg`、`deeplx` など）がないか確認してください。
+`restart.bat`（Discord の `/restart` 用）は初回起動時に自動生成され、直接編集できます
+（同様に無視されます）。冒頭で conda 環境名と取得ブランチを設定できます。
 
-## 🤗 貢献したいですか？
+---
 
-[Development Guide](https://docs.llmvtuber.com/docs/development-guide/overview)を参照してください。
+## 📜 サードパーティライセンス
 
-# 🎉🎉🎉 関連プロジェクト
+本プロジェクトには Live2D Inc. 提供の Live2D サンプルモデルが含まれます。これらの素材は
+[Live2D Free Material License Agreement](https://www.live2d.jp/en/terms/live2d-free-material-license-agreement/)
+および[利用規約](https://www.live2d.com/eula/live2d-sample-model-terms_en.html)に基づき
+個別にライセンスされており、本プロジェクトの MIT ライセンスの対象外です。商用利用
+（特に中〜大規模の企業）には Live2D Inc. からの追加許諾が必要になる場合があります。
 
-[ylxmf2005/LLM-Live2D-Desktop-Assitant](https://github.com/ylxmf2005/LLM-Live2D-Desktop-Assitant)
-
-  - LLMで駆動する **Live2D デスクトップアシスタント** です！ WindowsとMacOSの両方で使用可能で、画面を検出し、クリップボードの内容を取得し、固有の声で音声コマンドに反応します。**ウェイクワード、歌唱機能**、コンピュータ全体の制御をサポートし、好きなキャラクターとスムーズに対話できます。
-
-
-
-
-
-## 📜 サードパーティライセンス (Third-Party Licenses)
-
-### Live2D サンプルモデルに関する通知 (Live2D Sample Models Notice)
-
-このプロジェクトには、**Live2D Inc.から提供されたLive2Dサンプルモデル** が含まれています。当該資産は **Live2D Free Material License Agreement** および **Live2D Cubism Sample Data 利用規約** に基づき別途ライセンスが付与されており、このプロジェクトのMITライセンスには含まれません。
-
-このコンテンツはLive2D Inc.が所有し著作権を持つサンプルデータを使用しており、Live2D Inc.が定めた **規約と条件** に従って活用されます。（詳細は [Live2D Free Material License Agreement](https://www.live2d.jp/en/terms/live2d-free-material-license-agreement/) および [Terms of Use](https://www.live2d.com/eula/live2d-sample-model-terms_en.html) を参照）
-
-注：特に中堅・大規模企業での **商用利用** の際、このLive2Dサンプルモデルの使用には追加のライセンス要件が適用される場合があります。プロジェクトを商用利用する計画がある場合は、必ずLive2D Inc.から適切な許可を得るか、当該モデルが含まれていないバージョンを使用してください。
-
-## コントリビューター
-
-このプロジェクトを可能にしてくださった **コントリビューターとメンテナの方々に感謝いたします。**
-
-<a href="https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/graphs/contributors">
-<img src="https://contrib.rocks/image?repo=Open-LLM-VTuber/Open-LLM-VTuber" />
-</a>
-
-## スター履歴 (Star History)
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Open-LLM-VTuber/open-llm-vtuber&type=Date)](https://star-history.com/#Open-LLM-VTuber/open-llm-vtuber&Date)
+その他のコードは上流 [t41372/Open-LLM-VTuber](https://github.com/t41372/Open-LLM-VTuber)
+の MIT ライセンスを継承します。
