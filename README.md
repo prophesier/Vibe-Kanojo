@@ -1,159 +1,113 @@
-![](./assets/banner.jpg)
+<h1 align="center">Vibe-Kanojo</h1>
 
-<h1 align="center">Open-LLM-VTuber</h1>
-<h3 align="center">
+<p align="center">
+中文 | <a href="./README.EN.md">English</a> | <a href="./README.JP.md">日本語</a>
+</p>
 
-[![GitHub release](https://img.shields.io/github/v/release/Open-LLM-VTuber/Open-LLM-VTuber)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/releases) 
-[![license](https://img.shields.io/github/license/Open-LLM-VTuber/Open-LLM-VTuber)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/blob/master/LICENSE) 
-[![CodeQL](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/codeql.yml/badge.svg)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/codeql.yml)
-[![Ruff](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/ruff.yml/badge.svg)](https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/actions/workflows/ruff.yml)
-[![Docker](https://img.shields.io/badge/Open-LLM-VTuber%2FOpen--LLM--VTuber-%25230db7ed.svg?logo=docker&logoColor=blue&labelColor=white&color=blue)](https://hub.docker.com/r/Open-LLM-VTuber/open-llm-vtuber) 
-[![QQ User Group](https://img.shields.io/badge/QQ_User_Group-792615362-white?style=flat&logo=qq&logoColor=white)](https://qm.qq.com/q/ngvNUQpuKI)
-[![Static Badge](https://img.shields.io/badge/Join%20Chat-Zulip?style=flat&logo=zulip&label=Zulip(dev-community)&color=blue&link=https%3A%2F%2Folv.zulipchat.com)](https://olv.zulipchat.com)
+<p align="center">
+一个能<b>长期记住你</b>、<b>随时陪你聊</b>的 AI 伴侣。
+</p>
 
-> **📢 v2.0 Development**: We are focusing on Open-LLM-VTuber v2.0 — a complete rewrite of the codebase. v2.0 is currently in its early discussion and planning phase. We kindly ask you to refrain from opening new issues or pull requests for feature requests on v1. To participate in the v2 discussions or contribute, join our developer community on [Zulip](https://olv.zulipchat.com). Weekly meeting schedules will be announced on Zulip. We will continue fixing bugs for v1 and work through existing pull requests.
-
-[![BuyMeACoffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/yi.ting)
-[![](https://dcbadge.limes.pink/api/server/3UDA8YFDXx)](https://discord.gg/3UDA8YFDXx)
-
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Open-LLM-VTuber/Open-LLM-VTuber)
-
-ENGLISH README | [中文 README](./README.CN.md) | [한국어 README](./README.KR.md) | [日本語 README](./README.JP.md)
-
-[Documentation](https://open-llm-vtuber.github.io/docs/quick-start) | [![Roadmap](https://img.shields.io/badge/Roadmap-GitHub_Project-yellow)](https://github.com/orgs/Open-LLM-VTuber/projects/2)
-
-<a href="https://trendshift.io/repositories/27063" target="_blank"><img src="https://trendshift.io/api/badge/repositories/27063" alt="Open-LLM-VTuber%2FOpen-LLM-VTuber | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-
-</h3>
-
-
-> 常见问题 Common Issues doc (Written in Chinese): https://docs.qq.com/pdf/DTFZGQXdTUXhIYWRq
+> 本项目在 [t41372/Open-LLM-VTuber](https://github.com/t41372/Open-LLM-VTuber) 的基础上开发，
+> 沿用了它的语音对话、Live2D 形象、ASR/TTS 等底层能力，并在此之上重写了记忆系统、
+> 接入了 Discord，让它从"一次性语音玩具"变成一个**有连续记忆、可以多端随时找到**的伴侣。
 >
-> User Survey: https://forms.gle/w6Y6PiHTZr1nzbtWA
->
-> 调查问卷(中文): https://wj.qq.com/s2/16150415/f50a/
+> 角色（提示词、Live2D 模型、声音）都是可替换的——仓库里默认带的只是一个示例角色，
+> 你可以换成任何你想要的设定。
 
-test
-test2
+---
 
-> :warning: This project is in its early stages and is currently under **active development**.
+## ✨ 本项目加了什么
 
-> :warning: If you want to run the server remotely and access it on a different machine, such as running the server on your computer and access it on your phone, you will need to configure `https`, because the microphone on the front end will only launch in a secure context (a.k.a. https or localhost). See [MDN Web Doc](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getUserMedia). Therefore, you should configure https with a reverse proxy to access the page on a remote machine (non-localhost).
+### 🧠 三层持久化记忆
 
+让角色真正"记得"你，而不是每次对话都从零开始。三层各司其职：
 
+- **滑动窗口** —— 最近若干个完整 session 的原文直接进上下文，保证短期连续性。
+  每个 session 之间会注入 `【セッション開始: 日時】` 边界标记，避免跨天对话被揉成一团。
+- **facts.json** —— 从对话里抽取的**结构化长期事实**（你的偏好、习惯、重要的人和事），
+  按时间排序注入系统提示，每条带记录日期。支持自动抽取、去重、以及"外科手术式"的合并。
+- **diaries/** —— 每个 session 结束时生成一篇**日记总结**，用时段词（"傍晚""深夜"）而非精确时间，
+  长期保留，作为更久远记忆的索引。
 
-## ⭐️ What is this project?
+所有记忆注入都接入了 **prompt caching**（Anthropic 1h cache / OpenAI 自动 cache），
+日常对话稳定 ~99% cache 命中，长记忆不等于高成本。
 
+### ⏰ 时间感知
 
-**Open-LLM-VTuber** is a unique **voice-interactive AI companion** that not only supports **real-time voice conversations**  and **visual perception** but also features a lively **Live2D avatar**. All functionalities can run completely offline on your computer!
+角色知道"现在几点""上次聊是什么时候"，并且**不会凭空编造时间**：
 
-You can treat it as your personal AI companion — whether you want a `virtual girlfriend`, `boyfriend`, `cute pet`, or any other character, it can meet your expectations. The project fully supports `Windows`, `macOS`, and `Linux`, and offers two usage modes: web version and desktop client (with special support for **transparent background desktop pet mode**, allowing the AI companion to accompany you anywhere on your screen).
+- 每条用户消息打上 `[YYYY-MM-DD HH:MM:SS 周几]` 时间标记（仅供模型读取，不会出现在回复里）
+- 系统提示里有严格规则：任何涉及时间的发言前必须先查标记
+- "现在时刻"以最新一条用户消息的时间为基准
 
-Although the long-term memory feature is temporarily removed (coming back soon), thanks to the persistent storage of chat logs, you can always continue your previous unfinished conversations without losing any precious interactive moments.
+### 💬 Discord 交互
 
-In terms of backend support, we have integrated a rich variety of LLM inference, text-to-speech, and speech recognition solutions. If you want to customize your AI companion, you can refer to the [Character Customization Guide](https://open-llm-vtuber.github.io/docs/user-guide/live2d) to customize your AI companion's appearance and persona.
+人在外面也能找到角色聊天，**与 web 端共享同一个 session**（同一段记忆、同一个对话）：
 
-The reason it's called `Open-LLM-Vtuber` instead of `Open-LLM-Companion` or `Open-LLM-Waifu` is because the project's initial development goal was to use open-source solutions that can run offline on platforms other than Windows to recreate the closed-source AI Vtuber `neuro-sama`.
+- 文本桥接到 OLV 的 WebSocket 后端，支持转发图片附件
+- 纯文本对话自动跳过 TTS，省资源
 
-### 👀 Demo
-| ![](assets/i1.jpg) | ![](assets/i2.jpg) |
-|:---:|:---:|
-| ![](assets/i3.jpg) | ![](assets/i4.jpg) |
+#### 管理员斜杠指令
 
+| 指令 | 作用 |
+|---|---|
+| `/restart` | 远程拉取最新代码并重启服务 |
+| `/logs target:bot\|olv\|both lines:N` | 远程查看日志 |
+| `/status` | 查看进程 PID、运行时长、当前 commit |
+| `/facts-consolidate` | 触发长期事实的合并整理 |
 
-## ✨ Features & Highlights
+### 🔍 Web 检索
 
-- 🖥️ **Cross-platform support**: Perfect compatibility with macOS, Linux, and Windows. We support NVIDIA and non-NVIDIA GPUs, with options to run on CPU or use cloud APIs for resource-intensive tasks. Some components support GPU acceleration on macOS.
+闲聊中角色可以主动联网查信息：
 
-- 🔒 **Offline mode support**: Run completely offline using local models - no internet required. Your conversations stay on your device, ensuring privacy and security.
+- **Claude 路径**：使用 Anthropic 原生 `web_search` / `web_fetch` server tool
+- **OpenAI 路径**：客户端自实现，search 走 Brave / Tavily（均有免费额度），fetch 自己抽正文
 
-- 💻 **Attractive and powerful web and desktop clients**: Offers both web version and desktop client usage modes, supporting rich interactive features and personalization settings. The desktop client can switch freely between window mode and desktop pet mode, allowing the AI companion to be by your side at all times.
+检索发生时会在触发位置显示一个内联标记，让你知道它真的查了网，而不是瞎编。
 
-- 🎯 **Advanced interaction features**:
-  - 👁️ Visual perception, supporting camera, screen recording and screenshots, allowing your AI companion to see you and your screen
-  - 🎤 Voice interruption without headphones (AI won't hear its own voice)
-  - 🫱 Touch feedback, interact with your AI companion through clicks or drags
-  - 😊 Live2D expressions, set emotion mapping to control model expressions from the backend
-  - 🐱 Pet mode, supporting transparent background, global top-most, and mouse click-through - drag your AI companion anywhere on the screen
-  - 💭 Display AI's inner thoughts, allowing you to see AI's expressions, thoughts and actions without them being spoken
-  - 🗣️ AI proactive speaking feature
-  - 💾 Chat log persistence, switch to previous conversations anytime
-  - 🌍 TTS translation support (e.g., chat in Chinese while AI uses Japanese voice)
+---
 
-- 🧠 **Extensive model support**:
-  - 🤖 Large Language Models (LLM): Ollama, OpenAI (and any OpenAI-compatible API), Gemini, Claude, Mistral, DeepSeek, Zhipu AI, GGUF, LM Studio, vLLM, etc.
-  - 🎙️ Automatic Speech Recognition (ASR): sherpa-onnx, FunASR, Faster-Whisper, Whisper.cpp, Whisper, Groq Whisper, Azure ASR, etc.
-  - 🔊 Text-to-Speech (TTS): sherpa-onnx, pyttsx3, MeloTTS, Coqui-TTS, GPTSoVITS, Bark, CosyVoice, Edge TTS, Fish Audio, Azure TTS, etc.
+## 🚀 快速开始
 
-- 🔧 **Highly customizable**:
-  - ⚙️ **Simple module configuration**: Switch various functional modules through simple configuration file modifications, without delving into the code
-  - 🎨 **Character customization**: Import custom Live2D models to give your AI companion a unique appearance. Shape your AI companion's persona by modifying the Prompt. Perform voice cloning to give your AI companion the voice you desire
-  - 🧩 **Flexible Agent implementation**: Inherit and implement the Agent interface to integrate any Agent architecture, such as HumeAI EVI, OpenAI Her, Mem0, etc.
-  - 🔌 **Good extensibility**: Modular design allows you to easily add your own LLM, ASR, TTS, and other module implementations, extending new features at any time
+底层部署（依赖安装、ASR/TTS/LLM 配置）与上游一致，请先参考
+[Open-LLM-VTuber 官方文档](https://open-llm-vtuber.github.io/docs/quick-start)。
 
+简要：
 
-## 👥 User Reviews
-> Thanks to the developer for open-sourcing and sharing the girlfriend for everyone to use
-> 
-> This girlfriend has been used over 100,000 times
+```bash
+uv sync                     # 安装依赖
+uv run run_server.py        # 启动服务（首次会自动生成 model_dict.json 等配置）
+```
 
+本项目额外的配置项（持久化记忆、Discord、Web 检索）见 `config_templates/conf.default.yaml`
+中对应区块的注释。Discord bot 的启用方式见 `discord_bot/` 下的说明。
 
-## 🚀 Quick Start
+首次启动时，`model_dict.json`、`mcp_servers.json`、`restart.bat` 会自动从同名的 `.example`
+模板生成，你可以直接编辑它们（已被 git 忽略，改动不会同步到仓库）。
 
-Please refer to the [Quick Start](https://open-llm-vtuber.github.io/docs/quick-start) section in our documentation for installation.
+### 一键启动（Windows）
 
+仓库自带一个 Windows Terminal 一键启动脚本模板，可同时拉起 OLV 服务、Discord bot、
+GPT-SoVITS TTS 三个标签页：
 
+```bat
+copy start_all.example.bat start_all.bat
+```
 
-## ☝ Update
-> :warning: `v1.0.0` has breaking changes and requires re-deployment. You *may* still update via the method below, but the `conf.yaml` file is incompatible and most of the dependencies needs to be reinstalled with `uv`. For those who came from versions before `v1.0.0`, I recommend deploy this project again with the [latest deployment guide](https://open-llm-vtuber.github.io/docs/quick-start).
+复制后编辑 `start_all.bat` 顶部的 `CONDA_ENV`（你的 conda 环境名）和 `TTS_DIR`
+（本地 GPT-SoVITS 路径）即可。`start_all.bat` 已被 git 忽略，随便改不会污染仓库。
 
-Please use `uv run update.py` to update if you installed any versions later than `v1.0.0`.
+`restart.bat`（供 Discord `/restart` 远程重启用）会在首次启动时自动生成，直接编辑即可
+（已被 git 忽略）；顶部可设置 conda 环境名与拉取分支。
 
-## 😢 Uninstall  
-Most files, including Python dependencies and models, are stored in the project folder.
+---
 
-However, models downloaded via ModelScope or Hugging Face may also be in `MODELSCOPE_CACHE` or `HF_HOME`. While we aim to keep them in the project's `models` directory, it's good to double-check.  
+## 📜 第三方许可
 
-Review the installation guide for any extra tools you no longer need, such as `uv`, `ffmpeg`, or `deeplx`.  
+本项目包含 Live2D Inc. 提供的 Live2D 示例模型。这些素材依据
+[Live2D Free Material License Agreement](https://www.live2d.jp/en/terms/live2d-free-material-license-agreement/)
+和[使用条款](https://www.live2d.com/eula/live2d-sample-model-terms_en.html)单独授权，
+不在本项目 MIT 许可的覆盖范围内。商用（尤其是中大型企业）可能需要向 Live2D Inc. 取得额外授权。
 
-## 🤗 Want to contribute?
-Checkout the [development guide](https://docs.llmvtuber.com/docs/development-guide/overview).
-
-
-# 🎉🎉🎉 Related Projects
-
-[ylxmf2005/LLM-Live2D-Desktop-Assitant](https://github.com/ylxmf2005/LLM-Live2D-Desktop-Assitant)
-- Your Live2D desktop assistant powered by LLM! Available for both Windows and MacOS, it senses your screen, retrieves clipboard content, and responds to voice commands with a unique voice. Featuring voice wake-up, singing capabilities, and full computer control for seamless interaction with your favorite character.
-
-
-
-
-
-
-## 📜 Third-Party Licenses
-
-### Live2D Sample Models Notice
-
-This project includes Live2D sample models provided by Live2D Inc. These assets are licensed separately under the Live2D Free Material License Agreement and the Terms of Use for Live2D Cubism Sample Data. They are not covered by the MIT license of this project.
-
-This content uses sample data owned and copyrighted by Live2D Inc. The sample data are utilized in accordance with the terms and conditions set by Live2D Inc. (See [Live2D Free Material License Agreement](https://www.live2d.jp/en/terms/live2d-free-material-license-agreement/) and [Terms of Use](https://www.live2d.com/eula/live2d-sample-model-terms_en.html)).
-
-Note: For commercial use, especially by medium or large-scale enterprises, the use of these Live2D sample models may be subject to additional licensing requirements. If you plan to use this project commercially, please ensure that you have the appropriate permissions from Live2D Inc., or use versions of the project without these models.
-
-
-## Contributors
-Thanks our contributors and maintainers for making this project possible.
-
-<a href="https://github.com/Open-LLM-VTuber/Open-LLM-VTuber/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=Open-LLM-VTuber/Open-LLM-VTuber" />
-</a>
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Open-LLM-VTuber/open-llm-vtuber&type=Date)](https://star-history.com/#Open-LLM-VTuber/open-llm-vtuber&Date)
-
-
-
-
-
+其余代码沿用上游 [t41372/Open-LLM-VTuber](https://github.com/t41372/Open-LLM-VTuber) 的 MIT 许可。
