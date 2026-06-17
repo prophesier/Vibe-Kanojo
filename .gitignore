@@ -90,3 +90,9 @@ private/
 mcp_servers.json
 
 .vscode/
+# frontend vendoring work notes (local)
+frontend_vendoring.md
+web/node_modules/
+web/dist/
+web/out/
+web/release/
