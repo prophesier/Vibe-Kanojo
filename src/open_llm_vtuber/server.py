@@ -40,6 +40,21 @@ class CORSStaticFiles(StarletteStaticFiles):
         return response
 
 
+class Live2DStaticFiles(CORSStaticFiles):
+    """
+    Live2D model assets (model3.json / exp3.json / textures) change whenever the
+    user swaps or re-exports a model. Without an explicit Cache-Control header the
+    Electron/Chromium HTTP cache applies heuristic freshness from Last-Modified and
+    can serve a stale model3.json for days, so a swapped model's expression order
+    silently doesn't take effect. Force revalidation (ETag) on every load.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 class AvatarStaticFiles(CORSStaticFiles):
     """
     Avatar files handler with security restrictions and CORS headers
@@ -120,7 +135,7 @@ class WebSocketServer:
         # Mount static files with CORS-enabled handlers
         self.app.mount(
             "/live2d-models",
-            CORSStaticFiles(directory="live2d-models"),
+            Live2DStaticFiles(directory="live2d-models"),
             name="live2d-models",
         )
         self.app.mount(
