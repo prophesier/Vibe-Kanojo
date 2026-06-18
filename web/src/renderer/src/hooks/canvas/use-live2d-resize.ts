@@ -94,6 +94,13 @@ export const useLive2DResize = ({
    * Uses linear interpolation for smooth transitions
    */
   const animateEase = useCallback(() => {
+    // While the expression-capture feature is fitting the model, don't enforce
+    // the user's scale (it would overwrite the capture framing every frame).
+    if ((window as any).__capturing) {
+      animationFrameRef.current = requestAnimationFrame(animateEase);
+      return;
+    }
+
     const clampedTargetScale = Math.max(
       MIN_SCALE,
       Math.min(MAX_SCALE, targetScaleRef.current),

@@ -21,10 +21,14 @@ from typing import Iterable, Literal, Optional
 import discord
 from discord import app_commands
 from loguru import logger
+from PIL import Image
 
 from .bridge import OLVBridge, TurnResult
 
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+# Longest side (px) of the expression face sent to Discord. Downscaled from the
+# higher-res cache on send (keeps detail); tune for size vs sharpness.
+_FACE_SEND_MAX_DIM = 280
 _CONSOLIDATION_LLM_PROVIDERS = frozenset(
     {
         "claude_llm",
@@ -122,6 +126,8 @@ class DiscordVTuberBot(discord.Client):
         self._admin_user_id = int(admin_user_id or 0)
         self._project_root = Path(project_root) if project_root else Path.cwd()
         self._full_config = full_config
+        # Last expression face sent to Discord; only re-send when it changes.
+        self._last_face_index: Optional[int] = None
         self._tree = app_commands.CommandTree(self)
         self._started_at = time.time()
         if self._admin_user_id:
@@ -251,6 +257,50 @@ class DiscordVTuberBot(discord.Client):
             )
             embed.set_footer(text=f"Reported {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+        @self._tree.command(
+            name="refresh-faces",
+            description="Re-render the Live2D expression faces sent to Discord",
+        )
+        async def refresh_faces_cmd(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message(
+                    "Unauthorized.", ephemeral=True
+                )
+                return
+            if self._bridge is None or not self._bridge.is_connected:
+                await interaction.response.send_message(
+                    "OLV bridge not connected — open the app and try again.",
+                    ephemeral=True,
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                result = await self._bridge.request_expression_capture()
+            except asyncio.TimeoutError:
+                await interaction.followup.send(
+                    "Timed out waiting for the frontend to capture faces "
+                    "(is the app open and rendering?).",
+                    ephemeral=True,
+                )
+                return
+            except Exception as e:
+                logger.exception("refresh-faces failed")
+                await interaction.followup.send(
+                    f"Face refresh failed: {type(e).__name__}: {e}", ephemeral=True
+                )
+                return
+
+            err = result.get("error")
+            count = result.get("count", 0)
+            if err or count == 0:
+                await interaction.followup.send(
+                    f"⚠️ No faces captured. {err or ''}".strip(), ephemeral=True
+                )
+                return
+            await interaction.followup.send(
+                f"✅ Refreshed {count} expression face(s).", ephemeral=True
+            )
 
         @self._tree.command(
             name="facts-consolidate",
@@ -647,6 +697,9 @@ class DiscordVTuberBot(discord.Client):
             if not await self._safe_reply(source, chunk):
                 delivered = False
 
+        # Show the expression face at the end, only when it changed from last time.
+        await self._maybe_send_face(source, result.face_index)
+
         if delivered:
             logger.info(f"Reply for req={result.request_id} delivered to Discord.")
         else:
@@ -659,6 +712,45 @@ class DiscordVTuberBot(discord.Client):
             logger.warning(
                 f"Reply for req={result.request_id} had partial error: {result.error}"
             )
+
+    async def _maybe_send_face(
+        self, source: discord.Message, face_index: Optional[int]
+    ) -> None:
+        """Attach the cached expression face PNG, but only when it changed.
+
+        Faces are produced by ``/refresh-faces`` into
+        ``cache/discord_faces/<conf_uid>/<index>.png``.
+        """
+        if face_index is None or face_index == self._last_face_index:
+            return
+        if self._full_config is None:
+            return
+        conf_uid = self._full_config.character_config.conf_uid
+        path = Path("cache") / "discord_faces" / conf_uid / f"{face_index}.png"
+        if not path.is_file():
+            return
+        try:
+            # Downscale to a fixed size on send from the higher-res cache, so it
+            # stays sharp (the cached capture keeps full quality).
+            with Image.open(path) as src:
+                w, h = src.size
+                longest = max(w, h)
+                if longest > _FACE_SEND_MAX_DIM:
+                    s = _FACE_SEND_MAX_DIM / longest
+                    out = src.resize(
+                        (max(1, round(w * s)), max(1, round(h * s))), Image.LANCZOS
+                    )
+                else:
+                    out = src.copy()
+                buf = io.BytesIO()
+                out.save(buf, format="PNG")
+            buf.seek(0)
+            await source.channel.send(
+                file=discord.File(buf, filename=f"face_{face_index}.png")
+            )
+            self._last_face_index = face_index
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to send expression face {face_index}: {e}")
 
     async def _safe_reply(self, source: discord.Message, content: str) -> bool:
         """Send a message to the channel, retrying transient failures.

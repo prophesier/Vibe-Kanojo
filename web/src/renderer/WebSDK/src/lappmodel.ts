@@ -482,6 +482,13 @@ export class LAppModel extends CubismUserModel {
   private setupTextures(): void {
     console.log('Setting up textures for model:', this._modelHomeDir);
 
+    // Raise the clipping-mask buffer from the Cubism 256px default so that
+    // mask-clipped parts of the model (face features, layered clothing) stay
+    // sharp at higher render resolutions — notably the expression-capture
+    // feature, but it also sharpens normal viewing. Set here (after
+    // createRenderer, before the first draw builds the clipping context).
+    this.getRenderer().setClippingMaskBufferSize(4096);
+
     // iPhoneでのアルファ品質向上のためTypescriptではpremultipliedAlphaを採用 (Reverted to likely original)
     const usePremultiply = true;
 

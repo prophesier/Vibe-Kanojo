@@ -195,7 +195,10 @@ export class LAppDelegate {
 
       // 画面の初期化
       // 屏幕初始化
-      gl!.clearColor(0.0, 0.0, 0.0, 1.0);
+      // Transparent clear colour + an explicit colour-buffer clear below, now
+      // that preserveDrawingBuffer disables the automatic clear (see
+      // LAppGlManager). Keeps the canvas transparent and capturable.
+      gl!.clearColor(0.0, 0.0, 0.0, 0.0);
 
       // 深度テストを有効化
       // 启用深度测试
@@ -207,8 +210,7 @@ export class LAppDelegate {
 
       // カラーバッファや深度バッファをクリアする
       // 清除颜色缓冲区和深度缓冲区
-      // gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-      gl!.clear(gl!.DEPTH_BUFFER_BIT);
+      gl!.clear(gl!.COLOR_BUFFER_BIT | gl!.DEPTH_BUFFER_BIT);
 
       gl!.clearDepth(1.0);
 

@@ -11,6 +11,7 @@ import { LAppDelegate } from "./lappdelegate";
 import * as LAppDefine from "./lappdefine";
 import { LAppGlManager } from "./lappglmanager";
 import { LAppLive2DManager } from "./lapplive2dmanager";
+import { setupExpressionCapture } from "./expressioncapture";
 
 /**
  * Initialize the Live2D application
@@ -37,6 +38,9 @@ export function initializeLive2D(): void {
   }
 
   LAppDelegate.getInstance().run();
+
+  // Expose window.__captureExpression / __captureAllFaces / __previewAllFaces
+  setupExpressionCapture();
 
   (window as any).getLive2DManager = () => LAppLive2DManager.getInstance();
 

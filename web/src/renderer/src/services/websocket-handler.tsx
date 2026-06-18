@@ -286,6 +286,32 @@ function WebSocketHandler({ children }: { children: React.ReactNode }) {
           console.warn('Received incomplete tool_call_status message:', message);
         }
         break;
+      case 'capture-expressions': {
+        // Backend (via /refresh-faces) asks this frontend to render every Live2D
+        // expression to a PNG and send them back for caching. ~20s; runs async.
+        const capture = (window as any).__captureAllFaces;
+        if (typeof capture === 'function') {
+          capture()
+            .then((images: Record<number, string>) => {
+              // Stream one image per message — a single combined message can be
+              // several MB and exceeds the WebSocket size limit (drops the socket).
+              const entries = Object.entries(images);
+              wsService.sendMessage({ type: 'expression-capture-begin' });
+              entries.forEach(([index, image]) => {
+                wsService.sendMessage({ type: 'expression-capture-chunk', index: Number(index), image });
+              });
+              wsService.sendMessage({ type: 'expression-capture-done', count: entries.length });
+            })
+            .catch((e: unknown) => {
+              console.error('[capture-expressions] failed', e);
+              wsService.sendMessage({ type: 'expression-capture-done', count: 0, error: String(e) });
+            });
+        } else {
+          console.warn('[capture-expressions] __captureAllFaces not available');
+          wsService.sendMessage({ type: 'expression-capture-done', count: 0, error: 'capture unavailable' });
+        }
+        break;
+      }
       default:
         console.warn('Unknown message type:', message.type);
     }

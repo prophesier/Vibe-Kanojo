@@ -1,7 +1,9 @@
 from typing import Dict, List, Optional, Callable, TypedDict
 from fastapi import WebSocket, WebSocketDisconnect
 import asyncio
+import base64
 import json
+import os
 from enum import Enum
 import numpy as np
 from loguru import logger
@@ -101,6 +103,10 @@ class WebSocketHandler:
             "audio-play-start": self._handle_audio_play_start,
             "request-init-config": self._handle_init_config_request,
             "heartbeat": self._handle_heartbeat,
+            "request-expression-capture": self._handle_request_expression_capture,
+            "expression-capture-begin": self._handle_expression_capture_begin,
+            "expression-capture-chunk": self._handle_expression_capture_chunk,
+            "expression-capture-done": self._handle_expression_capture_done,
         }
 
     async def handle_new_connection(
@@ -715,3 +721,102 @@ class WebSocketHandler:
             await websocket.send_json({"type": "heartbeat-ack"})
         except Exception as e:
             logger.error(f"Error sending heartbeat acknowledgment: {e}")
+
+    async def _handle_request_expression_capture(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Ask connected frontend client(s) to capture the Live2D expression faces.
+
+        Triggered from Discord ``/refresh-faces`` via the proxy bridge. Broadcast
+        to every other client; only a real frontend handles ``capture-expressions``
+        (the bridge ignores it). The frontend replies with
+        ``expression-capture-result``.
+        """
+        msg = json.dumps({"type": "capture-expressions"})
+        sent = 0
+        for uid, ws in list(self.client_connections.items()):
+            if uid == client_uid:
+                continue  # don't echo back to the requester (the bridge)
+            try:
+                await ws.send_text(msg)
+                sent += 1
+            except Exception as e:
+                logger.warning(f"capture-expressions send to {uid} failed: {e}")
+        logger.info(f"[expression-capture] requested; broadcast to {sent} client(s)")
+        if sent == 0:
+            try:
+                await websocket.send_json(
+                    {
+                        "type": "expression-capture-complete",
+                        "count": 0,
+                        "error": "no frontend client connected",
+                    }
+                )
+            except Exception:
+                pass
+
+    def _discord_faces_dir(self, client_uid: str) -> str:
+        """``cache/discord_faces/<conf_uid>`` for the given client's character."""
+        context = self.client_contexts.get(client_uid)
+        conf_uid = (
+            context.character_config.conf_uid
+            if context and context.character_config
+            else "default"
+        )
+        return os.path.join("cache", "discord_faces", conf_uid)
+
+    async def _handle_expression_capture_begin(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Start of a face capture: (re)create a clean output directory.
+
+        Images are streamed one-per-message (``expression-capture-chunk``) to stay
+        well under the WebSocket message-size limit; a single combined message can
+        run to several MB and gets the connection dropped.
+        """
+        out_dir = self._discord_faces_dir(client_uid)
+        try:
+            if os.path.isdir(out_dir):
+                for name in os.listdir(out_dir):
+                    if name.endswith(".png"):
+                        os.remove(os.path.join(out_dir, name))
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"[expression-capture] could not clear {out_dir}: {e}")
+
+    async def _handle_expression_capture_chunk(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Save one captured expression PNG as ``<index>.png`` (overwrite)."""
+        index = data.get("index")
+        data_url = data.get("image") or ""
+        out_dir = self._discord_faces_dir(client_uid)
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            b64 = data_url.split(",", 1)[1] if "," in data_url else data_url
+            raw = base64.b64decode(b64)
+            with open(os.path.join(out_dir, f"{index}.png"), "wb") as f:
+                f.write(raw)
+        except Exception as e:
+            logger.warning(f"failed to save expression face {index}: {e}")
+
+    async def _handle_expression_capture_done(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """End of a face capture: announce completion back toward Discord."""
+        count = data.get("count", 0)
+        error = data.get("error")
+        logger.info(
+            f"[expression-capture] done: {count} faces in "
+            f"{self._discord_faces_dir(client_uid)}"
+        )
+        # Broadcast so the proxy bridge (which forwards it to Discord) receives it;
+        # real frontends ignore this type.
+        complete = json.dumps(
+            {"type": "expression-capture-complete", "count": count, "error": error}
+        )
+        for uid, ws in list(self.client_connections.items()):
+            try:
+                await ws.send_text(complete)
+            except Exception:
+                pass

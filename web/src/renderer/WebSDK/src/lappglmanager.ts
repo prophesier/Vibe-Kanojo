@@ -47,7 +47,11 @@ export class LAppGlManager {
       return;
     }
 
-     gl = canvas.getContext("webgl2");
+     // preserveDrawingBuffer lets us read the rendered frame back via
+     // canvas.toDataURL (used by the expression-capture feature). It disables
+     // the browser's automatic colour-buffer clear, so the render loop must now
+     // clear the colour buffer itself (see LAppDelegate.run).
+     gl = canvas.getContext("webgl2", { preserveDrawingBuffer: true });
 
      if (!gl) {
        // gl初期化失敗

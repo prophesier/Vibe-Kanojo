@@ -92,6 +92,9 @@ async def handle_sentence_output(
     """Handle sentence output type with optional translation support"""
     full_response = ""
     async for display_text, tts_text, actions in output:
+        # The ✦ primary-expression marker stays in the displayed/stored text (so
+        # it's visible) but must not be spoken by TTS.
+        tts_text = tts_text.replace("✦", "")
         logger.debug(f"🏃 Processing output: '''{tts_text}'''...")
 
         if translate_engine:
