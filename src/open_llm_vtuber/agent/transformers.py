@@ -86,6 +86,9 @@ def actions_extractor(live2d_model: Live2dModel):
                         expressions = live2d_model.extract_emotion(sentence.text)
                         if expressions:
                             actions.expressions = expressions
+                        primary = live2d_model.extract_primary_emotion(sentence.text)
+                        if primary is not None:
+                            actions.primary_expression = primary
                     yield sentence, actions  # Yield the tuple
                 elif isinstance(item, dict):
                     # Pass through dictionaries

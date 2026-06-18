@@ -71,6 +71,10 @@ export class WindowManager {
         sandbox: false,
         contextIsolation: true,
         nodeIntegration: true,
+        // Keep rendering (requestAnimationFrame) running even when the window is
+        // minimised/hidden — so the pet stays alive in the background and the
+        // expression-capture feature works regardless of window state/mode.
+        backgroundThrottling: false,
       },
       hasShadow: false,
       paintWhenInitiallyHidden: true,

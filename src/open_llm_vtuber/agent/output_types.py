@@ -10,6 +10,9 @@ class Actions:
     expressions: Optional[List[str] | List[int]] = None
     pictures: Optional[List[str]] = None
     sounds: Optional[List[str]] = None
+    # Index of the one expression the LLM marked as primary (✦[key]); used to
+    # pick which face image to attach in Discord.
+    primary_expression: Optional[int] = None
 
     def to_dict(self) -> dict:
         """Convert Actions object to a dictionary for JSON serialization"""

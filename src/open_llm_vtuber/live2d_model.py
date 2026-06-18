@@ -2,6 +2,10 @@ import json
 import chardet
 from loguru import logger
 
+# Sigil the LLM puts right before an expression bracket (e.g. ✦[joy]) to mark
+# the one expression it most wants to convey — used to pick the Discord face.
+EXPRESSION_MARKER = "✦"
+
 # This class will only prepare the payload for the live2d model
 # the process of sending the payload should be done by the caller
 # This class is **Not responsible** for sending the payload to the server
@@ -170,6 +174,24 @@ class Live2dModel:
                     break
             i += 1
         return expression_list
+
+    def extract_primary_emotion(self, str_to_check: str):
+        """Return the emo_map index marked primary with ✦[key], else None.
+
+        The LLM marks the one expression it most wants to convey by putting the
+        ✦ sigil right before that expression's bracket. The first marker wins.
+        Plain ``[key]`` tags are unaffected (extract_emotion still finds them).
+        """
+        lower = str_to_check.lower()
+        i = 0
+        while i < len(lower):
+            if lower[i] == EXPRESSION_MARKER:
+                for key in self.emo_map.keys():
+                    tag = f"{EXPRESSION_MARKER}[{key}]"
+                    if lower[i : i + len(tag)] == tag:
+                        return self.emo_map[key]
+            i += 1
+        return None
 
     def remove_emotion_keywords(self, target_str: str) -> str:
         """

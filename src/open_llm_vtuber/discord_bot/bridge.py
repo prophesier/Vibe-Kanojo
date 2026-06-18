@@ -34,6 +34,9 @@ class TurnResult:
     request_id: str
     text_parts: list[str] = field(default_factory=list)
     error: Optional[str] = None
+    # Expression index for the face to attach on Discord: the LLM-marked primary
+    # if any, otherwise the first expression seen this turn.
+    face_index: Optional[int] = None
 
     @property
     def text(self) -> str:
@@ -83,6 +86,8 @@ class OLVBridge:
         self._ready_event = asyncio.Event()
         self._current_turn: Optional[_PendingTurn] = None
         self._turn_lock = asyncio.Lock()
+        # Resolves when an expression-capture-complete arrives (for /refresh-faces).
+        self._capture_future: Optional[asyncio.Future] = None
 
     @property
     def is_connected(self) -> bool:
@@ -114,6 +119,27 @@ class OLVBridge:
             except (asyncio.CancelledError, Exception):
                 pass
             self._receive_task = None
+
+    async def request_expression_capture(
+        self, *, timeout: float = 120.0
+    ) -> dict[str, Any]:
+        """Trigger a frontend Live2D expression-face capture and wait for it.
+
+        Returns ``{"count": int, "error": str | None}``. Raises on timeout or if
+        the bridge is not connected.
+        """
+        if self._ws is None:
+            raise RuntimeError("bridge not connected")
+        loop = asyncio.get_running_loop()
+        self._capture_future = loop.create_future()
+        try:
+            async with self._send_lock:
+                await self._ws.send(
+                    json.dumps({"type": "request-expression-capture"})
+                )
+            return await asyncio.wait_for(self._capture_future, timeout=timeout)
+        finally:
+            self._capture_future = None
 
     async def send_text(
         self,
@@ -247,11 +273,30 @@ class OLVBridge:
     async def _handle_incoming(self, data: dict[str, Any]) -> None:
         msg_type = data.get("type")
 
+        if msg_type == "expression-capture-complete":
+            fut = self._capture_future
+            if fut is not None and not fut.done():
+                fut.set_result(
+                    {"count": data.get("count", 0), "error": data.get("error")}
+                )
+            return
+
         if msg_type == "audio":
             display = data.get("display_text") or {}
             text = (display.get("text") or "").strip()
             if text and self._current_turn is not None:
                 self._current_turn.result.text_parts.append(text)
+            # Pick the face for this turn: the LLM-marked primary wins; otherwise
+            # fall back to the first expression seen.
+            actions = data.get("actions") or {}
+            if self._current_turn is not None:
+                primary = actions.get("primary_expression")
+                if primary is not None:
+                    self._current_turn.result.face_index = primary
+                elif self._current_turn.result.face_index is None:
+                    exprs = actions.get("expressions") or []
+                    if exprs:
+                        self._current_turn.result.face_index = exprs[0]
             return
 
         if msg_type == "full-text":
