@@ -620,19 +620,27 @@ export class LAppModel extends CubismUserModel {
 
     // Lip sync settings
     if (this._lipsync) {
-      let value = 0.0;
       this._wavFileHandler.update(deltaTimeSeconds);
-      value = this._wavFileHandler.getRms();
-      value = Math.min(1.0, value * 1.5);
 
-      const lipSyncWeight = 4.0;
+      // While capturing the static face images for the Discord pack, leave the
+      // mouth alone: an expression's own ParamMouthOpenY defines its resting
+      // mouth shape (the "speaking" faces set 1), and lip sync — with no audio,
+      // rms ≈ 0 — would otherwise force that mouth shut in the captured image.
+      if (!(window as any).__capturing) {
+        let value = this._wavFileHandler.getRms();
+        value = Math.min(1.0, value * 1.5);
 
-      for (let i = 0; i < this._lipSyncIds.getSize(); ++i) {
-        this._model.addParameterValueById(
-          this._lipSyncIds.at(i),
-          value,
-          lipSyncWeight
-        );
+        // Overwrite (not add) the mouth-open value so lip sync is the sole
+        // driver during playback. With Add, an expression that statically sets
+        // ParamMouthOpenY = 1 keeps adding +1 once it has fully faded in, which
+        // saturates the parameter at its max and pins the mouth open — lip sync
+        // can no longer pull it back down. The 4.0 weight is folded into the
+        // target so the snappy feel is unchanged, and expressions that leave the
+        // parameter at 0 resolve to exactly the same value as before.
+        const target = Math.min(1.0, value * 4.0);
+        for (let i = 0; i < this._lipSyncIds.getSize(); ++i) {
+          this._model.setParameterValueById(this._lipSyncIds.at(i), target);
+        }
       }
     }
 
