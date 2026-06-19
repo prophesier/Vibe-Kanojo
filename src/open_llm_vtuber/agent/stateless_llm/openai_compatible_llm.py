@@ -258,7 +258,13 @@ class AsyncLLM(StatelessLLMInterface):
                 f"Tool Support: {self.support_tools}, Available tools: {available_tools}"
             )
 
+            served_model_logged = False
             async for chunk in stream:
+                if not served_model_logged and getattr(chunk, "model", None):
+                    logger.info(
+                        f"[llm] requested={self.model!r} served={chunk.model!r}"
+                    )
+                    served_model_logged = True
                 usage = getattr(chunk, "usage", None)
                 if usage:
                     self._log_openai_cache_usage(usage)
