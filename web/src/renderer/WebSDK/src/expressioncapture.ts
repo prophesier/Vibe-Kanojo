@@ -38,10 +38,25 @@ function getModel(): any {
   return LAppLive2DManager.getInstance()?.getModel(0);
 }
 
+/**
+ * Expression name at the model3.json array index `i` — the same order the
+ * backend's emotionMap and `getExpressionName(i)` use. Do NOT index into
+ * `_expressions._keyValues`: that csmMap is filled in expression-file
+ * fetch-completion order (async, non-deterministic), so its `[i]` doesn't match
+ * the canonical index and the captured faces come out mis-numbered (typically
+ * the middle ones, whose fetches race). Falls back to the map only if the model
+ * setting is unavailable.
+ */
+function expressionNameByIndex(model: any, index: number): string | undefined {
+  const name = model?._modelSetting?.getExpressionName?.(index);
+  if (name) return name;
+  return model?._expressions?._keyValues?.[index]?.first;
+}
+
 /** Reset to a neutral resting expression so the model isn't left on the last capture. */
 function resetExpression(): void {
   const model = getModel();
-  const name: string | undefined = model?._expressions?._keyValues?.[RESET_EXPRESSION_INDEX]?.first;
+  const name = expressionNameByIndex(model, RESET_EXPRESSION_INDEX);
   if (name != null) model.setExpression(name);
 }
 
@@ -180,7 +195,9 @@ function cropPortrait(): string {
 /** Number of expressions the current model has. */
 export function expressionCount(): number {
   const model = getModel();
-  return model?._expressions?.getSize?.() ?? 0;
+  // Count from the model setting so it matches the canonical index space used
+  // by expressionNameByIndex (falls back to the loaded-expression map).
+  return model?._modelSetting?.getExpressionCount?.() ?? model?._expressions?.getSize?.() ?? 0;
 }
 
 /**
@@ -191,8 +208,7 @@ export async function captureExpression(index: number, settleMs = 1000): Promise
   const model = getModel();
   if (!model || !canvas) throw new Error('model/canvas not ready');
 
-  const exprs = model._expressions;
-  const name: string | undefined = exprs?._keyValues?.[index]?.first;
+  const name = expressionNameByIndex(model, index);
   if (name == null) throw new Error(`no expression at index ${index}`);
 
   // Hold the eyes open so we never catch a mid-blink frame; render at higher
@@ -241,7 +257,7 @@ export async function captureAllFaces(settleMs = 1000): Promise<Record<number, s
   try {
     savedMatrix = await applyCaptureFraming(model);
     for (let i = 0; i < count; i += 1) {
-      const name = model._expressions._keyValues[i].first;
+      const name = expressionNameByIndex(model, i);
       model.setExpression(name);
       // eslint-disable-next-line no-await-in-loop
       await wait(settleMs);
