@@ -14,8 +14,10 @@ class DiaryRagConfig(I18nMixin):
     topn_threshold: float = Field(0.70, alias="topn_threshold")
     max_retrievals_per_turn: int = Field(2, alias="max_retrievals_per_turn")
     lexical_weight: float = Field(0.5, alias="lexical_weight")
-    ttl_turns: int = Field(4, alias="ttl_turns")
-    max_in_context: int = Field(4, alias="max_in_context")
+    rerank_enabled: bool = Field(True, alias="rerank_enabled")
+    rerank_model: str = Field("gpt-4o-mini", alias="rerank_model")
+    rerank_candidates: int = Field(12, alias="rerank_candidates")
+    prefilter_floor: float = Field(0.3, alias="prefilter_floor")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "enabled": Description(
@@ -50,13 +52,21 @@ class DiaryRagConfig(I18nMixin):
             en="Weight of the keyword-overlap signal in hybrid scoring (0 = pure vector)",
             zh="混合打分里关键词重叠信号的权重（0=纯向量）",
         ),
-        "ttl_turns": Description(
-            en="How many turns a retrieved diary stays in context before expiring",
-            zh="已检索日记在上下文中保留的对话轮数（过期移除）",
+        "rerank_enabled": Description(
+            en="Let a cheap LLM judge which shortlisted diaries are actually relevant",
+            zh="用一个便宜 LLM 判断候选日记里哪些真正相关",
         ),
-        "max_in_context": Description(
-            en="Hard cap on diaries kept in context at once (oldest evicted first)",
-            zh="同时保留在上下文中的日记硬上限（超出淘汰最旧）",
+        "rerank_model": Description(
+            en="Model for the relevance judge (uses the diary_rag OpenAI key)",
+            zh="相关性判官用的模型（复用 diary_rag 的 OpenAI key）",
+        ),
+        "rerank_candidates": Description(
+            en="How many top hybrid candidates to shortlist for the LLM judge",
+            zh="送给 LLM 判官的 hybrid 候选数量",
+        ),
+        "prefilter_floor": Description(
+            en="Skip the LLM judge entirely when the best hybrid score is below this",
+            zh="最高 hybrid 分低于此值时直接跳过 LLM 判官（省调用）",
         ),
     }
 

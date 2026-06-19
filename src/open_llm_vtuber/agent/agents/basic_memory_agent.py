@@ -743,18 +743,20 @@ class BasicMemoryAgent(AgentInterface):
                 | self._sliding_window_uids
                 | self._session_injected_uids
             )
-            hits, candidates = await mgr.retrieve_diary_context(query, exclude)
+            hits, candidates, keywords = await mgr.retrieve_diary_context(query, exclude)
             if hits:
                 self._pending_rag_block = self._format_diary_rag_block(hits)
                 self._session_injected_uids.update(h["uid"] for h in hits)
 
             logger.info(
-                "[diary_rag] query=%r candidates(date,hybrid,vec,lex)=%s inserted=%s session_total=%d excluded=%d"
+                "[diary_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s inserted=%s session_total=%d excluded=%d"
                 % (
-                    query[:50],
-                    # top scored before thresholding — tune thresholds / lexical_weight from these
+                    query[:30],
+                    keywords,
+                    # scored shortlist (pre-judge) — tune lexical_weight / prefilter_floor from these
                     [((c[1][:10] if c[1] else c[0][:19]), c[2], c[3], c[4]) for c in candidates],
-                    [(h["uid"][:19], round(h["score"], 3)) for h in hits],
+                    # reranked picks show the judge's reason; score-path shows hybrid
+                    [(h["uid"][:19], (h.get("reason") or round(h.get("score", 0.0), 3))) for h in hits],
                     len(self._session_injected_uids),
                     len(exclude),
                 )

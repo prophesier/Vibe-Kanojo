@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Set
 from loguru import logger
 
-from .vector_index import VectorIndex
+from .vector_index import VectorIndex, extract_keywords
 
 # Lazily-built Japanese sentence segmenter (pysbd) for diary chunking. Built on
 # first use so importing this module stays cheap when RAG is disabled.
@@ -155,13 +155,20 @@ _CONSOLIDATE_SYSTEM = (
 _DIARY_SYSTEM = (
     "あなたは記憶アシスタントです。AIキャラクターの一人称視点から、"
     "この会話セッションを日記としてまとめてください。\n\n"
-    "【長さの制約（重要）】\n"
-    "全体で**200〜400字程度**を目安に。最大でも500字以内に収める。\n"
-    "この日記は最近20件分が常時システムプロンプトに注入されるため、"
-    "1件が長くなるとtoken予算が急速に膨らむ。簡潔さを最優先する。\n\n"
+    "【この日記の用途（重要）】\n"
+    "この日記は後で2通りに使われる：(1) 最近の数件がシステムプロンプトに常時注入される、"
+    "(2) それより古いものは、後の会話でユーザーの発言に関連した時だけ自動で検索されて参照される。"
+    "そのため、後から思い出したり検索したりする価値のある**具体的な出来事・物事は、"
+    "固有の言葉のまま具体的に書き残す**こと（例:「大きい飲み物」ではなく「グランドサイズのコーラ」、"
+    "「お菓子」ではなく「白黒のポテトチップス」のように、特徴的な固有名・数量・状況を残す）。"
+    "抽象化して要約しすぎると、後で検索に引っかからず、思い出せなくなる。\n\n"
+    "【長さの制約】\n"
+    "全体で**400〜700字程度**を目安に。最大でも900字以内。"
+    "具体性は保ちつつ、逐語的な再現・引用は避けて簡潔にまとめる。\n\n"
     "【記録する内容】\n"
     "以下のうち、このセッションで**実際に発生したもの**だけを記録する。"
     "該当しないカテゴリは省略する（穴埋め式に全項目を埋める必要はない）：\n"
+    "- 具体的な出来事・エピソード（何があったか。固有名・固有の物事をそのまま残す）\n"
     "- 未解決の約束・タスク・宿題\n"
     "- ユーザーが示した判断パターン・選好・価値観\n"
     "- 感情の節目（嬉しさ・落ち込み・葛藤・転機）\n"
@@ -170,12 +177,13 @@ _DIARY_SYSTEM = (
     "セッションで触れた話題は本文の中に自然な文章として織り込む。"
     "「話した話題：」のような見出しや箇条書きにはしない。\n"
     "- 軽く触れただけの話題は一言で済ませる（「〇〇の話題にも触れた」程度）。\n"
-    "- 深く議論した話題でも、**論点・結論・ユーザーの主な意見を1〜2文で**簡潔に。"
-    "詳細な再現、引用、AI自身の応答の引き写しは不要。論旨だけ残せばよい。\n"
-    "- 深掘り話題が複数あっても、それぞれを簡潔に。膨らませない。\n\n"
+    "- 深く議論した話題は、**論点・結論・ユーザーの主な意見**に加えて、"
+    "**後で参照されそうな具体的な事項（固有名・物・出来事）も一言添える**。"
+    "ただし会話の逐語的な再現や、AI自身の応答の引き写しは不要。\n\n"
     "【省いてよい内容】\n"
-    "食事の細部、ゲーム進捗の数字、その日着た服など、後で参照する価値の薄い"
-    "日常の細部は省略してよい。会話履歴自体に残るため、日記に書くと冗長になる。\n\n"
+    "繰り返しの数値（ゲームの細かい進捗など）や、後で話題に上らないことが明らかな"
+    "純粋な雑事は省いてよい。ただし「何を食べた・買った・見た」のような具体は、"
+    "後で話題に上りうるので、特徴的なら固有の物事として一言残す。\n\n"
     "【時刻表現】\n"
     "「今日」「本日」のような日付レベルの曖昧表現は避ける。"
     "ただし「19時42分から21時5分の会話で」のような分単位の精密表現も避ける——"
@@ -289,6 +297,22 @@ class PersistentMemoryManager:
                     "(set diary_rag.openai_api_key or configure the openai_llm provider); "
                     "RAG disabled."
                 )
+
+        # Optional LLM relevance judge over the hybrid shortlist (reuses the
+        # embedding key/endpoint). None → fall back to pure score-based selection.
+        self._diary_reranker = None
+        if (
+            self._diary_index is not None
+            and getattr(diary_rag_config, "rerank_enabled", False)
+            and embed_api_key
+        ):
+            from .diary_reranker import DiaryReranker
+
+            model = getattr(diary_rag_config, "rerank_model", "gpt-4o-mini")
+            self._diary_reranker = DiaryReranker(
+                api_key=embed_api_key, base_url=embed_base_url, model=model
+            )
+            logger.info(f"[memory] Diary RAG reranker enabled ({model}).")
         # Session UIDs currently loaded in the agent's sliding window — their
         # diaries are excluded from the injected memory block to avoid
         # duplicating content the agent already has verbatim.
@@ -383,30 +407,88 @@ class PersistentMemoryManager:
     async def retrieve_diary_context(
         self, query: str, exclude_uids: Set[str]
     ) -> List[Dict[str, Any]]:
-        """Return diaries semantically relevant to ``query`` (long-tail recall).
+        """Return diaries relevant to ``query`` (long-tail recall).
 
-        Reads the live content from disk for each hit so it's never stale.
+        Pipeline: denoise the query to content keywords (drop framing words) →
+        hybrid candidate generation (keywords drive embedding + lexical, grouped
+        back to whole diaries) → optional LLM relevance judge over the shortlist
+        → recall the full diaries. Reads content fresh from disk so it's never
+        stale.
+
         Returns ``(hits, candidates)`` where hits is
-        ``[{"uid", "date", "content", "score"}, ...]`` and candidates is the top
-        ``(uid, date, score)`` before thresholding (for tuning from logs).
+        ``[{"uid", "date", "content", "score", "reason"}, ...]`` and candidates is
+        the scored shortlist ``(uid, date, hybrid, vec, lex)`` for log tuning.
         Returns ``([], [])`` when RAG is off / query empty / embedding fails.
         """
         if self._diary_index is None or not query or not query.strip():
-            return [], []
+            return [], [], []
         cfg = self._rag_cfg
-        # The index holds sentence-level chunks; group_by="parent" collapses
-        # them back to whole diaries (ranked by each diary's best chunk), so a
-        # specific detail can match strongly without diluting across the whole
-        # summary, while we still recall and inject the full diary.
-        hits, candidates = await self._diary_index.retrieve(
-            query,
+        max_n = getattr(cfg, "max_retrievals_per_turn", 2)
+        lex_w = getattr(cfg, "lexical_weight", 0.5)
+
+        # Denoise the query: retrieve on the content keywords (embed the stitched
+        # keywords; lexical matches each keyword), falling back to the raw query.
+        keywords = extract_keywords(query)
+        embed_q = " ".join(keywords) if keywords else query
+
+        # No reranker → original score-based threshold + topN selection.
+        if self._diary_reranker is None:
+            hits, candidates = await self._diary_index.retrieve(
+                embed_q,
+                exclude_ids=exclude_uids,
+                similarity_threshold=getattr(cfg, "similarity_threshold", 0.55),
+                topn_threshold=getattr(cfg, "topn_threshold", 0.70),
+                max_retrievals=max_n,
+                group_by="parent",
+                lexical_weight=lex_w,
+                keywords=keywords,
+            )
+            out, cands = self._resolve_diaries(hits, candidates)
+            return out, cands, keywords
+
+        # Reranker path: pull a generous shortlist (no strict gate — the judge is
+        # the real relevance filter), then let the LLM pick/order the relevant.
+        top_k = getattr(cfg, "rerank_candidates", 12)
+        _, candidates = await self._diary_index.retrieve(
+            embed_q,
             exclude_ids=exclude_uids,
-            similarity_threshold=getattr(cfg, "similarity_threshold", 0.55),
-            topn_threshold=getattr(cfg, "topn_threshold", 0.70),
-            max_retrievals=getattr(cfg, "max_retrievals_per_turn", 2),
+            similarity_threshold=-1.0,
+            topn_threshold=-1.0,
+            max_retrievals=top_k,
+            debug_k=top_k,
             group_by="parent",
-            lexical_weight=getattr(cfg, "lexical_weight", 0.5),
+            lexical_weight=lex_w,
+            keywords=keywords,
         )
+        floor = getattr(cfg, "prefilter_floor", 0.3)
+        if not candidates or candidates[0][2] < floor:
+            return [], candidates, keywords  # nothing plausibly relevant; skip judge
+
+        shortlist: List[Dict[str, Any]] = []
+        for uid, date, _h, _v, _lx in candidates:
+            entry = self._read_diary(uid)
+            if entry and entry.get("content"):
+                shortlist.append(
+                    {"id": uid, "date": entry.get("date", date), "content": entry["content"]}
+                )
+        judged = await self._diary_reranker.rerank(query, shortlist)
+        if judged is None:  # judge errored → fall back to top-N by hybrid
+            judged = [dict(s, reason="(rerank-fallback)") for s in shortlist[:max_n]]
+
+        out = [
+            {
+                "uid": j["id"],
+                "date": j["date"],
+                "content": j["content"],
+                "score": 0.0,
+                "reason": j.get("reason", ""),
+            }
+            for j in judged[:max_n]
+        ]
+        return out, candidates, keywords
+
+    def _resolve_diaries(self, hits: List[Dict[str, Any]], candidates) -> tuple:
+        """Map VectorIndex hits to full diaries read fresh from disk."""
         out: List[Dict[str, Any]] = []
         for h in hits:
             entry = self._read_diary(h["id"])
@@ -417,6 +499,7 @@ class PersistentMemoryManager:
                         "date": entry.get("date", h["meta"].get("date", "")),
                         "content": entry["content"],
                         "score": h["score"],
+                        "reason": "",
                     }
                 )
         return out, candidates

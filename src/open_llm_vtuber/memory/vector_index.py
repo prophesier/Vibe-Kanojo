@@ -56,6 +56,58 @@ def _lexical_overlap(query_bigrams: set, text: str) -> float:
     return len(query_bigrams & _char_bigrams(text)) / len(query_bigrams)
 
 
+# Lazily-built janome tokenizer for query keyword extraction (denoising).
+_JA_TOKENIZER = None
+# Common framing / content-light words to drop from extracted keywords. The
+# query "…の記憶を思い出してみて" should reduce to its actual content terms.
+_KW_STOP = {
+    "する", "ある", "いる", "なる", "できる", "みる", "見る", "思う", "思い出す",
+    "覚える", "くる", "来る", "いく", "行く", "言う", "話す", "やる", "くれる",
+    "こと", "もの", "ため", "よう", "とき", "ところ", "今", "私", "あなた", "君",
+    "それ", "これ", "あれ", "どれ", "記憶", "話", "件", "感じ", "気",
+    "今日", "昨日", "明日", "日", "時", "最近", "前", "後", "何", "の",
+}
+
+
+def extract_keywords(text: str) -> List[str]:
+    """Content keywords from a query — nouns / verbs / adjectives (base form),
+    minus particles, pronouns and a stop list — via janome.
+
+    Used to denoise the retrieval query: conversational framing ("思い出して
+    みて", "覚えてる？") is dropped so only the actual subject terms drive
+    retrieval. English/mixed terms survive (tagged as nouns). Returns ``[]`` if
+    janome is unavailable or nothing meaningful remains, so the caller can fall
+    back to the raw query. Never raises.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+    global _JA_TOKENIZER
+    try:
+        if _JA_TOKENIZER is None:
+            from janome.tokenizer import Tokenizer
+
+            _JA_TOKENIZER = Tokenizer()
+        out: List[str] = []
+        for tok in _JA_TOKENIZER.tokenize(text):
+            parts = tok.part_of_speech.split(",")
+            pos = parts[0]
+            sub = parts[1] if len(parts) > 1 else ""
+            if pos not in ("名詞", "動詞", "形容詞"):
+                continue
+            if sub in ("非自立", "代名詞", "接尾", "数"):
+                continue
+            base = tok.base_form if tok.base_form and tok.base_form != "*" else tok.surface
+            if len(base) <= 1 or base in _KW_STOP:
+                continue
+            out.append(base)
+        # De-duplicate, preserving order.
+        seen: set = set()
+        return [k for k in out if not (k in seen or seen.add(k))]
+    except Exception:
+        return []
+
+
 class VectorIndex:
     """Cosine-similarity index over short or paragraph-length texts.
 
@@ -264,6 +316,7 @@ class VectorIndex:
         debug_k: int = 5,
         group_by: Optional[str] = None,
         lexical_weight: float = 0.5,
+        keywords: Optional[List[str]] = None,
     ) -> tuple:
         """Return ``(picked, candidates)`` for ``query`` using hybrid scoring.
 
@@ -300,7 +353,16 @@ class VectorIndex:
 
         qnorm = float(np.linalg.norm(qvec)) or 1.0
         scores = self._normed @ (qvec / qnorm)
-        qbg = _char_bigrams(query) if lexical_weight else set()
+
+        # Lexical signal. With extracted keywords, score by the BEST-matching
+        # keyword (one strong term suffices and a long query isn't penalised);
+        # otherwise fall back to whole-query bigram overlap.
+        kw_bigrams = (
+            [b for b in (_char_bigrams(k) for k in keywords) if b]
+            if (lexical_weight and keywords)
+            else []
+        )
+        qbg = _char_bigrams(query) if (lexical_weight and not kw_bigrams) else set()
 
         # Best HYBRID score per result key. Tuple: (hybrid, vector, lexical, meta).
         best: Dict[str, tuple] = {}
@@ -310,7 +372,13 @@ class VectorIndex:
             if key in exclude_ids:
                 continue
             v = float(scores[i])
-            lx = _lexical_overlap(qbg, self._texts.get(uid, "")) if lexical_weight else 0.0
+            if not lexical_weight:
+                lx = 0.0
+            elif kw_bigrams:
+                tb = _char_bigrams(self._texts.get(uid, ""))
+                lx = max((len(b & tb) / len(b) for b in kw_bigrams), default=0.0)
+            else:
+                lx = _lexical_overlap(qbg, self._texts.get(uid, ""))
             h = v + lexical_weight * lx
             cur = best.get(key)
             if cur is None or h > cur[0]:

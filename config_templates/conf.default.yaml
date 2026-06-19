@@ -56,10 +56,13 @@ system_config:
       # embeddings barely separate exact keyword matches on a homogeneous diary
       # corpus, so this lexical boost surfaces literal-term hits. 0 = pure vector.
       lexical_weight: 0.5
-      # Turns a retrieved diary stays in context before expiring.
-      ttl_turns: 4
-      # Hard cap on diaries kept in context at once (oldest evicted first).
-      max_in_context: 4
+      # LLM relevance judge over the hybrid shortlist: a cheap model picks which
+      # candidates actually relate to the message (drops keyword-only / meta hits)
+      # and replaces threshold tuning. Uses the diary_rag OpenAI key.
+      rerank_enabled: true
+      rerank_model: "gpt-4o-mini"
+      rerank_candidates: 12     # top hybrid candidates shortlisted for the judge
+      prefilter_floor: 0.3      # skip the judge when the best hybrid is below this
 
 # configuration for the default character
 character_config:
