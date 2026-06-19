@@ -28,6 +28,24 @@ COMMAS = [
 ]
 
 END_PUNCTUATIONS = [".", "!", "?", "。", "！", "？", "...", "。。。"]
+
+# Paired brackets whose contents pysbd will happily split on internal sentence
+# punctuation. While the LLM streams token-by-token the closing half may not
+# have arrived yet, so a sentence boundary found inside an open bracket is not
+# real — emitting it would leak the parenthetical out in pieces and drop the
+# punctuation-only closer downstream. We only track full-width Japanese pairs
+# (what this character actually uses); ASCII "()" is left out so kaomoji and
+# code snippets aren't held.
+_BRACKET_PAIRS = {
+    "（": "）",
+    "「": "」",
+    "『": "』",
+    "【": "】",
+    "〔": "〕",
+    "《": "》",
+    "〈": "〉",
+}
+
 ABBREVIATIONS = [
     "Mr.",
     "Mrs.",
@@ -84,6 +102,37 @@ def detect_language(text: str) -> str:
     except Exception as e:
         logger.debug(f"Language detection failed, language not supported by pysdb: {e}")
         return None
+
+
+_BRACKET_CLOSERS = {close: open_ for open_, close in _BRACKET_PAIRS.items()}
+
+
+def _has_unclosed_bracket(text: str) -> bool:
+    """True if any tracked bracket pair has more openers than closers in `text`.
+
+    Used to detect a parenthetical whose closing half hasn't streamed in yet, so
+    the divider can hold it instead of splitting on punctuation inside it.
+    """
+    for open_b, close_b in _BRACKET_PAIRS.items():
+        if text.count(open_b) > text.count(close_b):
+            return True
+    return False
+
+
+def _first_unclosed_open_pos(text: str) -> Optional[int]:
+    """Index of the earliest opening bracket with no matching closer, or None.
+
+    Everything from this position onward is the still-open parenthetical span
+    that must be held until its closer streams in.
+    """
+    stack: List[Tuple[str, int]] = []
+    for i, ch in enumerate(text):
+        if ch in _BRACKET_PAIRS:
+            stack.append((ch, i))
+        elif ch in _BRACKET_CLOSERS:
+            if stack:  # match (or best-effort pop on mismatch)
+                stack.pop()
+    return stack[0][1] if stack else None
 
 
 def is_complete_sentence(text: str) -> bool:
@@ -494,6 +543,7 @@ class SentenceDivider:
                     self._is_first_sentence
                     and self.faster_first_response
                     and contains_comma(self._buffer)
+                    and not _has_unclosed_bracket(self._buffer)
                 ):
                     sentence, remaining = comma_splitter(self._buffer)
                     if sentence.strip():
@@ -595,11 +645,29 @@ class SentenceDivider:
         """Get the complete response accumulated so far"""
         return "".join(self._full_response)
 
-    def _segment_text(self, text: str) -> Tuple[List[str], str]:
-        """Segment text using the configured method"""
+    def _raw_segment(self, text: str) -> Tuple[List[str], str]:
         if self.segment_method == "regex":
             return segment_text_by_regex(text)
         return segment_text_by_pysbd(text)
+
+    def _segment_text(self, text: str) -> Tuple[List[str], str]:
+        """Segment text, but never emit across an unclosed bracket.
+
+        While a parenthetical's closer hasn't streamed in, its internal sentence
+        punctuation is not a real boundary. We hold everything from the first
+        unclosed opener onward (it stays a suffix of `text`) until the closer
+        arrives or the end-of-stream flush, and only emit the clean prefix.
+        """
+        pos = _first_unclosed_open_pos(text)
+        if pos is None:
+            return self._raw_segment(text)
+
+        safe_prefix, held = text[:pos], text[pos:]
+        if not safe_prefix.strip():
+            return [], text  # the whole buffer is the still-open span
+
+        sentences, remaining = self._raw_segment(safe_prefix)
+        return sentences, remaining + held
 
     def reset(self):
         """Reset the divider state for a new conversation"""
