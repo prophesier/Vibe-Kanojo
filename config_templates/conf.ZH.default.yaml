@@ -50,6 +50,21 @@ system_config:
       rerank_model: "gpt-4o-mini"
       rerank_candidates: 12         # 送给判官的 hybrid 候选数
       prefilter_floor: 0.3          # 最高 hybrid 分低于此则跳过判官（省调用）
+      rerank_context_turns: 6       # 给判官作上下文的最近对话轮数（让它结合在聊什么判断，而非只看最后一句）
+    # 事实 RAG：低优先级事实的独立索引。打了 user/llm 标签的事实固定进开头提示词；
+    # low（默认）按需在这里检索。独立于 diary_rag，复用其嵌入 key/模型。
+    # 启用前请先给事实分层：所有现有事实会迁移成 low，开头会先清空，需手动把要保留的提级。
+    facts_rag:
+      enabled: false
+      similarity_threshold: 0.55
+      topn_threshold: 0.70
+      max_retrievals_per_turn: 3
+      lexical_weight: 0.5
+      rerank_enabled: true
+      rerank_model: "gpt-4o-mini"
+      rerank_candidates: 12
+      prefilter_floor: 0.3
+      rerank_context_turns: 6
 
 # 默认角色的配置
 character_config:

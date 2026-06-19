@@ -8,6 +8,7 @@ Layer 3 – session diaries: per-session mood summaries, stored in diaries/.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -84,12 +85,26 @@ _FACT_EXTRACT_SYSTEM = (
     "No なら抽出しない。\n\n"
     "【ガイドライン】\n"
     "- 中国語・日本語・英語が混在していても、すべての言語の発言を対象にする\n"
-    "- 既存の事実リストが提供される場合、それらをそのまま繰り返さない\n\n"
+    "- 既存の事実リストが提供される場合、それらをそのまま繰り返さない\n"
+    "- 既存の事実には先頭に `[importance]`（現在の重要度）が付いている。"
+    "新しい事実の重要度を判定する際の一貫性の参考にしてよい。\n\n"
+    "【重要度の判定（importance）】\n"
+    "抽出する各事実に importance を付ける。値は \"llm\" か \"low\" のどちらか。\n"
+    "（\"user\" は使わない——それは人間が手動で指定する専用の値で、あなたが付けてはいけない。）\n"
+    "- \"llm\" = ユーザー像を定義する中核的な事実で、常にキャラクターの念頭にあるべきもの:\n"
+    "  学歴・専攻・資格、職業・専門スキル、出身地、年齢層、家族・重要な人間関係、\n"
+    "  価値観・信念・性格特性、長期的な目標や進行中の重要プロジェクト、\n"
+    "  重要な約束・合意、人生の節目・転機・トラウマ。\n"
+    "- \"low\" = 覚えておく価値はあるが、関連する話題のときに思い出せれば十分な事実:\n"
+    "  具体的な好みの細部、個別のエピソード、特定の物事（食べた物・買った物・観た作品など）、\n"
+    "  中核とまでは言えない習慣や傾向。\n"
+    "迷ったら \"low\"。\"llm\" は本当に常時参照する価値があるものだけに厳選する。\n\n"
     "**出力形式（厳守）**：\n"
-    '[{"fact": "ユーザーは物理学部出身で物理学を専攻していた"}, '
-    '{"fact": "ユーザーはWindowsを使用している"}]\n'
+    '[{"fact": "ユーザーは物理学部出身で物理学を専攻していた", "importance": "llm"}, '
+    '{"fact": "ユーザーは白黒のポテトチップスが好き", "importance": "low"}]\n'
     "本当に新しい事実が1件もない場合のみ、空の配列のみを出力する: []\n"
-    "繰り返す：JSON配列のみ。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。"
+    "繰り返す：JSON配列のみ。各要素は必ず \"fact\" と \"importance\" を持つ。"
+    "\"importance\" は \"llm\" か \"low\"。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。"
 )
 
 _CONSOLIDATE_SYSTEM = (
@@ -266,6 +281,7 @@ class PersistentMemoryManager:
         diary_count: int = 5,
         recent_sessions: int = 3,
         diary_rag_config: Any = None,
+        facts_rag_config: Any = None,
         embed_api_key: str = "",
         embed_base_url: str = "",
     ) -> None:
@@ -306,13 +322,46 @@ class PersistentMemoryManager:
             and getattr(diary_rag_config, "rerank_enabled", False)
             and embed_api_key
         ):
-            from .diary_reranker import DiaryReranker
+            from .reranker import MemoryReranker
 
             model = getattr(diary_rag_config, "rerank_model", "gpt-4o-mini")
-            self._diary_reranker = DiaryReranker(
-                api_key=embed_api_key, base_url=embed_base_url, model=model
+            self._diary_reranker = MemoryReranker(
+                api_key=embed_api_key, base_url=embed_base_url, model=model,
+                item_label="日記",
             )
             logger.info(f"[memory] Diary RAG reranker enabled ({model}).")
+
+        # Facts RAG — a separate, independent subsystem (own index, own config,
+        # own reranker). Index ALL facts; tier filtering happens only at
+        # injection (user/llm-tier facts stay in the header, `low` go to RAG).
+        self._facts_rag_cfg = facts_rag_config
+        self._facts_index: Optional[VectorIndex] = None
+        self._facts_reranker = None
+        if facts_rag_config is not None and getattr(facts_rag_config, "enabled", False):
+            if embed_api_key:
+                self._facts_index = VectorIndex(
+                    os.path.join(self._base_dir, "facts.embeddings.json"),
+                    api_key=embed_api_key,
+                    base_url=embed_base_url,
+                    model=getattr(diary_rag_config, "embedding_model", "text-embedding-3-small"),
+                )
+                logger.info("[memory] Facts RAG enabled.")
+                # One-time: tag existing facts so they can be re-tiered by hand.
+                self._migrate_facts_importance()
+                if getattr(facts_rag_config, "rerank_enabled", False):
+                    from .reranker import MemoryReranker
+
+                    fmodel = getattr(facts_rag_config, "rerank_model", "gpt-4o-mini")
+                    self._facts_reranker = MemoryReranker(
+                        api_key=embed_api_key, base_url=embed_base_url, model=fmodel,
+                        item_label="事実",
+                    )
+                    logger.info(f"[memory] Facts RAG reranker enabled ({fmodel}).")
+            else:
+                logger.warning(
+                    "[memory] facts_rag enabled but no embedding API key resolved; "
+                    "facts RAG disabled."
+                )
         # Session UIDs currently loaded in the agent's sliding window — their
         # diaries are excluded from the injected memory block to avoid
         # duplicating content the agent already has verbatim.
@@ -339,8 +388,12 @@ class PersistentMemoryManager:
         self._current_session_uid = uid or ""
 
     def get_facts_prompt(self) -> str:
-        """Return the facts block for the system prompt (empty string if no facts)."""
-        facts = self._load_facts()
+        """Return the facts block for the system prompt (empty string if no facts).
+
+        When facts RAG is active only the header-tier facts (user/llm) go here;
+        ``low`` facts are recalled on demand. With RAG off, all facts go here.
+        """
+        facts = self._header_facts()
         if not facts:
             return ""
         lines = []
@@ -404,8 +457,166 @@ class PersistentMemoryManager:
             d.get("history_uid", "") for d in self._load_recent_diaries()
         } - {""}
 
+    # ------------------------------------------------------------------
+    # Facts RAG (low-importance fact recall) — sibling of diary RAG
+    # ------------------------------------------------------------------
+
+    @property
+    def facts_rag_active(self) -> bool:
+        """True when the fact vector index is built and ready to query."""
+        return self._facts_index is not None
+
+    @property
+    def facts_rag_config(self) -> Any:
+        """The FactsRagConfig or None."""
+        return self._facts_rag_cfg
+
+    @staticmethod
+    def _fact_id(fact_text: str) -> str:
+        """Stable content fingerprint used as the vector-index id for a fact.
+
+        The id *is* the content hash, so an edited/merged fact gets a new id —
+        ensure_indexed then re-embeds it and prunes the stale vector
+        automatically, with no separate content-change check (facts, unlike
+        immutable diaries, get rewritten by consolidation/pruning).
+        """
+        norm = " ".join((fact_text or "").split())
+        return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+
+    def _header_facts(self) -> List[Dict[str, Any]]:
+        """Facts that belong in the system-prompt header.
+
+        With facts RAG active, only ``user``/``llm``-tier facts; the rest
+        (``low``, the default) are recalled on demand. With RAG off, all facts
+        (preserves the original always-inject-everything behaviour).
+        """
+        facts = self._load_facts()
+        if not self.facts_rag_active:
+            return facts
+        return [f for f in facts if (f.get("importance") or "low") in ("user", "llm")]
+
+    def injected_fact_ids(self) -> Set[str]:
+        """Fingerprints of the facts already in the header (user/llm tier).
+
+        The agent unions these into the fact-retrieval exclude set so RAG never
+        surfaces a fact the model already has verbatim in its prompt.
+        """
+        return {self._fact_id(f["fact"]) for f in self._header_facts() if f.get("fact")}
+
+    def _facts_items_for_index(self) -> List[Dict[str, Any]]:
+        """Every fact as ``{id, text, meta}`` for the fact vector index.
+
+        Indexes ALL tiers — tier filtering is applied only at injection, so a
+        manual tier change takes effect without re-indexing.
+        """
+        items: List[Dict[str, Any]] = []
+        for f in self._load_facts():
+            text = f.get("fact", "")
+            if not text:
+                continue
+            items.append(
+                {
+                    "id": self._fact_id(text),
+                    "text": text,
+                    "meta": {"date": str(f.get("updated", ""))[:10]},
+                }
+            )
+        return items
+
+    def _migrate_facts_importance(self) -> None:
+        """One-time: tag facts lacking ``importance`` with the default ``low``.
+
+        Lets the user re-tier by hand before relying on RAG. Backs up to a
+        uniquely-named file first (distinct from the rolling ``facts.json.bak``
+        that ``_save_facts`` overwrites each save). Idempotent — a no-op once
+        every fact carries an ``importance``.
+        """
+        facts = self._load_facts()
+        if not facts or all("importance" in f for f in facts):
+            return
+        backup = self._facts_path + ".pre-importance.bak"
+        try:
+            if os.path.exists(self._facts_path) and not os.path.exists(backup):
+                shutil.copy2(self._facts_path, backup)
+                logger.info(f"[memory] Backed up facts.json → {backup} before importance migration.")
+        except Exception as e:
+            logger.warning(f"[memory] facts importance backup failed: {e}")
+        for f in facts:
+            f.setdefault("importance", "low")
+        self._save_facts(facts)
+        logger.info(
+            f"[memory] Tagged {len(facts)} fact(s) with default importance=low "
+            "(RAG-gated until you re-tier them)."
+        )
+
+    async def retrieve_facts_context(
+        self, query: str, exclude_ids: Set[str], context: str = ""
+    ) -> tuple:
+        """Return low-importance facts relevant to the conversation.
+
+        Mirrors :meth:`retrieve_diary_context` but over the fact index (facts are
+        single sentences, so no parent grouping). ``context`` is the recent
+        conversation handed to the judge. Returns ``(hits, candidates, keywords)``
+        where hits is ``[{"id", "fact", "score", "reason"}, ...]``.
+        """
+        if self._facts_index is None or not query or not query.strip():
+            return [], [], []
+        cfg = self._facts_rag_cfg
+        max_n = getattr(cfg, "max_retrievals_per_turn", 3)
+        lex_w = getattr(cfg, "lexical_weight", 0.5)
+        keywords = extract_keywords(query)
+        embed_q = " ".join(keywords) if keywords else query
+        by_id = {
+            self._fact_id(f["fact"]): f for f in self._load_facts() if f.get("fact")
+        }
+
+        if self._facts_reranker is None:
+            hits, candidates = await self._facts_index.retrieve(
+                embed_q,
+                exclude_ids=exclude_ids,
+                similarity_threshold=getattr(cfg, "similarity_threshold", 0.55),
+                topn_threshold=getattr(cfg, "topn_threshold", 0.70),
+                max_retrievals=max_n,
+                lexical_weight=lex_w,
+                keywords=keywords,
+            )
+            out = [
+                {"id": h["id"], "fact": by_id[h["id"]]["fact"], "score": h["score"], "reason": ""}
+                for h in hits
+                if h["id"] in by_id
+            ]
+            return out, candidates, keywords
+
+        top_k = getattr(cfg, "rerank_candidates", 12)
+        _, candidates = await self._facts_index.retrieve(
+            embed_q,
+            exclude_ids=exclude_ids,
+            similarity_threshold=-1.0,
+            topn_threshold=-1.0,
+            max_retrievals=top_k,
+            debug_k=top_k,
+            lexical_weight=lex_w,
+            keywords=keywords,
+        )
+        floor = getattr(cfg, "prefilter_floor", 0.3)
+        if not candidates or candidates[0][2] < floor:
+            return [], candidates, keywords
+        shortlist = [
+            {"id": cid, "date": date, "content": by_id[cid]["fact"]}
+            for cid, date, _h, _v, _lx in candidates
+            if cid in by_id
+        ]
+        judged = await self._facts_reranker.rerank(query, shortlist, context=context)
+        if judged is None:
+            judged = [dict(s, reason="(rerank-fallback)") for s in shortlist[:max_n]]
+        out = [
+            {"id": j["id"], "fact": j["content"], "score": 0.0, "reason": j.get("reason", "")}
+            for j in judged[:max_n]
+        ]
+        return out, candidates, keywords
+
     async def retrieve_diary_context(
-        self, query: str, exclude_uids: Set[str]
+        self, query: str, exclude_uids: Set[str], context: str = ""
     ) -> List[Dict[str, Any]]:
         """Return diaries relevant to ``query`` (long-tail recall).
 
@@ -471,7 +682,7 @@ class PersistentMemoryManager:
                 shortlist.append(
                     {"id": uid, "date": entry.get("date", date), "content": entry["content"]}
                 )
-        judged = await self._diary_reranker.rerank(query, shortlist)
+        judged = await self._diary_reranker.rerank(query, shortlist, context=context)
         if judged is None:  # judge errored → fall back to top-N by hybrid
             judged = [dict(s, reason="(rerank-fallback)") for s in shortlist[:max_n]]
 
@@ -583,8 +794,13 @@ class PersistentMemoryManager:
         """
         try:
             existing = self._load_facts()
+            # Show each existing fact's current importance so the LLM tags new
+            # facts consistently with the established tiering (it must still
+            # never output "user" — see _FACT_EXTRACT_SYSTEM).
             existing_text = (
-                "\n".join(f"- {f['fact']}" for f in existing) if existing else "(まだありません)"
+                "\n".join(f"- [{f.get('importance', 'low')}] {f['fact']}" for f in existing)
+                if existing
+                else "(まだありません)"
             )
             conv_text = self._format_messages(recent_messages)
             if not conv_text.strip() and not diary_context.strip():
@@ -618,7 +834,23 @@ class PersistentMemoryManager:
                 return
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            tagged = [{"fact": f["fact"], "updated": now} for f in new_facts if "fact" in f]
+            # The LLM tags each fact "llm" (keep in header) or "low" (RAG-recalled).
+            # "user" is manual-only: if the LLM assigns it, demote to "llm" rather
+            # than rework — but log it so the slip is visible. Missing/invalid → low.
+            tagged: List[Dict[str, Any]] = []
+            for f in new_facts:
+                if "fact" not in f:
+                    continue
+                imp = f.get("importance")
+                if imp == "user":
+                    logger.warning(
+                        f"[memory] Extraction LLM tagged a fact 'user' (manual-only); "
+                        f"demoted to 'llm': {f['fact']!r}"
+                    )
+                    imp = "llm"
+                elif imp not in ("llm", "low"):
+                    imp = "low"
+                tagged.append({"fact": f["fact"], "updated": now, "importance": imp})
             merged = existing + tagged
             # Smart trim: ask the LLM to drop least-important entries when
             # over the cap. The whole merged pool (old + new) is the
@@ -857,6 +1089,11 @@ class PersistentMemoryManager:
             # vectors whose diary was deleted.
             if self._diary_index is not None:
                 await self._diary_index.ensure_indexed(self._all_diary_chunks_for_index())
+            # Same for facts: embed new/edited facts, prune vectors of facts that
+            # were consolidated or pruned away (id = content fingerprint, so an
+            # edited fact is a new id + an orphaned old one).
+            if self._facts_index is not None:
+                await self._facts_index.ensure_indexed(self._facts_items_for_index())
         except Exception as e:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
@@ -1076,7 +1313,7 @@ class PersistentMemoryManager:
         if added:
             lines.append(f"  Added {len(added)} new fact(s):")
             for f in added:
-                lines.append(f"    + {f['fact']}")
+                lines.append(f"    + [{f.get('importance', 'low')}] {f['fact']}")
         if discarded_new:
             lines.append(
                 f"  Discarded {len(discarded_new)} newly-extracted fact(s) "
@@ -1178,6 +1415,7 @@ class PersistentMemoryManager:
         survivors = [
             f for i, f in enumerate(facts) if i not in merged_text_set
         ]
+        _tier_rank = {"user": 2, "llm": 1, "low": 0}
         new_merged: List[Dict[str, Any]] = []
         for m in valid:
             source_dates = [
@@ -1187,7 +1425,15 @@ class PersistentMemoryManager:
             newest = max(source_dates) if source_dates else (
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             )
-            new_merged.append({"fact": m["into"], "updated": newest})
+            # Keep the highest tier among the merged sources so consolidation
+            # never silently demotes a hand-set `user` (or `llm`) fact.
+            best_tier = max(
+                (facts[i].get("importance", "low") for i in m["merge"]),
+                key=lambda t: _tier_rank.get(t, 0),
+            )
+            new_merged.append(
+                {"fact": m["into"], "updated": newest, "importance": best_tier}
+            )
 
         new_facts = survivors + new_merged
 

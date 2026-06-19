@@ -11,6 +11,7 @@ from typing import (
 )
 import json
 import hashlib
+import re
 from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
@@ -85,6 +86,10 @@ class BasicMemoryAgent(AgentInterface):
         # are excluded from further retrieval (each diary appears at most once).
         self._session_injected_uids: Set[str] = set()
         self._pending_rag_block: str = ""
+        # Facts RAG (independent of diary RAG): low-importance facts recalled on
+        # demand, injected after the diary block. Same persist-in-_memory pattern.
+        self._session_injected_fact_ids: Set[str] = set()
+        self._pending_facts_block: str = ""
         self._sliding_window_uids: Set[str] = set()
         # Fingerprint of the last system prompt, for diagnosing prompt-cache
         # drops: a change between turns is exactly what busts the prefix cache.
@@ -316,9 +321,11 @@ class BasicMemoryAgent(AgentInterface):
         "Web検索で裏を取るか、率直に「分からない」と言えば、両立する。\n\n"
         "【自動検索された過去の記憶について】\n\n"
         "一部のユーザーのメッセージの冒頭に、"
-        "`［過去の記憶（自動検索）］` というラベルの付いた囲みが挿入されていることがある。"
+        "`［過去の記憶（自動検索）］`（過去セッションの日記）や "
+        "`［関連する事実（自動検索）］`（ユーザーに関する事実）という"
+        "ラベルの付いた囲みが挿入されていることがある。"
         "これはその時の会話の一部ではなく、"
-        "**今の話題に関連しそうな過去セッションの日記を、システムが自動検索して添えたもの**。\n"
+        "**今の話題に関連しそうな過去の記憶を、システムが自動検索して添えたもの**。\n"
         "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
         "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
@@ -534,6 +541,8 @@ class BasicMemoryAgent(AgentInterface):
         # blocks live in _memory, which is being rebuilt here anyway).
         self._session_injected_uids = set()
         self._pending_rag_block = ""
+        self._session_injected_fact_ids = set()
+        self._pending_facts_block = ""
         # Reset banner state; will be set True below if the current
         # session already has messages here, or later by _add_message
         # when the first user message of a fresh session comes in.
@@ -659,8 +668,13 @@ class BasicMemoryAgent(AgentInterface):
         # outgoing payload, above the user's actual text. It is NOT passed to
         # _add_message below, so _memory — and therefore the persisted history
         # and the cache prefix — stay clean (see _maybe_inject_diary_rag).
-        rag_block = self._pending_rag_block
+        # Diary block first, then the facts block (independent subsystem), then
+        # the user's actual text. Both ride only on the outgoing payload.
+        rag_block = "\n\n".join(
+            b for b in (self._pending_rag_block, self._pending_facts_block) if b
+        )
         self._pending_rag_block = ""
+        self._pending_facts_block = ""
         if rag_block and text_prompt:
             payload_text = f"{rag_block}\n\n{text_prompt}"
         else:
@@ -743,7 +757,11 @@ class BasicMemoryAgent(AgentInterface):
                 | self._sliding_window_uids
                 | self._session_injected_uids
             )
-            hits, candidates, keywords = await mgr.retrieve_diary_context(query, exclude)
+            n_ctx = getattr(mgr.diary_rag_config, "rerank_context_turns", 6)
+            context = self._recent_dialogue_context(n_ctx)
+            hits, candidates, keywords = await mgr.retrieve_diary_context(
+                query, exclude, context=context
+            )
             if hits:
                 self._pending_rag_block = self._format_diary_rag_block(hits)
                 self._session_injected_uids.update(h["uid"] for h in hits)
@@ -777,6 +795,98 @@ class BasicMemoryAgent(AgentInterface):
             lines.append(f"〔{(e.get('date') or '')[:10]} のセッション〕")
             lines.append((e.get("content") or "").strip())
         lines.append("［過去の記憶終了］")
+        return "\n".join(lines)
+
+    def _recent_dialogue_context(self, n_turns: int) -> str:
+        """Recent conversation as role-labelled lines, for the RAG relevance judge.
+
+        The judge otherwise sees only the isolated latest message and over-includes
+        anything keyword-adjacent; the surrounding turns tell it what's actually
+        being discussed. Strips injected RAG blocks and leading timestamp tags and
+        truncates each line so the judge call stays cheap.
+        """
+        if n_turns <= 0 or not self._memory:
+            return ""
+        lines: List[str] = []
+        for m in self._memory[-(2 * n_turns):]:
+            role = m.get("role", "")
+            if role not in ("user", "assistant"):
+                continue
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            if not isinstance(content, str):
+                continue
+            text = re.sub(r"［[^［]*?開始］.*?［[^］]*?終了］", "", content, flags=re.S)
+            text = re.sub(r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*", "", text).strip()
+            if not text:
+                continue
+            if len(text) > 200:
+                text = text[:200] + "…"
+            lines.append(f"{'ユーザー' if role == 'user' else 'AI'}: {text}")
+        return "\n".join(lines)
+
+    async def _maybe_inject_facts_rag(self, input_data: BatchInput) -> None:
+        """Retrieve long-tail low-importance facts relevant to this turn.
+
+        Independent sibling of _maybe_inject_diary_rag: its block is folded into
+        the outgoing user message after the diary block (see _to_messages) and
+        persists in _memory the same append-only way, so the cache prefix stays
+        clean. Each fact is injected at most once per session. Never raises;
+        no-op when facts RAG is off / query empty.
+        """
+        self._pending_facts_block = ""
+        mgr = self._memory_manager
+        if not mgr or not getattr(mgr, "facts_rag_active", False):
+            return
+        try:
+            query = " ".join(
+                t.content for t in input_data.texts if t.source == TextSource.INPUT
+            ).strip()
+            if not query:
+                return
+            # Exclude facts already in the header (user/llm tier) and facts
+            # injected earlier this session (they persist in _memory).
+            exclude = mgr.injected_fact_ids() | self._session_injected_fact_ids
+            n_ctx = getattr(mgr.facts_rag_config, "rerank_context_turns", 6)
+            context = self._recent_dialogue_context(n_ctx)
+            hits, candidates, keywords = await mgr.retrieve_facts_context(
+                query, exclude, context=context
+            )
+            if hits:
+                self._pending_facts_block = self._format_facts_rag_block(hits)
+                self._session_injected_fact_ids.update(h["id"] for h in hits)
+
+            logger.info(
+                "[facts_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s inserted=%s session_total=%d excluded=%d"
+                % (
+                    query[:30],
+                    keywords,
+                    [((c[1][:10] if c[1] else c[0][:8]), c[2], c[3], c[4]) for c in candidates],
+                    [(h["id"][:8], (h.get("reason") or round(h.get("score", 0.0), 3))) for h in hits],
+                    len(self._session_injected_fact_ids),
+                    len(exclude),
+                )
+            )
+        except Exception as e:
+            logger.warning(f"[facts_rag] retrieval skipped: {e}")
+            self._pending_facts_block = ""
+
+    def _format_facts_rag_block(self, entries: List[Dict[str, Any]]) -> str:
+        """Terse marker block for the retrieved facts.
+
+        The full explanation of auto-retrieved memory lives once in
+        _HISTORY_NOTE, so this block stays short — it persists in _memory once
+        per injecting turn, so brevity matters.
+        """
+        lines = ["［関連する事実（自動検索）開始］"]
+        for e in entries:
+            lines.append(f"・{(e.get('fact') or '').strip()}")
+        lines.append("［関連する事実終了］")
         return "\n".join(lines)
 
     async def _claude_tool_interaction_loop(
@@ -1090,6 +1200,7 @@ class BasicMemoryAgent(AgentInterface):
             self.prompt_mode_flag = False
 
             await self._maybe_inject_diary_rag(input_data)
+            await self._maybe_inject_facts_rag(input_data)
             messages = self._to_messages(input_data)
             tools = None
             tool_mode = None

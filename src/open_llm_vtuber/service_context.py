@@ -438,6 +438,7 @@ class ServiceContext:
                     diary_count=mem_cfg.diary_count,
                     recent_sessions=mem_cfg.recent_sessions,
                     diary_rag_config=mem_cfg.diary_rag,
+                    facts_rag_config=mem_cfg.facts_rag,
                     embed_api_key=embed_key,
                     embed_base_url=embed_base,
                 )
