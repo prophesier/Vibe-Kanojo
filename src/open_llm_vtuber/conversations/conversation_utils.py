@@ -171,8 +171,17 @@ async def finalize_conversation_turn(
     """Finalize a conversation turn"""
     if tts_manager.task_list:
         await asyncio.gather(*tts_manager.task_list)
+
+    # Signal synthesis-complete to audio clients even when the turn produced no
+    # speakable text (e.g. an all-expression-tag reply with empty TTS): the web
+    # client gates its playback-completion on this signal, so without it the UI
+    # freezes in "thinking-speaking". Text-only clients (skip_tts, e.g. the
+    # Discord bridge) have no audio playback and finalize on
+    # conversation-chain-end, so they are intentionally left exactly as before.
+    if not tts_manager._skip_tts:
         await websocket_send(json.dumps({"type": "backend-synth-complete"}))
 
+    if tts_manager.task_list:
         response = await message_handler.wait_for_response(
             client_uid, "frontend-playback-complete"
         )

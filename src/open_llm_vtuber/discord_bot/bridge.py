@@ -305,8 +305,12 @@ class OLVBridge:
             return
 
         if msg_type == "backend-synth-complete":
-            # OLV waits for this ack before sending conversation-chain-end.
-            # The browser sends it after playing audio; we ack immediately.
+            # Dormant by default: Discord runs through OLV's skip_tts (empty-TTS)
+            # path, so finalize_conversation_turn does NOT send this to the bridge
+            # — the turn finalizes on conversation-chain-end instead. Kept as a
+            # safety net for if Discord ever re-enables real TTS (skip_tts=False):
+            # OLV would then send this and wait for the ack below before chain-end.
+            # When it does arrive we ack immediately (no audio to actually play).
             if self._ws is not None:
                 try:
                     async with self._send_lock:
