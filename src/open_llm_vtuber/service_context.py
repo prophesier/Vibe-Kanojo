@@ -429,11 +429,17 @@ class ServiceContext:
             # a client connects.
             mem_cfg = self.system_config.persistent_memory
             if mem_cfg.enabled:
+                embed_key, embed_base = PersistentMemoryManager.resolve_embed_credentials(
+                    mem_cfg.diary_rag, self.character_config.agent_config
+                )
                 self.memory_manager = PersistentMemoryManager(
                     conf_uid=self.character_config.conf_uid,
                     max_facts=mem_cfg.max_facts,
                     diary_count=mem_cfg.diary_count,
                     recent_sessions=mem_cfg.recent_sessions,
+                    diary_rag_config=mem_cfg.diary_rag,
+                    embed_api_key=embed_key,
+                    embed_base_url=embed_base,
                 )
                 if hasattr(self.agent_engine, "set_memory_manager"):
                     self.agent_engine.set_memory_manager(self.memory_manager)

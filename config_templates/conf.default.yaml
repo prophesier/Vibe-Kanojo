@@ -35,6 +35,31 @@ system_config:
     diary_count: 5
     # Maximum facts to keep in facts.json before trimming oldest (Layer 2)
     max_facts: 50
+    # Diary RAG: semantically retrieve older diaries (beyond the diary_count
+    # injected above) when the current message is relevant to them. Embeddings
+    # need OpenAI; retrieval degrades gracefully if unavailable.
+    diary_rag:
+      enabled: false
+      # OpenAI key/endpoint for embeddings. Leave blank to reuse the openai_llm
+      # provider's credentials (these are a separate service from chat).
+      openai_api_key: ""
+      base_url: ""
+      embedding_model: "text-embedding-3-small"
+      # Minimum cosine similarity for any diary to be inserted (the gate; most
+      # turns insert nothing, which is what keeps the prompt cache intact).
+      similarity_threshold: 0.55
+      # Stricter similarity a 2nd+ diary must clear to also be inserted.
+      topn_threshold: 0.70
+      # Max diaries inserted in a single turn.
+      max_retrievals_per_turn: 2
+      # Hybrid scoring: final = cosine + lexical_weight * keyword_overlap. Dense
+      # embeddings barely separate exact keyword matches on a homogeneous diary
+      # corpus, so this lexical boost surfaces literal-term hits. 0 = pure vector.
+      lexical_weight: 0.5
+      # Turns a retrieved diary stays in context before expiring.
+      ttl_turns: 4
+      # Hard cap on diaries kept in context at once (oldest evicted first).
+      max_in_context: 4
 
 # configuration for the default character
 character_config:

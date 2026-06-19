@@ -7,8 +7,10 @@ from typing import (
     Literal,
     Union,
     Optional,
+    Set,
 )
 import json
+import hashlib
 from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
@@ -73,6 +75,20 @@ class BasicMemoryAgent(AgentInterface):
         self._mcp_prompt_string = mcp_prompt_string
         self._json_detector = StreamJSONDetector()
         self._memory_manager = None  # set via set_memory_manager()
+
+        # Diary RAG (long-tail recall). The in-context list is ephemeral: it
+        # holds retrieved diaries with a per-turn TTL and is injected only into
+        # the outgoing user message — never persisted to _memory or history, so
+        # the prompt cache prefix stays clean. _pending_rag_block is the block
+        # built for the turn currently being assembled (consumed by _to_messages).
+        # Diaries injected via RAG this session — persisted in _memory, so they
+        # are excluded from further retrieval (each diary appears at most once).
+        self._session_injected_uids: Set[str] = set()
+        self._pending_rag_block: str = ""
+        self._sliding_window_uids: Set[str] = set()
+        # Fingerprint of the last system prompt, for diagnosing prompt-cache
+        # drops: a change between turns is exactly what busts the prefix cache.
+        self._last_system_fp: str = ""
 
         # Tracks whether the current session's banner has already been
         # prepended in _memory. Set by set_memory_from_recent_histories
@@ -297,7 +313,16 @@ class BasicMemoryAgent(AgentInterface):
         "その中に事実関係が含まれていれば、"
         "出力する前にその部分の正確性だけを検証すればよい。"
         "不確かな部分は「仮説だが」「確認していないが」と留保を添えるか、"
-        "Web検索で裏を取るか、率直に「分からない」と言えば、両立する。"
+        "Web検索で裏を取るか、率直に「分からない」と言えば、両立する。\n\n"
+        "【自動検索された過去の記憶について】\n\n"
+        "一部のユーザーのメッセージの冒頭に、"
+        "`［過去の記憶（自動検索）］` というラベルの付いた囲みが挿入されていることがある。"
+        "これはその時の会話の一部ではなく、"
+        "**今の話題に関連しそうな過去セッションの日記を、システムが自動検索して添えたもの**。\n"
+        "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
+        "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
+        "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
+        "囲みの後にあるユーザーの実際の発言に対して返答すること。"
     )
 
     def _build_runtime_system(self) -> str:
@@ -308,12 +333,34 @@ class BasicMemoryAgent(AgentInterface):
         right before it encounters the data they apply to.
         """
         parts = [self._system, self._TIMESTAMP_NOTE]
+        facts_fp = diaries_fp = "-"
         if self._memory_manager:
-            mem_block = self._memory_manager.get_memory_prompt()
+            facts_text = self._memory_manager.get_facts_prompt()
+            diaries_text = self._memory_manager.get_diaries_prompt()
+            mem_block = "\n\n".join(p for p in (facts_text, diaries_text) if p)
             if mem_block:
                 parts.append(mem_block)
+            facts_fp = self._short_hash(facts_text)
+            diaries_fp = self._short_hash(diaries_text)
         parts.append(self._HISTORY_NOTE)
-        return "\n\n".join(parts)
+        system = "\n\n".join(parts)
+
+        # Diagnostic: the OpenAI/Anthropic prefix cache only hits when this
+        # whole string is byte-identical to a recent turn. Log only when it
+        # changes, so a cache drop can be traced to which sub-block moved
+        # (facts vs diaries) and on which turn.
+        fp = self._short_hash(system)
+        if fp != self._last_system_fp:
+            logger.info(
+                f"[sys_fp] system={fp} facts={facts_fp} diaries={diaries_fp} "
+                f"len={len(system)} (changed from {self._last_system_fp or 'init'})"
+            )
+            self._last_system_fp = fp
+        return system
+
+    @staticmethod
+    def _short_hash(text: str) -> str:
+        return hashlib.md5((text or "").encode("utf-8")).hexdigest()[:8]
 
     # ------------------------------------------------------------------
     # Prompt caching helpers (Claude only)
@@ -483,6 +530,10 @@ class BasicMemoryAgent(AgentInterface):
         """
         sessions = get_recent_histories(conf_uid, n, exclude_uid=current_uid)
         self._memory = []
+        # Fresh session window → reset diary-RAG dedup state (the injected
+        # blocks live in _memory, which is being rebuilt here anyway).
+        self._session_injected_uids = set()
+        self._pending_rag_block = ""
         # Reset banner state; will be set True below if the current
         # session already has messages here, or later by _add_message
         # when the first user message of a fresh session comes in.
@@ -527,6 +578,10 @@ class BasicMemoryAgent(AgentInterface):
                         self._current_session_banner_added = True
                     self._memory.append(entry)
             loaded_uids.append(current_uid)
+
+        # Sessions whose full history is in the sliding window — their diaries
+        # are excluded from RAG retrieval (the content is already in context).
+        self._sliding_window_uids = set(loaded_uids)
 
         if self._memory_manager:
             # Diaries for all loaded sessions are suppressed — their content
@@ -600,8 +655,18 @@ class BasicMemoryAgent(AgentInterface):
         messages = self._attach_cache_breakpoint(messages)
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
-        if text_prompt:
-            user_content.append({"type": "text", "text": text_prompt})
+        # The diary-RAG block (if retrieval fired this turn) rides only on the
+        # outgoing payload, above the user's actual text. It is NOT passed to
+        # _add_message below, so _memory — and therefore the persisted history
+        # and the cache prefix — stay clean (see _maybe_inject_diary_rag).
+        rag_block = self._pending_rag_block
+        self._pending_rag_block = ""
+        if rag_block and text_prompt:
+            payload_text = f"{rag_block}\n\n{text_prompt}"
+        else:
+            payload_text = rag_block or text_prompt
+        if payload_text:
+            user_content.append({"type": "text", "text": payload_text})
 
         if input_data.images:
             image_added = False
@@ -635,13 +700,82 @@ class BasicMemoryAgent(AgentInterface):
                 skip_memory = True
 
             if not skip_memory:
+                # Store the SAME text we send (including any RAG block) so the
+                # conversation in _memory stays append-only — OpenAI's prefix
+                # cache only credits a hit when each request extends the prior
+                # one, so a sent-vs-stored mismatch on the last user message
+                # would bust the whole prefix. chat_history on disk still gets
+                # the clean input (saved separately by the conversation handler).
                 self._add_message(
-                    text_prompt if text_prompt else "[User provided image(s)]", "user"
+                    payload_text if payload_text else "[User provided image(s)]", "user"
                 )
         else:
             logger.warning("No content generated for user message.")
 
         return messages
+
+    async def _maybe_inject_diary_rag(self, input_data: BatchInput) -> None:
+        """Retrieve long-tail diaries relevant to this turn and stage them.
+
+        Sets ``_pending_rag_block`` for ``_to_messages`` to fold into the
+        outgoing user message; that message is then stored in ``_memory``
+        verbatim, so the conversation stays append-only and the OpenAI prefix
+        cache keeps hitting. Each diary is injected at most once per session
+        (``_session_injected_uids``) — afterwards it lives in history, so it is
+        excluded from further retrieval. chat_history on disk stays clean
+        (saved separately). Never raises; no-op when RAG is off / query empty.
+        """
+        self._pending_rag_block = ""
+        mgr = self._memory_manager
+        if not mgr or not getattr(mgr, "diary_rag_active", False):
+            return
+        try:
+            query = " ".join(
+                t.content for t in input_data.texts if t.source == TextSource.INPUT
+            ).strip()
+            if not query:
+                return
+            # Exclude what the model already has verbatim: the injected diary
+            # block, the sliding-window sessions, and diaries already injected
+            # earlier this session (they persist in _memory).
+            exclude = (
+                mgr.injected_diary_uids()
+                | self._sliding_window_uids
+                | self._session_injected_uids
+            )
+            hits, candidates = await mgr.retrieve_diary_context(query, exclude)
+            if hits:
+                self._pending_rag_block = self._format_diary_rag_block(hits)
+                self._session_injected_uids.update(h["uid"] for h in hits)
+
+            logger.info(
+                "[diary_rag] query=%r candidates(date,hybrid,vec,lex)=%s inserted=%s session_total=%d excluded=%d"
+                % (
+                    query[:50],
+                    # top scored before thresholding — tune thresholds / lexical_weight from these
+                    [((c[1][:10] if c[1] else c[0][:19]), c[2], c[3], c[4]) for c in candidates],
+                    [(h["uid"][:19], round(h["score"], 3)) for h in hits],
+                    len(self._session_injected_uids),
+                    len(exclude),
+                )
+            )
+        except Exception as e:
+            logger.warning(f"[diary_rag] retrieval skipped: {e}")
+            self._pending_rag_block = ""
+
+    def _format_diary_rag_block(self, entries: List[Dict[str, Any]]) -> str:
+        """Terse marker block for the retrieved diaries (chronological).
+
+        The full explanation of what these blocks are lives once in
+        _HISTORY_NOTE, so each injected block stays short — it now persists in
+        the conversation history (once per injecting turn), so brevity matters.
+        """
+        lines = ["［過去の記憶（自動検索）開始］"]
+        for e in sorted(entries, key=lambda x: x.get("date", "")):
+            lines.append(f"〔{(e.get('date') or '')[:10]} のセッション〕")
+            lines.append((e.get("content") or "").strip())
+        lines.append("［過去の記憶終了］")
+        return "\n".join(lines)
 
     async def _claude_tool_interaction_loop(
         self,
@@ -953,6 +1087,7 @@ class BasicMemoryAgent(AgentInterface):
             self.reset_interrupt()
             self.prompt_mode_flag = False
 
+            await self._maybe_inject_diary_rag(input_data)
             messages = self._to_messages(input_data)
             tools = None
             tool_mode = None

@@ -34,6 +34,20 @@ system_config:
     recent_sessions: 3  # Layer 1：新会话开始时加载的历史会话数量
     diary_count: 5       # Layer 3：注入到系统提示词的最近日记条数
     max_facts: 50        # Layer 2：facts.json 保留的最大事实条数
+    # 日记 RAG：当前消息相关时，从更早的日记（超出上面注入的 diary_count）中
+    # 语义检索并临时插入。嵌入需要 OpenAI；不可用时优雅降级、不影响对话。
+    diary_rag:
+      enabled: false
+      # 嵌入用的 OpenAI key/端点。留空则复用 openai_llm 的凭据（与聊天是不同服务）。
+      openai_api_key: ""
+      base_url: ""
+      embedding_model: "text-embedding-3-small"
+      similarity_threshold: 0.55   # 任意日记被插入的最低相似度（总闸）
+      topn_threshold: 0.70          # 追加第 2+ 篇需要达到的更严相似度
+      max_retrievals_per_turn: 2    # 单轮最多插入的日记数
+      lexical_weight: 0.5           # 混合打分=余弦+本权重×关键词重叠；0=纯向量
+      ttl_turns: 4                  # 已检索日记在上下文中保留的对话轮数
+      max_in_context: 4             # 同时保留的日记硬上限（超出淘汰最旧）
 
 # 默认角色的配置
 character_config:
