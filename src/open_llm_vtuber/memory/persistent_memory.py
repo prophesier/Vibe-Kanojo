@@ -16,6 +16,29 @@ from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Set
 from loguru import logger
 
+from .vector_index import VectorIndex
+
+# Lazily-built Japanese sentence segmenter (pysbd) for diary chunking. Built on
+# first use so importing this module stays cheap when RAG is disabled.
+_JA_SEGMENTER = None
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split text into sentences for chunk-level embedding (Japanese-aware)."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    global _JA_SEGMENTER
+    try:
+        if _JA_SEGMENTER is None:
+            import pysbd
+
+            _JA_SEGMENTER = pysbd.Segmenter(language="ja", clean=False)
+        sents = _JA_SEGMENTER.segment(text)
+    except Exception:
+        sents = [text]
+    return [s.strip() for s in sents if s and s.strip()]
+
 # Matches timestamp tags injected by _to_text_prompt: "[YYYY-MM-DD HH:MM:SS Weekday]"
 _TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE)
 
@@ -234,6 +257,9 @@ class PersistentMemoryManager:
         max_facts: int = 50,
         diary_count: int = 5,
         recent_sessions: int = 3,
+        diary_rag_config: Any = None,
+        embed_api_key: str = "",
+        embed_base_url: str = "",
     ) -> None:
         self._conf_uid = conf_uid
         self._max_facts = max_facts
@@ -242,6 +268,27 @@ class PersistentMemoryManager:
         self._base_dir = os.path.join("chat_history", conf_uid)
         self._facts_path = os.path.join(self._base_dir, "facts.json")
         self._diaries_dir = os.path.join(self._base_dir, "diaries")
+
+        # Diary RAG (long-tail recall). Built only when enabled and an embedding
+        # key resolves; otherwise stays None and every RAG call is a no-op so a
+        # missing key degrades gracefully instead of breaking memory.
+        self._rag_cfg = diary_rag_config
+        self._diary_index: Optional[VectorIndex] = None
+        if diary_rag_config is not None and getattr(diary_rag_config, "enabled", False):
+            if embed_api_key:
+                self._diary_index = VectorIndex(
+                    os.path.join(self._base_dir, "diaries.embeddings.json"),
+                    api_key=embed_api_key,
+                    base_url=embed_base_url,
+                    model=getattr(diary_rag_config, "embedding_model", "text-embedding-3-small"),
+                )
+                logger.info("[memory] Diary RAG enabled.")
+            else:
+                logger.warning(
+                    "[memory] diary_rag enabled but no embedding API key resolved "
+                    "(set diary_rag.openai_api_key or configure the openai_llm provider); "
+                    "RAG disabled."
+                )
         # Session UIDs currently loaded in the agent's sliding window — their
         # diaries are excluded from the injected memory block to avoid
         # duplicating content the agent already has verbatim.
@@ -308,6 +355,132 @@ class PersistentMemoryManager:
         """Return the combined memory block (facts + diaries) for non-Claude LLMs."""
         parts = [p for p in (self.get_facts_prompt(), self.get_diaries_prompt()) if p]
         return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Diary RAG (long-tail recall)
+    # ------------------------------------------------------------------
+
+    @property
+    def diary_rag_active(self) -> bool:
+        """True when the diary vector index is built and ready to query."""
+        return self._diary_index is not None
+
+    @property
+    def diary_rag_config(self) -> Any:
+        """The DiaryRagConfig (ttl_turns / max_in_context / ... ) or None."""
+        return self._rag_cfg
+
+    def injected_diary_uids(self) -> Set[str]:
+        """UIDs of the diaries currently injected in the system prompt block.
+
+        The agent unions these into the retrieval exclude set so RAG never
+        surfaces a diary the model already has verbatim in its prompt.
+        """
+        return {
+            d.get("history_uid", "") for d in self._load_recent_diaries()
+        } - {""}
+
+    async def retrieve_diary_context(
+        self, query: str, exclude_uids: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """Return diaries semantically relevant to ``query`` (long-tail recall).
+
+        Reads the live content from disk for each hit so it's never stale.
+        Returns ``(hits, candidates)`` where hits is
+        ``[{"uid", "date", "content", "score"}, ...]`` and candidates is the top
+        ``(uid, date, score)`` before thresholding (for tuning from logs).
+        Returns ``([], [])`` when RAG is off / query empty / embedding fails.
+        """
+        if self._diary_index is None or not query or not query.strip():
+            return [], []
+        cfg = self._rag_cfg
+        # The index holds sentence-level chunks; group_by="parent" collapses
+        # them back to whole diaries (ranked by each diary's best chunk), so a
+        # specific detail can match strongly without diluting across the whole
+        # summary, while we still recall and inject the full diary.
+        hits, candidates = await self._diary_index.retrieve(
+            query,
+            exclude_ids=exclude_uids,
+            similarity_threshold=getattr(cfg, "similarity_threshold", 0.55),
+            topn_threshold=getattr(cfg, "topn_threshold", 0.70),
+            max_retrievals=getattr(cfg, "max_retrievals_per_turn", 2),
+            group_by="parent",
+            lexical_weight=getattr(cfg, "lexical_weight", 0.5),
+        )
+        out: List[Dict[str, Any]] = []
+        for h in hits:
+            entry = self._read_diary(h["id"])
+            if entry and entry.get("content"):
+                out.append(
+                    {
+                        "uid": h["id"],
+                        "date": entry.get("date", h["meta"].get("date", "")),
+                        "content": entry["content"],
+                        "score": h["score"],
+                    }
+                )
+        return out, candidates
+
+    def _read_diary(self, uid: str) -> Optional[Dict[str, Any]]:
+        """Load a single diary entry by uid, or None if missing/unreadable."""
+        path = os.path.join(self._diaries_dir, f"{uid}.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                entry = json.load(f)
+            if isinstance(entry, dict) and "content" in entry:
+                entry.setdefault("date", self._session_date_from_uid(uid))
+                return entry
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _diary_chunks(uid: str, content: str, date: str) -> List[Dict[str, Any]]:
+        """Split a diary into sentence-level chunk items for the vector index.
+
+        Each chunk id is ``<diary_uid>#<n>``; ``meta.parent`` points back at the
+        diary so retrieval can group chunks and recall the whole diary.
+        """
+        return [
+            {"id": f"{uid}#{i}", "text": sent, "meta": {"parent": uid, "date": date}}
+            for i, sent in enumerate(_split_sentences(content))
+        ]
+
+    def _all_diary_chunks_for_index(self) -> List[Dict[str, Any]]:
+        """Every diary's chunks as ``{id, text, meta}`` for ensure_indexed."""
+        items: List[Dict[str, Any]] = []
+        if not os.path.isdir(self._diaries_dir):
+            return items
+        for fname in os.listdir(self._diaries_dir):
+            if not fname.endswith(".json"):
+                continue
+            uid = fname[:-5]
+            entry = self._read_diary(uid)
+            if entry and entry.get("content"):
+                items.extend(
+                    self._diary_chunks(uid, entry["content"], entry.get("date", uid))
+                )
+        return items
+
+    @staticmethod
+    def resolve_embed_credentials(diary_rag_config: Any, agent_config: Any) -> tuple:
+        """Resolve (api_key, base_url) for embeddings.
+
+        Falls back to the ``openai_llm`` provider's credentials when the
+        ``diary_rag`` block leaves them blank, so a user already on OpenAI needs
+        no extra config. The framework's ``"default_api_key"`` placeholder is
+        treated as absent.
+        """
+        key = (getattr(diary_rag_config, "openai_api_key", "") or "") if diary_rag_config else ""
+        base = (getattr(diary_rag_config, "base_url", "") or "") if diary_rag_config else ""
+        if not key and agent_config is not None:
+            openai_cfg = getattr(getattr(agent_config, "llm_configs", None), "openai_llm", None)
+            if openai_cfg is not None:
+                key = getattr(openai_cfg, "llm_api_key", "") or ""
+                base = base or (getattr(openai_cfg, "base_url", "") or "")
+        if key == "default_api_key":
+            key = ""
+        return key, base
 
     async def extract_facts_async(
         self,
@@ -444,6 +617,10 @@ class PersistentMemoryManager:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(diary_entry, f, ensure_ascii=False, indent=2)
             logger.debug(f"[memory] Saved diary for session {history_uid}")
+            if self._diary_index is not None:
+                await self._diary_index.add_many(
+                    self._diary_chunks(history_uid, content, session_date)
+                )
         except Exception as e:
             logger.warning(f"[memory] Diary creation failed: {e}")
 
@@ -591,6 +768,12 @@ class PersistentMemoryManager:
             # this run (in-place pruning otherwise only triggers when a fact is
             # added, so an oversized file would keep injecting every entry).
             await self._enforce_fact_limit_async(llm, persona=persona)
+
+            # Embed any diaries that don't yet have a vector (first run embeds
+            # them all; later runs only the freshly backfilled ones). Prunes
+            # vectors whose diary was deleted.
+            if self._diary_index is not None:
+                await self._diary_index.ensure_indexed(self._all_diary_chunks_for_index())
         except Exception as e:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
