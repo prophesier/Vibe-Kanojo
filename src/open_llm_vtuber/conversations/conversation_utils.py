@@ -172,6 +172,13 @@ async def finalize_conversation_turn(
     if tts_manager.task_list:
         await asyncio.gather(*tts_manager.task_list)
 
+    # Flush the ordered sender before emitting any turn-end signal. The gather
+    # above only waits for synthesis + enqueue; silent display payloads
+    # (skip_tts / Discord) aren't in task_list at all. The last-enqueued payload
+    # — typically a trailing （…）aside that streams in last — would otherwise
+    # race with conversation-chain-end and the text-only bridge would drop it.
+    await tts_manager.wait_until_drained()
+
     # Signal synthesis-complete to audio clients even when the turn produced no
     # speakable text (e.g. an all-expression-tag reply with empty TTS): the web
     # client gates its playback-completion on this signal, so without it the UI
