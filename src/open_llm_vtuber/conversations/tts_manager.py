@@ -118,6 +118,23 @@ class TTSTaskManager:
             except asyncio.CancelledError:
                 break
 
+    async def wait_until_drained(self, timeout: float = 30.0) -> None:
+        """Block until the ordered sender has actually flushed every payload.
+
+        Awaiting ``task_list`` only guarantees TTS synthesis finished and the
+        payload was *enqueued* — not that it was sent. Silent display payloads
+        (the ``skip_tts`` / Discord path) aren't tracked in ``task_list`` at all.
+        Without waiting here, the last-enqueued payload — typically a trailing
+        ``（…）`` aside, which streams in last — races with the turn-end signal
+        and the text-only bridge drops it.
+        """
+        if self._sender_task is None or self._sender_task.done():
+            return
+        try:
+            await asyncio.wait_for(self._payload_queue.join(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("Timed out waiting for the payload queue to drain")
+
     async def _send_silent_payload(
         self,
         display_text: DisplayText,
