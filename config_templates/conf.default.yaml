@@ -63,6 +63,25 @@ system_config:
       rerank_model: "gpt-4o-mini"
       rerank_candidates: 12     # top hybrid candidates shortlisted for the judge
       prefilter_floor: 0.3      # skip the judge when the best hybrid is below this
+      # Recent conversation turns handed to the judge as context, so it weighs
+      # candidates against what's actually being discussed, not just the last line.
+      rerank_context_turns: 6
+    # Facts RAG: a separate index for low-importance facts. Facts tagged
+    # `user`/`llm` stay in the system prompt header; `low` (the default) are
+    # recalled on demand here. Independent of diary_rag; reuses its embedding
+    # key/model. Enable AFTER tiering your facts (all existing facts migrate to
+    # `low`, so the header empties until you promote the ones you want kept).
+    facts_rag:
+      enabled: false
+      similarity_threshold: 0.55
+      topn_threshold: 0.70
+      max_retrievals_per_turn: 3
+      lexical_weight: 0.5
+      rerank_enabled: true
+      rerank_model: "gpt-4o-mini"
+      rerank_candidates: 12
+      prefilter_floor: 0.3
+      rerank_context_turns: 6
 
 # configuration for the default character
 character_config:
