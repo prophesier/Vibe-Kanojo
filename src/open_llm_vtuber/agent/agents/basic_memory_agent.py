@@ -752,31 +752,38 @@ class BasicMemoryAgent(AgentInterface):
             # Exclude what the model already has verbatim: the injected diary
             # block, the sliding-window sessions, and diaries already injected
             # earlier this session (they persist in _memory).
-            exclude = (
-                mgr.injected_diary_uids()
-                | self._sliding_window_uids
-                | self._session_injected_uids
-            )
+            # Deliberately do NOT exclude diaries already injected via RAG this
+            # session. Letting the judge re-see them means it re-picks the
+            # genuinely most-relevant ones (which stay at the top) instead of
+            # being forced to reach for new, similar diaries every turn — those
+            # re-picks then drop out below as already-present, so the in-context
+            # set self-limits by relevance without a hard cap. Header diaries and
+            # sliding-window sessions stay excluded (already present verbatim).
+            exclude = mgr.injected_diary_uids() | self._sliding_window_uids
             n_ctx = getattr(mgr.diary_rag_config, "rerank_context_turns", 6)
             context = self._recent_dialogue_context(n_ctx)
             hits, candidates, keywords = await mgr.retrieve_diary_context(
                 query, exclude, context=context
             )
-            if hits:
-                self._pending_rag_block = self._format_diary_rag_block(hits)
-                self._session_injected_uids.update(h["uid"] for h in hits)
+            # Inject only the picks not already in context (already-injected
+            # re-picks are no-ops — they're still present from earlier turns).
+            new_hits = [h for h in hits if h["uid"] not in self._session_injected_uids]
+            if new_hits:
+                self._pending_rag_block = self._format_diary_rag_block(new_hits)
+                self._session_injected_uids.update(h["uid"] for h in new_hits)
 
             logger.info(
-                "[diary_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s inserted=%s session_total=%d excluded=%d"
+                "[diary_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s judged=%s inserted=%s session_total=%d"
                 % (
                     query[:30],
                     keywords,
                     # scored shortlist (pre-judge) — tune lexical_weight / prefilter_floor from these
                     [((c[1][:10] if c[1] else c[0][:19]), c[2], c[3], c[4]) for c in candidates],
-                    # reranked picks show the judge's reason; score-path shows hybrid
+                    # what the judge picked (may include already-injected → no-op)
                     [(h["uid"][:19], (h.get("reason") or round(h.get("score", 0.0), 3))) for h in hits],
+                    # what was actually newly injected this turn
+                    [h["uid"][:19] for h in new_hits],
                     len(self._session_injected_uids),
-                    len(exclude),
                 )
             )
         except Exception as e:
@@ -849,27 +856,31 @@ class BasicMemoryAgent(AgentInterface):
             ).strip()
             if not query:
                 return
-            # Exclude facts already in the header (user/llm tier) and facts
-            # injected earlier this session (they persist in _memory).
-            exclude = mgr.injected_fact_ids() | self._session_injected_fact_ids
+            # Exclude only the header-tier facts (user/llm), which are present
+            # verbatim. Do NOT exclude facts already RAG-injected this session —
+            # same self-limiting trick as diaries: the judge re-picks the best
+            # ones and they drop out below as no-ops, so it isn't forced to keep
+            # surfacing new similar facts.
+            exclude = mgr.injected_fact_ids()
             n_ctx = getattr(mgr.facts_rag_config, "rerank_context_turns", 6)
             context = self._recent_dialogue_context(n_ctx)
             hits, candidates, keywords = await mgr.retrieve_facts_context(
                 query, exclude, context=context
             )
-            if hits:
-                self._pending_facts_block = self._format_facts_rag_block(hits)
-                self._session_injected_fact_ids.update(h["id"] for h in hits)
+            new_hits = [h for h in hits if h["id"] not in self._session_injected_fact_ids]
+            if new_hits:
+                self._pending_facts_block = self._format_facts_rag_block(new_hits)
+                self._session_injected_fact_ids.update(h["id"] for h in new_hits)
 
             logger.info(
-                "[facts_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s inserted=%s session_total=%d excluded=%d"
+                "[facts_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s judged=%s inserted=%s session_total=%d"
                 % (
                     query[:30],
                     keywords,
                     [((c[1][:10] if c[1] else c[0][:8]), c[2], c[3], c[4]) for c in candidates],
                     [(h["id"][:8], (h.get("reason") or round(h.get("score", 0.0), 3))) for h in hits],
+                    [h["id"][:8] for h in new_hits],
                     len(self._session_injected_fact_ids),
-                    len(exclude),
                 )
             )
         except Exception as e:
