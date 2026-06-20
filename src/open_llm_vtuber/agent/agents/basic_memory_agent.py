@@ -885,7 +885,9 @@ class BasicMemoryAgent(AgentInterface):
         """
         lines = ["［関連する事実（自動検索）開始］"]
         for e in entries:
-            lines.append(f"・{(e.get('fact') or '').strip()}")
+            date = (e.get("date") or "")[:10]
+            prefix = f"[{date}] " if date else ""
+            lines.append(f"・{prefix}{(e.get('fact') or '').strip()}")
         lines.append("［関連する事実終了］")
         return "\n".join(lines)
 
