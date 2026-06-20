@@ -581,7 +581,13 @@ class PersistentMemoryManager:
                 keywords=keywords,
             )
             out = [
-                {"id": h["id"], "fact": by_id[h["id"]]["fact"], "score": h["score"], "reason": ""}
+                {
+                    "id": h["id"],
+                    "fact": by_id[h["id"]]["fact"],
+                    "date": str(by_id[h["id"]].get("updated", ""))[:10],
+                    "score": h["score"],
+                    "reason": "",
+                }
                 for h in hits
                 if h["id"] in by_id
             ]
@@ -610,7 +616,13 @@ class PersistentMemoryManager:
         if judged is None:
             judged = [dict(s, reason="(rerank-fallback)") for s in shortlist[:max_n]]
         out = [
-            {"id": j["id"], "fact": j["content"], "score": 0.0, "reason": j.get("reason", "")}
+            {
+                "id": j["id"],
+                "fact": j["content"],
+                "date": j.get("date", "") or str(by_id.get(j["id"], {}).get("updated", ""))[:10],
+                "score": 0.0,
+                "reason": j.get("reason", ""),
+            }
             for j in judged[:max_n]
         ]
         return out, candidates, keywords
