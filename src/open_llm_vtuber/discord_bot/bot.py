@@ -582,7 +582,15 @@ class DiscordVTuberBot(discord.Client):
 
         channel_id = data.get("channel_id")
         user_id = data.get("user_id")
-        elapsed = time.time() - float(data.get("initiated_at") or time.time())
+        initiated_at = float(data.get("initiated_at") or time.time())
+
+        # Hold the notification until OLV's startup backfill has settled. Backfill
+        # can rewrite facts → change the system prompt; if the user starts talking
+        # before it finishes, the prompt shifts mid-session and the OpenAI prompt
+        # cache drops. The no-work case settles almost immediately, so this returns
+        # fast when there's nothing to backfill.
+        settled = await self._wait_for_backfill_settled(after=initiated_at)
+        elapsed = time.time() - initiated_at
 
         # Build a system-style embed. Bot-authored messages never re-enter
         # on_message (filtered by message.author.bot), so this notification
@@ -593,6 +601,11 @@ class DiscordVTuberBot(discord.Client):
             color=0x57F287,
         )
         embed.add_field(name="所要時間", value=f"{elapsed:.1f} 秒", inline=True)
+        embed.add_field(
+            name="メモリ整理",
+            value="完了" if settled else "進行中の可能性",
+            inline=True,
+        )
         embed.set_footer(text="このメッセージはシステム通知であり、会話履歴には記録されません。")
 
         channel = None
@@ -627,6 +640,32 @@ class DiscordVTuberBot(discord.Client):
             state_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    async def _wait_for_backfill_settled(
+        self, *, after: float, timeout: float = 300.0, poll: float = 2.0
+    ) -> bool:
+        """Block until OLV records a backfill-settled marker newer than ``after``
+        (the restart's initiation time), or until ``timeout`` elapses.
+
+        Comparing against ``after`` ignores a stale marker left by the previous
+        run, so only this restart's backfill counts. Returns True if a fresh
+        settle was observed, False on timeout (announce anyway — a stuck or very
+        long backfill must not block the notification forever).
+        """
+        from ..pidfile import read_backfill_settled_at
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            settled_at = read_backfill_settled_at(root=self._project_root)
+            if settled_at is not None and settled_at >= after:
+                logger.info("Backfill settled; sending restart notification.")
+                return True
+            await asyncio.sleep(poll)
+        logger.warning(
+            f"Backfill-settled marker not seen within {timeout:.0f}s; announcing "
+            "restart anyway (memory backfill may still be running)."
+        )
+        return False
 
     async def on_message(self, message: discord.Message) -> None:
         if message.author.bot or message.author == self.user:

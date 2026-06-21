@@ -38,6 +38,7 @@ from .config_manager import (
     validate_config,
 )
 from .memory.persistent_memory import PersistentMemoryManager
+from .pidfile import mark_backfill_settled
 
 
 class ServiceContext:
@@ -255,17 +256,45 @@ class ServiceContext:
         # Kick off persistent-memory backfill on the live event loop. The
         # class-level in-progress guard makes this safe to call on every
         # connection — only the first one will actually do work.
+        #
+        # When it finishes, record a "backfill settled" marker: the Discord bot
+        # waits for it before announcing restart-complete, so the user isn't
+        # invited to talk while backfill is still rewriting facts (which would
+        # shift the system prompt mid-session and break the prompt cache). The
+        # no-work cases (no memory manager, or no LLM to run it) settle instantly
+        # since nothing will change the system prompt.
+        conf_uid = getattr(self.character_config, "conf_uid", "")
         if self.memory_manager:
             llm = getattr(self.agent_engine, "_llm", None)
             persona = getattr(self.agent_engine, "_system", "") or ""
             if llm:
                 asyncio.create_task(
-                    self.memory_manager.backfill_async(
-                        self.character_config.conf_uid, llm, persona=persona
-                    )
+                    self._backfill_then_mark_settled(conf_uid, llm, persona)
                 )
+            else:
+                mark_backfill_settled(conf_uid=conf_uid)
+        else:
+            mark_backfill_settled(conf_uid=conf_uid)
 
         logger.debug(f"Loaded service context with cache: {character_config}")
+
+    async def _backfill_then_mark_settled(
+        self, conf_uid: str, llm, persona: str
+    ) -> None:
+        """Run startup backfill, then mark the system prompt settled — but only
+        from the call that actually ran it. Concurrent callers early-return via
+        the in-progress guard (backfill_async returns False) and must NOT signal
+        settled, since the real run is still in flight.
+        """
+        try:
+            ran = await self.memory_manager.backfill_async(
+                conf_uid, llm, persona=persona
+            )
+        except Exception as e:
+            logger.warning(f"Backfill task failed: {e}")
+            ran = True  # facts won't change further; don't block the bot forever
+        if ran:
+            mark_backfill_settled(conf_uid=conf_uid)
 
     async def load_from_config(self, config: Config) -> None:
         """

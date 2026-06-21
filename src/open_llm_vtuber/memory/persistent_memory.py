@@ -1014,7 +1014,7 @@ class PersistentMemoryManager:
         # Mark diary so backfill knows this session's facts were already extracted.
         self._mark_diary_facts_extracted(history_uid)
 
-    async def backfill_async(self, conf_uid: str, llm: Any, persona: str = "") -> None:
+    async def backfill_async(self, conf_uid: str, llm: Any, persona: str = "") -> bool:
         """Generate diaries and facts for sessions that don't have them yet.
 
         Diary backfill: creates a diary for each session that has messages but
@@ -1025,9 +1025,15 @@ class PersistentMemoryManager:
         bounded regardless of how many sessions exist.
         Both passes are idempotent. Guarded by a process-wide lock so concurrent
         connections don't kick off duplicate backfills for the same character.
+
+        Returns ``True`` if this call actually ran the backfill (so the caller
+        can signal "system prompt settled"), or ``False`` if it early-returned
+        because another connection's backfill is already in progress — that
+        concurrent caller must NOT signal settled, since the real run is still
+        going. A run that completes with no work to do still returns ``True``.
         """
         if conf_uid in PersistentMemoryManager._backfill_in_progress:
-            return
+            return False
         PersistentMemoryManager._backfill_in_progress.add(conf_uid)
         try:
             from ..chat_history_manager import get_history_list, get_history
@@ -1151,6 +1157,10 @@ class PersistentMemoryManager:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
             PersistentMemoryManager._backfill_in_progress.discard(conf_uid)
+        # Reached only by the call that actually ran (the early-return above
+        # exits first). True even if the work errored — facts are in their
+        # final state for this startup either way, so the prompt is settled.
+        return True
 
     # ------------------------------------------------------------------
     # Internal helpers
