@@ -35,6 +35,11 @@ system_config:
     diary_count: 5
     # Maximum facts to keep in facts.json before trimming oldest (Layer 2)
     max_facts: 50
+    # Model for memory tasks (diary / fact extraction / consolidation). Blank =
+    # reuse the chat model. These are big, uncached one-shot calls, so pointing
+    # them at a cheaper model cuts cost without touching chat quality. Reuses the
+    # chat provider's key/endpoint — only the model name changes.
+    memory_llm_model: ""
     # Diary RAG: semantically retrieve older diaries (beyond the diary_count
     # injected above) when the current message is relevant to them. Embeddings
     # need OpenAI; retrieval degrades gracefully if unavailable.

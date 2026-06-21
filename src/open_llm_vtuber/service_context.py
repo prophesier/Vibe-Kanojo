@@ -445,6 +445,36 @@ class ServiceContext:
                 if hasattr(self.agent_engine, "set_memory_manager"):
                     self.agent_engine.set_memory_manager(self.memory_manager)
                 logger.info("[memory] Persistent memory manager initialised.")
+
+                # Optional: route memory tasks (diary/fact/consolidate) through a
+                # separate model — they're big, uncached one-shot calls that don't
+                # need the (pricier) chat model. Reuses the chat provider's
+                # key/endpoint, only overriding the model name.
+                if mem_cfg.memory_llm_model:
+                    try:
+                        from .agent.stateless_llm_factory import LLMFactory
+
+                        provider = (
+                            agent_config.agent_settings.model_dump()
+                            .get("basic_memory_agent", {})
+                            .get("llm_provider")
+                        )
+                        mcfg = dict(agent_config.llm_configs.model_dump().get(provider, {}))
+                        mcfg.pop("interrupt_method", None)
+                        mcfg["model"] = mem_cfg.memory_llm_model
+                        memory_llm = LLMFactory.create_llm(
+                            llm_provider=provider, system_prompt="", **mcfg
+                        )
+                        self.memory_manager.set_memory_llm(memory_llm)
+                        logger.info(
+                            f"[memory] Memory tasks routed to '{mem_cfg.memory_llm_model}' "
+                            f"(provider {provider})."
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"[memory] Could not build memory LLM "
+                            f"('{mem_cfg.memory_llm_model}'); falling back to chat model: {e}"
+                        )
             else:
                 self.memory_manager = None
 
