@@ -213,6 +213,23 @@ _DIARY_SYSTEM = (
     "出力は日記本文のみ。見出し・装飾・前置きは一切含めない。"
 )
 
+# Framing for the always-on facts block appended to the diary system prompt.
+# Without it the model tends to either copy facts verbatim into the diary or
+# treat them as things that happened this session. Placed right before the
+# conversation so it reads as background context, not new events.
+_DIARY_FACTS_NOTE = (
+    "【参考：ユーザーに関する既知の長期記憶】\n"
+    "以下は、すでに長期記憶として保存されているユーザーに関する事実。"
+    "日記を書く際、ユーザーの人物像を踏まえた自然な記述をするための"
+    "背景知識として参照してよい。\n"
+    "ただし厳守すること：\n"
+    "- これらは過去に確定済みの情報であり、今回のセッションで起きた出来事ではない。\n"
+    "- 日記本文にそのまま列挙・コピーしてはならない。"
+    "今回の会話で新しく分かったこと・起きたことだけを日記に書く。"
+    "既知の事実は、今回それに関連する話題が出たときの文脈理解にのみ使う。\n"
+    "- 各事実の冒頭の `[YYYY-MM-DD]` は記録日であり、出来事が起きた日ではない。"
+)
+
 _FACT_PRUNE_SYSTEM = (
     "あなたはメモリ整理ツールです。これは会話ではありません。"
     "ロールプレイ、キャラクターとしての応答、感情表現タグ（[neutral]、[smirk]等）、"
@@ -933,8 +950,23 @@ class PersistentMemoryManager:
             if header_parts:
                 conv_text = "[セッション情報]\n" + "\n".join(header_parts) + "\n\n" + conv_text
 
+            # Inject the always-on facts (user/llm tier when facts RAG is on,
+            # else all facts — exactly what the chat model keeps in its header)
+            # as background, placed AFTER the persona but BEFORE the diary-writing
+            # rules. This keeps _DIARY_SYSTEM adjacent to the conversation so the
+            # task instruction holds the high-attention slot (mirrors how the
+            # chat path puts _HISTORY_NOTE last); the facts are reference data
+            # and sit fine in the labelled middle block.
+            base = _DIARY_SYSTEM
+            header_facts = self._header_facts()
+            if header_facts:
+                fact_lines = "\n".join(
+                    f"- [{str(f.get('updated', ''))[:10] or '不明'}] {f['fact']}"
+                    for f in header_facts
+                )
+                base = f"{_DIARY_FACTS_NOTE}\n\n{fact_lines}\n\n---\n\n{_DIARY_SYSTEM}"
             content = await self._call_llm(
-                llm, self._with_persona(_DIARY_SYSTEM, persona), conv_text
+                llm, self._with_persona(base, persona), conv_text
             )
             content = content.strip()
             if not content:
