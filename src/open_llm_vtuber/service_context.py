@@ -421,6 +421,12 @@ class ServiceContext:
             self.character_config.agent_config = agent_config
             self.system_prompt = system_prompt
 
+            # Pin OpenAI prompt-cache routing to this character so its turns reuse
+            # the same cache machine across a session (see openai_compatible_llm).
+            chat_llm = getattr(self.agent_engine, "_llm", None)
+            if chat_llm is not None and hasattr(chat_llm, "set_prompt_cache_key"):
+                chat_llm.set_prompt_cache_key(self.character_config.conf_uid)
+
             # Wire up persistent memory if enabled. Backfill is *not* scheduled
             # here because init_agent runs inside asyncio.run() during server
             # startup — any task created on that throwaway event loop would be
@@ -465,6 +471,12 @@ class ServiceContext:
                         memory_llm = LLMFactory.create_llm(
                             llm_provider=provider, system_prompt="", **mcfg
                         )
+                        if hasattr(memory_llm, "set_prompt_cache_key"):
+                            # Separate routing group from chat — memory prompts
+                            # differ, so they shouldn't share the chat machine.
+                            memory_llm.set_prompt_cache_key(
+                                self.character_config.conf_uid + "-mem"
+                            )
                         self.memory_manager.set_memory_llm(memory_llm)
                         logger.info(
                             f"[memory] Memory tasks routed to '{mem_cfg.memory_llm_model}' "

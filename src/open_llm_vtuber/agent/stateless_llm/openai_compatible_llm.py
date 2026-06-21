@@ -3,7 +3,6 @@ This class is responsible for handling asynchronous interaction with OpenAI API 
 endpoints for language generation.
 """
 
-import hashlib
 from typing import AsyncIterator, List, Dict, Any
 from openai import (
     AsyncStream,
@@ -48,6 +47,9 @@ class AsyncLLM(StatelessLLMInterface):
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
+        # Stable per-character routing hint for OpenAI's prompt cache. Empty
+        # until set_prompt_cache_key is called (e.g. with the conf_uid).
+        self._prompt_cache_key: str = ""
         self._include_usage_supported = True
         self._completion_token_param = (
             "max_completion_tokens"
@@ -65,6 +67,11 @@ class AsyncLLM(StatelessLLMInterface):
         logger.info(
             f"Initialized AsyncLLM with the parameters: {self.base_url}, {self.model}"
         )
+
+    def set_prompt_cache_key(self, key: str) -> None:
+        """Set a stable OpenAI prompt_cache_key (e.g. the conf_uid) so this
+        character's requests route to the same cache machine across turns."""
+        self._prompt_cache_key = key or ""
 
     @staticmethod
     def _uses_official_openai_endpoint(base_url: str) -> bool:
@@ -219,18 +226,18 @@ class AsyncLLM(StatelessLLMInterface):
                 )
             if self._include_usage_supported:
                 request_kwargs["stream_options"] = {"include_usage": True}
-            # Pin cache routing per character/session. OpenAI keys its prompt
-            # cache per-machine; without a stable prompt_cache_key, consecutive
-            # turns can scatter across machines and miss an otherwise-valid 24h
-            # cache. Derived from the (per-character) system prompt so it's
-            # constant within a session and only changes when the prompt does
-            # (a genuinely new prefix anyway). Sent via extra_body so it works
-            # regardless of SDK version / is ignored by endpoints that don't
-            # support it.
-            if system:
+            # Pin cache routing. OpenAI keys its prompt cache per-machine; without
+            # a stable prompt_cache_key, consecutive turns can scatter across
+            # machines and miss an otherwise-valid 24h cache. The key is set
+            # explicitly per character (see set_prompt_cache_key) rather than
+            # derived from the system prompt: the system embeds facts/diaries that
+            # the startup backfill rewrites mid-session, so hashing it would flip
+            # the key and route the turn to a cold machine, losing even the
+            # unchanged persona prefix. Sent via extra_body so it's
+            # SDK-version-agnostic / ignored by endpoints that don't support it.
+            if self._prompt_cache_key:
                 request_kwargs["extra_body"] = {
-                    "prompt_cache_key": "olv-"
-                    + hashlib.sha1(system.encode("utf-8")).hexdigest()[:16]
+                    "prompt_cache_key": self._prompt_cache_key
                 }
 
             while True:
