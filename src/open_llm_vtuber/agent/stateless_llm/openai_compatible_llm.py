@@ -3,6 +3,7 @@ This class is responsible for handling asynchronous interaction with OpenAI API 
 endpoints for language generation.
 """
 
+import hashlib
 from typing import AsyncIterator, List, Dict, Any
 from openai import (
     AsyncStream,
@@ -218,6 +219,19 @@ class AsyncLLM(StatelessLLMInterface):
                 )
             if self._include_usage_supported:
                 request_kwargs["stream_options"] = {"include_usage": True}
+            # Pin cache routing per character/session. OpenAI keys its prompt
+            # cache per-machine; without a stable prompt_cache_key, consecutive
+            # turns can scatter across machines and miss an otherwise-valid 24h
+            # cache. Derived from the (per-character) system prompt so it's
+            # constant within a session and only changes when the prompt does
+            # (a genuinely new prefix anyway). Sent via extra_body so it works
+            # regardless of SDK version / is ignored by endpoints that don't
+            # support it.
+            if system:
+                request_kwargs["extra_body"] = {
+                    "prompt_cache_key": "olv-"
+                    + hashlib.sha1(system.encode("utf-8")).hexdigest()[:16]
+                }
 
             while True:
                 try:
