@@ -146,6 +146,7 @@ class PersistentMemoryConfig(I18nMixin):
     recent_sessions: int = Field(3, alias="recent_sessions")
     diary_count: int = Field(5, alias="diary_count")
     max_facts: int = Field(50, alias="max_facts")
+    memory_llm_model: str = Field("", alias="memory_llm_model")
     diary_rag: DiaryRagConfig = Field(default_factory=DiaryRagConfig, alias="diary_rag")
     facts_rag: FactsRagConfig = Field(default_factory=FactsRagConfig, alias="facts_rag")
 
@@ -165,6 +166,10 @@ class PersistentMemoryConfig(I18nMixin):
         "max_facts": Description(
             en="Maximum number of facts to retain in facts.json",
             zh="facts.json 中保留的最大事实条数",
+        ),
+        "memory_llm_model": Description(
+            en="Model for memory tasks (diary/fact/consolidate); blank = reuse the chat model. Reuses the chat provider's key/endpoint",
+            zh="记忆任务（日记/事实/合并）用的模型；留空则复用主对话模型。复用主 provider 的 key/端点",
         ),
         "diary_rag": Description(
             en="Diary retrieval-augmented recall settings",

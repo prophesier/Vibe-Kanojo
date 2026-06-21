@@ -292,6 +292,10 @@ class PersistentMemoryManager:
         self._base_dir = os.path.join("chat_history", conf_uid)
         self._facts_path = os.path.join(self._base_dir, "facts.json")
         self._diaries_dir = os.path.join(self._base_dir, "diaries")
+        # Optional dedicated LLM for memory tasks (diary/fact/consolidate). When
+        # set, _call_llm uses it instead of the chat model — keeps big uncached
+        # one-shot memory calls off the (pricier) chat model. set via setter.
+        self._memory_llm: Any = None
 
         # Diary RAG (long-tail recall). Built only when enabled and an embedding
         # key resolves; otherwise stays None and every RAG call is a no-op so a
@@ -374,6 +378,11 @@ class PersistentMemoryManager:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def set_memory_llm(self, llm: Any) -> None:
+        """Route memory tasks (diary/fact/consolidate) through this LLM instead
+        of the chat model. Pass None to fall back to the caller-supplied LLM."""
+        self._memory_llm = llm
 
     def set_active_sessions(self, uids) -> None:
         """Mark these session UIDs as already loaded in the sliding window."""
@@ -1251,10 +1260,13 @@ class PersistentMemoryManager:
                 lines.append(f"{label}: {content}")
         return "\n".join(lines)
 
-    @staticmethod
     async def _call_llm(
-        llm: Any, system: str, prompt: str, max_tokens: int = 4096
+        self, llm: Any, system: str, prompt: str, max_tokens: int = 4096
     ) -> str:
+        # Route every memory task (fact extraction, diary, prune, consolidate)
+        # through the dedicated memory model when one is configured — these are
+        # big, uncached one-shot calls that don't need the chat model.
+        llm = self._memory_llm or llm
         messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
         result = ""
         # Memory tasks (fact extraction, diary summary, fact pruning,

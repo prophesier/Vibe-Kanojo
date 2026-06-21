@@ -34,6 +34,9 @@ system_config:
     recent_sessions: 3  # Layer 1：新会话开始时加载的历史会话数量
     diary_count: 5       # Layer 3：注入到系统提示词的最近日记条数
     max_facts: 50        # Layer 2：facts.json 保留的最大事实条数
+    # 记忆任务（日记/事实抽取/合并）用的模型。留空=复用主对话模型。这些是大块、不缓存的
+    # 一次性调用，指向更便宜的模型能省钱且不影响对话质量。复用主 provider 的 key/端点，只换模型名。
+    memory_llm_model: ""
     # 日记 RAG：当前消息相关时，从更早的日记（超出上面注入的 diary_count）中
     # 语义检索并临时插入。嵌入需要 OpenAI；不可用时优雅降级、不影响对话。
     diary_rag:
