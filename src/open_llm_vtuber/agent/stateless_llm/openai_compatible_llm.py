@@ -123,6 +123,11 @@ class AsyncLLM(StatelessLLMInterface):
         return "max_tokens" in message and "max_completion_tokens" in message
 
     @staticmethod
+    def _is_reasoning_effort_unsupported(error: APIError) -> bool:
+        message = str(error).lower()
+        return "reasoning_effort" in message or "reasoning effort" in message
+
+    @staticmethod
     def _summarize_messages(messages: List[Dict[str, Any]]) -> str:
         """Summarize request messages for error logs without dumping chat text."""
         total_chars = 0
@@ -169,6 +174,7 @@ class AsyncLLM(StatelessLLMInterface):
         tools: List[Dict[str, Any]] | NotGiven = NOT_GIVEN,
         max_tokens: int = None,
         disable_server_tools: bool = False,
+        reasoning_effort: str = None,
     ) -> AsyncIterator[str | List[ChoiceDeltaToolCall]]:
         """
         Generates a chat completion using the OpenAI API asynchronously.
@@ -226,6 +232,12 @@ class AsyncLLM(StatelessLLMInterface):
                 )
             if self._include_usage_supported:
                 request_kwargs["stream_options"] = {"include_usage": True}
+            # Explicit reasoning effort for callers that need it (memory tasks):
+            # gpt-5.1 defaults to "none", so without this it skips reasoning. Sent
+            # only when provided; dropped on the retry below if the model/endpoint
+            # rejects it.
+            if reasoning_effort:
+                request_kwargs["reasoning_effort"] = reasoning_effort
             # Pin cache routing. OpenAI keys its prompt cache per-machine; without
             # a stable prompt_cache_key, consecutive turns can scatter across
             # machines and miss an otherwise-valid 24h cache. The key is set
@@ -258,6 +270,16 @@ class AsyncLLM(StatelessLLMInterface):
                             "usage logging."
                         )
                         request_kwargs.pop("stream_options", None)
+                        continue
+                    if (
+                        reasoning_effort
+                        and "reasoning_effort" in request_kwargs
+                        and self._is_reasoning_effort_unsupported(e)
+                    ):
+                        request_kwargs.pop("reasoning_effort", None)
+                        logger.warning(
+                            "Endpoint rejected reasoning_effort; retrying without it."
+                        )
                         continue
                     if (
                         max_tokens

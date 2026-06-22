@@ -44,6 +44,7 @@ def _split_sentences(text: str) -> List[str]:
 _TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE)
 
 
+
 _FACT_EXTRACT_SYSTEM = (
     "あなたはメモリ抽出ツールです。これは会話ではありません。"
     "ロールプレイ、キャラクターとしての応答、感情表現タグ（[neutral]、[smirk]等）、"
@@ -313,6 +314,11 @@ class PersistentMemoryManager:
         # set, _call_llm uses it instead of the chat model — keeps big uncached
         # one-shot memory calls off the (pricier) chat model. set via setter.
         self._memory_llm: Any = None
+        # reasoning_effort sent on memory-task calls. Empty = don't send (use the
+        # model's default). gpt-5.1 defaults to "none" (no reasoning → lazy "[]"
+        # for extraction), so it needs an explicit "low"; gpt-5.5 defaults to
+        # "medium" so empty is fine there. Set from config via the setter.
+        self._memory_reasoning_effort: str = ""
 
         # Diary RAG (long-tail recall). Built only when enabled and an embedding
         # key resolves; otherwise stays None and every RAG call is a no-op so a
@@ -400,6 +406,11 @@ class PersistentMemoryManager:
         """Route memory tasks (diary/fact/consolidate) through this LLM instead
         of the chat model. Pass None to fall back to the caller-supplied LLM."""
         self._memory_llm = llm
+
+    def set_memory_reasoning_effort(self, effort: str) -> None:
+        """Set reasoning_effort for memory-task LLM calls (none/low/medium/high).
+        Empty string = don't send it, i.e. use the model's own default."""
+        self._memory_reasoning_effort = (effort or "").strip()
 
     def set_active_sessions(self, uids) -> None:
         """Mark these session UIDs as already loaded in the sliding window."""
@@ -1318,12 +1329,23 @@ class PersistentMemoryManager:
         #     mid-entry; these calls need more headroom.
         #   disable_server_tools=True — keeps the web_search / web_fetch
         #     tool definitions out of the request, saving ~200-300 tokens
-        #     per memory call when those tools are enabled for chat. Both
-        #     kwargs fall back gracefully on LLM impls that don't accept
-        #     them (TypeError → retry with positional-only args).
+        #     per memory call when those tools are enabled for chat.
+        #   reasoning_effort=self._memory_reasoning_effort — gpt-5.1 defaults
+        #     reasoning_effort to "none", so without this it does ZERO reasoning
+        #     and lazily returns "[]" for extraction (observed: a 148-message
+        #     session yielded 0 facts with reasoning=0). An explicit effort makes
+        #     these judgment-heavy tasks actually think. Empty string → not sent
+        #     (model default); also ignored by models/endpoints that don't
+        #     support it (graceful API fallback).
+        # All three kwargs fall back gracefully on LLM impls that don't accept
+        # them (TypeError → retry with positional-only args).
         try:
             stream = llm.chat_completion(
-                messages, system, max_tokens=max_tokens, disable_server_tools=True
+                messages,
+                system,
+                max_tokens=max_tokens,
+                disable_server_tools=True,
+                reasoning_effort=self._memory_reasoning_effort,
             )
         except TypeError:
             try:
