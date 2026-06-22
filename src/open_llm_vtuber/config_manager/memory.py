@@ -147,6 +147,7 @@ class PersistentMemoryConfig(I18nMixin):
     diary_count: int = Field(5, alias="diary_count")
     max_facts: int = Field(50, alias="max_facts")
     memory_llm_model: str = Field("", alias="memory_llm_model")
+    memory_reasoning_effort: str = Field("", alias="memory_reasoning_effort")
     diary_rag: DiaryRagConfig = Field(default_factory=DiaryRagConfig, alias="diary_rag")
     facts_rag: FactsRagConfig = Field(default_factory=FactsRagConfig, alias="facts_rag")
 
@@ -170,6 +171,10 @@ class PersistentMemoryConfig(I18nMixin):
         "memory_llm_model": Description(
             en="Model for memory tasks (diary/fact/consolidate); blank = reuse the chat model. Reuses the chat provider's key/endpoint",
             zh="记忆任务（日记/事实/合并）用的模型；留空则复用主对话模型。复用主 provider 的 key/端点",
+        ),
+        "memory_reasoning_effort": Description(
+            en="reasoning_effort for memory tasks (none/low/medium/high). Blank = don't send it (use the model's default). gpt-5.1 defaults to 'none' (no reasoning) so set 'low' there; gpt-5.5 already defaults to 'medium' so blank is fine",
+            zh="记忆任务的推理强度（none/low/medium/high）。留空=不发送（用模型默认）。gpt-5.1 默认 none（不推理），用它请设 low；gpt-5.5 默认就是 medium，留空即可",
         ),
         "diary_rag": Description(
             en="Diary retrieval-augmented recall settings",

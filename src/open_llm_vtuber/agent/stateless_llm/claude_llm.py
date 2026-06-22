@@ -161,6 +161,7 @@ class AsyncLLM(StatelessLLMInterface):
         tools: List[Dict[str, Any]] = None,
         max_tokens: int = 1024,
         disable_server_tools: bool = False,
+        reasoning_effort: str = None,  # noqa: ARG002 — accepted for signature parity (OpenAI-only); ignored here
     ) -> AsyncIterator[Dict[str, Any]]:
         """
         Generates a chat completion using the Claude API asynchronously,

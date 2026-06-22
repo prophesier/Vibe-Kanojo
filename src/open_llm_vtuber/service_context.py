@@ -479,6 +479,13 @@ class ServiceContext:
                 )
                 if hasattr(self.agent_engine, "set_memory_manager"):
                     self.agent_engine.set_memory_manager(self.memory_manager)
+                # reasoning_effort for memory-task calls (applies whether or not a
+                # separate memory model is used below). Blank = use the model's
+                # default; set "low" for gpt-5.1 (which otherwise defaults to no
+                # reasoning and returns empty extractions).
+                self.memory_manager.set_memory_reasoning_effort(
+                    mem_cfg.memory_reasoning_effort
+                )
                 logger.info("[memory] Persistent memory manager initialised.")
 
                 # Optional: route memory tasks (diary/fact/consolidate) through a
