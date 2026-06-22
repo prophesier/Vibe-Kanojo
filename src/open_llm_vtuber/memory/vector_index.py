@@ -17,6 +17,7 @@ or blocks a chat turn — the caller simply gets an empty result.
 from __future__ import annotations
 
 import json
+import math
 import os
 import unicodedata
 from typing import Any, Dict, List, Optional, Sequence
@@ -354,15 +355,24 @@ class VectorIndex:
         qnorm = float(np.linalg.norm(qvec)) or 1.0
         scores = self._normed @ (qvec / qnorm)
 
-        # Lexical signal. With extracted keywords, score by the BEST-matching
-        # keyword (one strong term suffices and a long query isn't penalised);
-        # otherwise fall back to whole-query bigram overlap.
-        kw_bigrams = (
-            [b for b in (_char_bigrams(k) for k in keywords) if b]
-            if (lexical_weight and keywords)
-            else []
-        )
-        qbg = _char_bigrams(query) if (lexical_weight and not kw_bigrams) else set()
+        # Lexical signal. With extracted keywords, score by the best-matching
+        # keyword — but weight each keyword by how RARE it is in this corpus
+        # (IDF), so a precise hit on a distinctive term wins while a hit on a
+        # ubiquitous word (which most diaries share) barely counts. Without the
+        # IDF weight, MAX-over-keywords saturated to 1.0 for almost any diary
+        # that happened to share one common word (esp. on long queries that
+        # extract many keywords), which flattened the lexical signal. Falls back
+        # to whole-query bigram overlap when no keywords were given.
+        use_kw = bool(lexical_weight and keywords)
+        # Per-entry bigram sets, computed once and reused for both the IDF
+        # document-frequency counts and the per-entry lexical score.
+        text_bigrams: Dict[str, set] = {}
+        kw_weighted: List[tuple] = []  # [(keyword_bigrams, idf_weight), ...]
+        if use_kw:
+            for uid in self._ids:
+                text_bigrams[uid] = _char_bigrams(self._texts.get(uid, ""))
+            kw_weighted = self._keyword_idf_weights(keywords, text_bigrams)
+        qbg = _char_bigrams(query) if (lexical_weight and not use_kw) else set()
 
         # Best HYBRID score per result key. Tuple: (hybrid, vector, lexical, meta).
         best: Dict[str, tuple] = {}
@@ -374,9 +384,12 @@ class VectorIndex:
             v = float(scores[i])
             if not lexical_weight:
                 lx = 0.0
-            elif kw_bigrams:
-                tb = _char_bigrams(self._texts.get(uid, ""))
-                lx = max((len(b & tb) / len(b) for b in kw_bigrams), default=0.0)
+            elif use_kw:
+                tb = text_bigrams[uid]
+                lx = max(
+                    (w * (len(kb & tb) / len(kb)) for kb, w in kw_weighted),
+                    default=0.0,
+                )
             else:
                 lx = _lexical_overlap(qbg, self._texts.get(uid, ""))
             h = v + lexical_weight * lx
@@ -403,6 +416,46 @@ class VectorIndex:
             for key, (h, v, lx, meta) in picked
         ]
         return hits, candidates
+
+    @staticmethod
+    def _keyword_idf_weights(
+        keywords: List[str], text_bigrams: Dict[str, set]
+    ) -> List[tuple]:
+        """Return ``[(keyword_bigrams, weight), ...]`` for the query keywords.
+
+        ``weight`` ∈ [0, 1] is the keyword's inverse document frequency,
+        normalised so the rarest keyword in this query weighs 1. A keyword that
+        appears in (almost) every entry weighs ~0, so a lexical hit on a common
+        word can no longer saturate the score — only hits on distinctive terms
+        carry weight. A keyword "appears" in an entry when all its character
+        bigrams are present (== a full match, the same bar the score's 1.0 uses).
+
+        Returns ``[]`` when nothing discriminates (no valid keyword, or every
+        keyword is ubiquitous), so the caller's ``max(..., default=0.0)`` yields
+        a zero lexical signal and ranking falls back to pure cosine.
+        """
+        n = len(text_bigrams) or 1
+        entries: List[tuple] = []  # (keyword_bigrams, idf)
+        for k in keywords:
+            kb = _char_bigrams(k)
+            if not kb:
+                continue
+            # Soft document frequency: sum the SAME bigram-overlap fraction the
+            # score uses, rather than counting full matches. A base form like
+            # 食べる only partially overlaps the conjugated 食べた in the text, so
+            # a hard "all bigrams present" test would score df=0 and mistake a
+            # ubiquitous word for a rare one. Summing fractions instead means a
+            # term that lightly matches the whole corpus accrues a high df → a
+            # low weight, which is exactly what we want.
+            df = sum(len(kb & tb) / len(kb) for tb in text_bigrams.values())
+            idf = max(math.log(n / (1 + df)), 0.0)
+            entries.append((kb, idf))
+        if not entries:
+            return []
+        max_idf = max(idf for _, idf in entries)
+        if max_idf <= 0:
+            return []  # every keyword is ubiquitous → no discriminating signal
+        return [(kb, idf / max_idf) for kb, idf in entries]
 
     # ------------------------------------------------------------------
     # Internal mutation helpers (keep _ids / _vectors / _normed in lockstep)
