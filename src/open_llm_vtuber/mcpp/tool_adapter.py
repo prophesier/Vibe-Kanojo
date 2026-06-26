@@ -14,6 +14,23 @@ class ToolAdapter:
     def __init__(self, server_registery: Optional[ServerRegistry] = None) -> None:
         """Initialize with an ServerRegistry."""
         self.server_registery = server_registery or ServerRegistry()
+        # Cache of discovered tool info, keyed by the sorted enabled-server
+        # tuple. The ToolAdapter is shared across every session (see
+        # ServiceContext._init_service_context), so this makes each MCP server
+        # spawn ONCE for schema discovery instead of on every session init and
+        # every get_tools() call. Process-lifetime only: restart to refresh
+        # after a server's tool set changes.
+        self._tool_info_cache: Dict[
+            Tuple[str, ...],
+            Tuple[Dict[str, Dict[str, str]], Dict[str, FormattedTool]],
+        ] = {}
+        # Cache of the fully built (prompt, openai_tools, claude_tools) tuple so
+        # the per-session get_tools() call neither re-fetches nor re-logs a
+        # "constructing tools" line once a server set has been discovered.
+        self._tools_cache: Dict[
+            Tuple[str, ...],
+            Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]],
+        ] = {}
 
     async def get_server_and_tool_info(
         self, enabled_servers: List[str]
@@ -27,6 +44,16 @@ class ToolAdapter:
                 "MC: No enabled MCP servers specified. Cannot fetch tool info."
             )
             return servers_info, formatted_tools
+
+        # Serve from cache when we've already discovered this exact server set —
+        # avoids re-spawning every MCP server on each session/get_tools call.
+        cache_key = tuple(sorted(enabled_servers))
+        cached = self._tool_info_cache.get(cache_key)
+        if cached is not None:
+            logger.debug(
+                f"MC: Reusing cached tool info for {list(cache_key)} (no server spawn)."
+            )
+            return cached
 
         logger.debug(f"MC: Fetching tool info for enabled servers: {enabled_servers}")
 
@@ -80,6 +107,11 @@ class ToolAdapter:
         logger.debug(
             f"MC: Finished fetching tool info. Found {len(formatted_tools)} tools across enabled servers."
         )
+        # Cache only a non-empty discovery, so a transient failure (e.g. a
+        # server that was momentarily down) is retried next time rather than
+        # being pinned as "no tools".
+        if formatted_tools:
+            self._tool_info_cache[cache_key] = (servers_info, formatted_tools)
         return servers_info, formatted_tools
 
     def construct_mcp_prompt_string(
@@ -220,6 +252,12 @@ class ToolAdapter:
         self, enabled_servers: List[str]
     ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Run the dynamic fetching and formatting process."""
+        cache_key = tuple(sorted(enabled_servers))
+        cached = self._tools_cache.get(cache_key)
+        if cached is not None:
+            logger.debug(f"MC: Reusing cached MCP tools/prompt for {list(cache_key)}.")
+            return cached
+
         logger.info(
             f"MC: Running dynamic tool construction for servers: {enabled_servers}"
         )
@@ -229,4 +267,7 @@ class ToolAdapter:
         mcp_prompt_string = self.construct_mcp_prompt_string(servers_info)
         openai_tools, claude_tools = self.format_tools_for_api(formatted_tools_dict)
         logger.info("MC: Dynamic tool construction complete.")
-        return mcp_prompt_string, openai_tools, claude_tools
+        result = (mcp_prompt_string, openai_tools, claude_tools)
+        if formatted_tools_dict:
+            self._tools_cache[cache_key] = result
+        return result

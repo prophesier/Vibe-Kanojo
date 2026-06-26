@@ -38,7 +38,7 @@ class MCPClient:
             raise TypeError(
                 "MCPC: Invalid server manager. Must be an instance of ServerRegistry."
             )
-        logger.info("MCPC: Initialized MCPClient instance.")
+        logger.debug("MCPC: Initialized MCPClient instance.")
 
     async def _ensure_server_running_and_get_session(
         self, server_name: str

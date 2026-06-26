@@ -102,8 +102,11 @@ class ServiceContext:
             f"Initializing MCP components: use_mcpp={use_mcpp}, enabled_servers={enabled_servers}"
         )
 
-        # Reset MCP components first
-        self.mcp_server_registery = None
+        # Reset per-session MCP components, but keep the shared ServerRegistry
+        # and ToolAdapter — they're reused across every session. Rebuilding the
+        # registry here (as before) re-read mcp_servers.json and re-probed
+        # runtimes on every connection, repeating the same "uvx not available"
+        # warnings each time.
         self.tool_manager = None
         self.mcp_client = None
         self.tool_executor = None
@@ -111,9 +114,10 @@ class ServiceContext:
         self.mcp_prompt = ""
 
         if use_mcpp and enabled_servers:
-            # 1. Initialize ServerRegistry
-            self.mcp_server_registery = ServerRegistry()
-            logger.info("ServerRegistry initialized or referenced.")
+            # 1. Reuse the shared ServerRegistry; only build one if missing.
+            if not self.mcp_server_registery:
+                self.mcp_server_registery = ServerRegistry()
+            logger.debug("ServerRegistry initialized or referenced.")
 
             # 2. Use ToolAdapter to get the MCP prompt and tools
             if not self.tool_adapter:
@@ -131,10 +135,10 @@ class ServiceContext:
                 ) = await self.tool_adapter.get_tools(enabled_servers)
                 # Store the generated prompt string
                 self.mcp_prompt = mcp_prompt_string
-                logger.info(
+                logger.debug(
                     f"Dynamically generated MCP prompt string (length: {len(self.mcp_prompt)})."
                 )
-                logger.info(
+                logger.debug(
                     f"Dynamically formatted tools - OpenAI: {len(openai_tools)}, Claude: {len(claude_tools)}."
                 )
 
@@ -148,7 +152,7 @@ class ServiceContext:
                     formatted_tools_claude=claude_tools,
                     initial_tools_dict=raw_tools_dict,
                 )
-                logger.info("ToolManager initialized with dynamically fetched tools.")
+                logger.debug("ToolManager initialized with dynamically fetched tools.")
 
             except Exception as e:
                 logger.error(
@@ -163,7 +167,7 @@ class ServiceContext:
                 self.mcp_client = MCPClient(
                     self.mcp_server_registery, self.send_text, self.client_uid
                 )
-                logger.info("MCPClient initialized for this session.")
+                logger.debug("MCPClient initialized for this session.")
             else:
                 logger.error(
                     "MCP enabled but ServerRegistry not available. MCPClient not created."
@@ -173,14 +177,14 @@ class ServiceContext:
             # 5. Initialize ToolExecutor
             if self.mcp_client and self.tool_manager:
                 self.tool_executor = ToolExecutor(self.mcp_client, self.tool_manager)
-                logger.info("ToolExecutor initialized for this session.")
+                logger.debug("ToolExecutor initialized for this session.")
             else:
                 logger.warning(
                     "MCPClient or ToolManager not available. ToolExecutor not created."
                 )
                 self.tool_executor = None  # Ensure it's None
 
-            logger.info("StreamJSONDetector initialized for this session.")
+            logger.debug("StreamJSONDetector initialized for this session.")
 
         elif use_mcpp and not enabled_servers:
             logger.warning(
