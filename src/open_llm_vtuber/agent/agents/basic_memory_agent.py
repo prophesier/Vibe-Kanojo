@@ -1020,10 +1020,19 @@ class BasicMemoryAgent(AgentInterface):
         initial_messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
     ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
-        """Handle OpenAI interaction with tool support."""
+        """Handle OpenAI interaction with tool support (MCP + built-in)."""
         messages = initial_messages.copy()
         current_turn_text = ""
         pending_tool_calls: Union[List[ToolCallObject], List[Dict[str, Any]]] = []
+
+        # Per-turn state for in-process tools handled inside this same loop
+        # (web search/fetch today; alarms later), routed by name.
+        cfg = self._web_tools_config
+        builtin_budget = {
+            "searches": int(cfg.get("max_searches", 3) or 0),
+            "fetches": int(cfg.get("max_fetches", 3) or 0),
+        }
+        builtin_names = self._builtin_tool_names()
 
         while True:
             if self.prompt_mode_flag:
@@ -1158,30 +1167,58 @@ class BasicMemoryAgent(AgentInterface):
                 if current_turn_text:
                     self._add_message(current_turn_text, "assistant")
 
-                tool_results_for_llm = []
-                if not self._tool_executor:
-                    logger.error(
-                        "OpenAI Tool interaction requested but ToolExecutor/MCPClient is not available."
+                # Split the calls: in-process built-in tools (web/alarm/...) are
+                # handled here; the rest go to the MCP executor. Both yield
+                # role:tool results that we feed back in the same `messages`.
+                builtin_calls = [
+                    tc
+                    for tc in pending_tool_calls
+                    if getattr(tc, "function", None)
+                    and tc.function.name in builtin_names
+                ]
+                mcp_calls = [
+                    tc
+                    for tc in pending_tool_calls
+                    if not (
+                        getattr(tc, "function", None)
+                        and tc.function.name in builtin_names
                     )
-                    yield "[Error: ToolExecutor/MCPClient not configured for OpenAI mode]"
-                    continue
+                ]
 
-                tool_executor_iterator = self._tool_executor.execute_tools(
-                    tool_calls=pending_tool_calls,
-                    caller_mode="OpenAI",
-                )
-                try:
-                    while True:
-                        update = await anext(tool_executor_iterator)
-                        if update.get("type") == "final_tool_results":
-                            tool_results_for_llm = update.get("results", [])
-                            break
+                tool_results_for_llm = []
+
+                for tc in builtin_calls:
+                    async for ev in self._run_builtin_tool_call(tc, builtin_budget):
+                        if ev.get("type") == "_builtin_tool_result":
+                            tool_results_for_llm.append(ev["message"])
                         else:
-                            yield update
-                except StopAsyncIteration:
-                    logger.warning(
-                        "OpenAI tool executor finished without final results marker."
-                    )
+                            yield ev
+
+                if mcp_calls:
+                    if not self._tool_executor:
+                        logger.error(
+                            "MCP tool call requested but ToolExecutor/MCPClient is not available."
+                        )
+                        yield "[Error: ToolExecutor/MCPClient not configured for OpenAI mode]"
+                    else:
+                        tool_executor_iterator = self._tool_executor.execute_tools(
+                            tool_calls=mcp_calls,
+                            caller_mode="OpenAI",
+                        )
+                        try:
+                            while True:
+                                update = await anext(tool_executor_iterator)
+                                if update.get("type") == "final_tool_results":
+                                    tool_results_for_llm.extend(
+                                        update.get("results", [])
+                                    )
+                                    break
+                                else:
+                                    yield update
+                        except StopAsyncIteration:
+                            logger.warning(
+                                "OpenAI tool executor finished without final results marker."
+                            )
 
                 if tool_results_for_llm:
                     messages.extend(tool_results_for_llm)
@@ -1220,7 +1257,6 @@ class BasicMemoryAgent(AgentInterface):
             llm_supports_native_tools = False
 
             if self._use_mcpp and self._tool_manager:
-                tools = None
                 if isinstance(self._llm, ClaudeAsyncLLM):
                     tool_mode = "Claude"
                     tools = self._formatted_tools_claude
@@ -1239,6 +1275,7 @@ class BasicMemoryAgent(AgentInterface):
                         f"No tools available/formatted for '{tool_mode}' mode, despite MCP being enabled."
                     )
 
+            # Claude + MCP keeps its dedicated loop.
             if self._use_mcpp and tool_mode == "Claude":
                 logger.debug(
                     f"Starting Claude tool interaction loop with {len(tools)} tools."
@@ -1248,62 +1285,72 @@ class BasicMemoryAgent(AgentInterface):
                 ):
                     yield output
                 return
-            elif self._use_mcpp and tool_mode == "OpenAI":
-                logger.debug(
-                    f"Starting OpenAI tool interaction loop with {len(tools)} tools."
-                )
-                async for output in self._openai_tool_interaction_loop(
-                    messages, tools if tools else []
-                ):
-                    yield output
-                return
-            else:
-                if self._should_use_openai_web_tools():
-                    logger.info("Starting chat completion with web tools (OpenAI).")
-                    token_stream = self._openai_web_tool_loop(
-                        messages, self._build_system_for_llm()
+
+            # OpenAI path: MCP tools (if enabled) and built-in tools (web
+            # search/fetch, and later alarms) share ONE tool-calling loop,
+            # dispatched by name. This is what lets the built-in Brave web tools
+            # run even while an MCP server (e.g. uber) is enabled — they used to
+            # be mutually exclusive.
+            if isinstance(self._llm, OpenAICompatibleAsyncLLM):
+                builtin_tools = self._build_builtin_tools_openai()
+                openai_tools: List[Dict[str, Any]] = []
+                if self._use_mcpp and tool_mode == "OpenAI" and tools:
+                    openai_tools.extend(tools)
+                openai_tools.extend(builtin_tools)
+                if openai_tools:
+                    logger.debug(
+                        f"Starting OpenAI tool loop: {len(openai_tools)} tools "
+                        f"(mcp={len(openai_tools) - len(builtin_tools)}, "
+                        f"builtin={len(builtin_tools)})."
                     )
-                else:
-                    logger.info("Starting simple chat completion.")
-                    token_stream = self._llm.chat_completion(
-                        messages, self._build_system_for_llm()
-                    )
-                complete_response = ""
-                async for event in token_stream:
-                    text_chunk = ""
-                    if isinstance(event, dict) and event.get("type") == "text_delta":
-                        text_chunk = event.get("text", "")
-                    elif (
-                        isinstance(event, dict)
-                        and event.get("type") == "web_search_marker"
+                    async for output in self._openai_tool_interaction_loop(
+                        messages, openai_tools
                     ):
-                        # Inline "searched the web" indicator. Streamed for
-                        # display (Discord + web stay in sync) but deliberately
-                        # NOT added to complete_response, so it isn't saved to
-                        # history and the model can't learn to fake the marker.
-                        marker = event.get("text", "")
-                        if marker:
-                            yield marker
-                        continue
-                    elif isinstance(event, str):
-                        text_chunk = event
-                    else:
-                        continue
-                    if text_chunk:
-                        yield text_chunk
-                        complete_response += text_chunk
-                if complete_response:
-                    self._add_message(complete_response, "assistant")
+                        yield output
+                    return
+
+            # No tools at all: plain streaming completion.
+            logger.info("Starting simple chat completion.")
+            complete_response = ""
+            async for event in self._llm.chat_completion(
+                messages, self._build_system_for_llm()
+            ):
+                text_chunk = ""
+                if isinstance(event, dict) and event.get("type") == "text_delta":
+                    text_chunk = event.get("text", "")
+                elif isinstance(event, str):
+                    text_chunk = event
+                else:
+                    continue
+                if text_chunk:
+                    yield text_chunk
+                    complete_response += text_chunk
+            if complete_response:
+                self._add_message(complete_response, "assistant")
 
         return chat_with_memory
 
-    def _should_use_openai_web_tools(self) -> bool:
-        """Web tools apply only on the OpenAI path, when enabled, no MCP."""
-        return (
-            bool(self._web_tools_config.get("enabled"))
-            and isinstance(self._llm, OpenAICompatibleAsyncLLM)
-            and not self._use_mcpp
+    def _web_tools_enabled(self) -> bool:
+        """Built-in Brave web tools on the OpenAI path. Available whenever
+        enabled — INCLUDING alongside MCP tools, since both kinds of tool now
+        share one OpenAI tool-calling loop (dispatched by name)."""
+        return bool(self._web_tools_config.get("enabled")) and isinstance(
+            self._llm, OpenAICompatibleAsyncLLM
         )
+
+    def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:
+        """OpenAI schemas for in-process (non-MCP) tools to advertise to the LLM.
+
+        These ride in the same tool list as the MCP tools; the OpenAI loop
+        routes calls back to ``_run_builtin_tool_call`` by name."""
+        tools: List[Dict[str, Any]] = []
+        if self._web_tools_enabled():
+            tools.extend(self._build_web_tools_openai())
+        return tools
+
+    def _builtin_tool_names(self) -> set:
+        """Names the OpenAI loop should handle in-process instead of via MCP."""
+        return {t["function"]["name"] for t in self._build_builtin_tools_openai()}
 
     @staticmethod
     def _build_web_tools_openai() -> List[Dict[str, Any]]:
@@ -1353,116 +1400,66 @@ class BasicMemoryAgent(AgentInterface):
             },
         ]
 
-    async def _openai_web_tool_loop(
-        self, messages: List[Dict[str, Any]], system: Any
-    ) -> AsyncIterator[Union[str, Dict[str, Any]]]:
-        """Drive an OpenAI tool-calling loop for client-side web tools.
+    async def _run_builtin_tool_call(
+        self, tc: ToolCallObject, budget: Dict[str, int]
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Execute one in-process (non-MCP) tool call.
 
-        Yields plain text chunks (str) and inline tool markers
-        ({"type": "web_search_marker"}) — the same event shapes the simple
-        chat consumer already handles, so persistence/display logic is
-        reused unchanged. Tool-call plumbing mutates only the local
-        ``messages`` list, never self._memory.
+        Yields display events (e.g. a ``web_search_marker``) and, last, a
+        ``{"type": "_builtin_tool_result", "message": {...}}`` carrying the
+        ``role: tool`` message to feed back to the LLM. ``budget`` caps how
+        many searches/fetches a single turn may run and is mutated in place.
         """
         cfg = self._web_tools_config
-        tools = self._build_web_tools_openai()
-        searches_left = int(cfg.get("max_searches", 3) or 0)
-        fetches_left = int(cfg.get("max_fetches", 3) or 0)
-        provider = cfg.get("provider", "brave")
-        api_key = cfg.get("api_key", "")
-        max_fetch_chars = int(cfg.get("max_fetch_chars", 20000) or 20000)
-        work = list(messages)
-        max_rounds = 6
+        name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments or "{}")
+        except json.JSONDecodeError:
+            args = {}
 
-        for _round in range(max_rounds):
-            round_text = ""
-            tool_calls: Optional[List[ToolCallObject]] = None
-            async for event in self._llm.chat_completion(work, system, tools=tools):
-                if isinstance(event, list):
-                    tool_calls = event
-                elif isinstance(event, str):
-                    if event == "__API_NOT_SUPPORT_TOOLS__":
-                        # Provider rejected tools mid-stream; restart this
-                        # round without tools so the user still gets a reply.
-                        async for ev in self._llm.chat_completion(work, system):
-                            if isinstance(ev, str) and ev:
-                                yield ev
-                                round_text += ev
-                        tool_calls = None
-                        break
-                    if event:
-                        yield event
-                        round_text += event
-
-            if not tool_calls:
-                break
-
-            # Record the assistant's tool-call turn so the follow-up request
-            # has the context the tool results refer back to.
-            work.append(
-                {
-                    "role": "assistant",
-                    "content": round_text or None,
-                    "tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
+        result: Any
+        if name == "web_search":
+            query = str(args.get("query", "")).strip()
+            if budget.get("searches", 0) <= 0:
+                result = {"error": "web search limit reached this turn"}
+            else:
+                budget["searches"] -= 1
+                logger.info(f"[web_search] query: {query or '(empty)'}")
+                yield {
+                    "type": "web_search_marker",
+                    "text": f"\n🔍 *Web検索: {query[:80] or '...'}*\n",
                 }
-            )
-
-            for tc in tool_calls:
-                name = tc.function.name
-                try:
-                    args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError:
-                    args = {}
-
-                if name == "web_search":
-                    query = str(args.get("query", "")).strip()
-                    if searches_left <= 0:
-                        result: Any = {"error": "web search limit reached this turn"}
-                    else:
-                        searches_left -= 1
-                        logger.info(f"[web_search] query: {query or '(empty)'}")
-                        yield {
-                            "type": "web_search_marker",
-                            "text": f"\n🔍 *Web検索: {query[:80] or '...'}*\n",
-                        }
-                        result = await web_search(
-                            query,
-                            provider=provider,
-                            api_key=api_key,
-                            max_results=5,
-                        )
-                elif name == "web_fetch":
-                    url = str(args.get("url", "")).strip()
-                    if fetches_left <= 0:
-                        result = {"error": "web fetch limit reached this turn"}
-                    else:
-                        fetches_left -= 1
-                        logger.info(f"[web_fetch] url: {url or '(empty)'}")
-                        yield {
-                            "type": "web_search_marker",
-                            "text": f"\n🔗 *Web取得: {url[:120] or '...'}*\n",
-                        }
-                        result = await web_fetch(url, max_chars=max_fetch_chars)
-                else:
-                    result = {"error": f"unknown tool {name!r}"}
-
-                work.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": json.dumps(result, ensure_ascii=False),
-                    }
+                result = await web_search(
+                    query,
+                    provider=cfg.get("provider", "brave"),
+                    api_key=cfg.get("api_key", ""),
+                    max_results=5,
                 )
+        elif name == "web_fetch":
+            url = str(args.get("url", "")).strip()
+            if budget.get("fetches", 0) <= 0:
+                result = {"error": "web fetch limit reached this turn"}
+            else:
+                budget["fetches"] -= 1
+                logger.info(f"[web_fetch] url: {url or '(empty)'}")
+                yield {
+                    "type": "web_search_marker",
+                    "text": f"\n🔗 *Web取得: {url[:120] or '...'}*\n",
+                }
+                result = await web_fetch(
+                    url, max_chars=int(cfg.get("max_fetch_chars", 20000) or 20000)
+                )
+        else:
+            result = {"error": f"unknown builtin tool {name!r}"}
+
+        yield {
+            "type": "_builtin_tool_result",
+            "message": {
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, ensure_ascii=False),
+            },
+        }
 
     async def chat(
         self,
