@@ -261,6 +261,20 @@ class BasicMemoryAgent(AgentInterface):
         "返信本文には絶対に含めてはならない。"
     )
 
+    # Tool-execution markers (🔍/🔗/🍔/⏰) get persisted into chat history as a
+    # display-only record, and the model otherwise imitates them. State plainly
+    # that they are auto-inserted history, not something to reproduce.
+    _TOOL_MARKER_NOTE = (
+        "【ツール実行マーカーについて】\n"
+        "会話履歴に時々現れる絵文字付きの短いマーカー"
+        "（例:「🔍 *Web検索: …*」「🔗 *Web取得: …*」「🍔 *Uber Eats*」"
+        "「⏰ *Alarm set: …*」）は、ツールが実行されたことをシステムが"
+        "自動で挿入した表示専用の記録であり、あなた自身が書くものではない。"
+        "これらのマーカーを真似て本文に出力してはならない。"
+        "ツールを使いたいときは、マーカー文字列を書くのではなく"
+        "実際にそのツールを呼び出すこと（文字列を書いても何も実行されない）。"
+    )
+
     # Trailing system block placed right before the message history.
     # No cache_control marker — small, static, and positional. By sitting
     # last in the system prompt, it's the closest instruction to the
@@ -347,6 +361,8 @@ class BasicMemoryAgent(AgentInterface):
         right before it encounters the data they apply to.
         """
         parts = [self._system, self._TIMESTAMP_NOTE]
+        if self._has_marker_tools():
+            parts.append(self._TOOL_MARKER_NOTE)
         facts_fp = diaries_fp = "-"
         if self._memory_manager:
             facts_text = self._memory_manager.get_facts_prompt()
@@ -411,7 +427,10 @@ class BasicMemoryAgent(AgentInterface):
         blocks: List[Dict[str, Any]] = [
             {
                 "type": "text",
-                "text": "\n\n".join([self._system, self._TIMESTAMP_NOTE]),
+                "text": "\n\n".join(
+                    [self._system, self._TIMESTAMP_NOTE]
+                    + ([self._TOOL_MARKER_NOTE] if self._has_marker_tools() else [])
+                ),
                 "cache_control": self._CACHE_CONTROL_1H,
             }
         ]
@@ -1358,6 +1377,15 @@ class BasicMemoryAgent(AgentInterface):
         share one OpenAI tool-calling loop (dispatched by name)."""
         return bool(self._web_tools_config.get("enabled")) and isinstance(
             self._llm, OpenAICompatibleAsyncLLM
+        )
+
+    def _has_marker_tools(self) -> bool:
+        """Whether any tool that emits an inline marker is active (web / MCP /
+        alarms), so the don't-imitate note is only added when it's relevant."""
+        return (
+            self._web_tools_enabled()
+            or self._alarm_store is not None
+            or bool(self._use_mcpp)
         )
 
     def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:
