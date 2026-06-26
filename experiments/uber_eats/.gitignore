@@ -1,0 +1,9 @@
+# Local/sensitive runtime state — never commit.
+# uber_profile/ = live session cookies; uber_session.json = captured auth headers
+# (csrf / x-uber-* / location); uber_mcp.log = server log; out/ = spike artifacts.
+uber_profile/
+uber_session.json
+uber_mcp.log
+out/
+search_probe_out/
+item_sample.json
