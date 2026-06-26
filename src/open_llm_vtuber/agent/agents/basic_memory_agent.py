@@ -1474,6 +1474,8 @@ class BasicMemoryAgent(AgentInterface):
                         "時間になるとメモが自分に届き、あなたから話しかけるきっかけになる。"
                         "「30分後」のような相対指定は in_minutes、「20時に」のような"
                         "時刻指定は at を使う（どちらか一方でよい）。"
+                        "近い時刻に既存のアラームがあると既存分が返るので、"
+                        "本当に別途必要だと自分で判断したときだけ force=true で設定する。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -1494,6 +1496,13 @@ class BasicMemoryAgent(AgentInterface):
                                 "description": (
                                     "鳴らす時刻。「HH:MM」（その時刻の次の発生）"
                                     "または「YYYY-MM-DD HH:MM」。"
+                                ),
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "description": (
+                                    "近い時刻に既存のアラームがあっても重複を承知で"
+                                    "設定する場合のみ true。通常は付けない。"
                                 ),
                             },
                         },
@@ -1599,18 +1608,48 @@ class BasicMemoryAgent(AgentInterface):
                         "message": f"時刻を解釈できませんでした: {err}",
                     }
                 else:
-                    record = await self._alarm_store.add(
-                        fire_at_utc=fire_at_utc, note=note
+                    force = bool(args.get("force", False))
+                    dup = (
+                        None
+                        if force
+                        else await self._alarm_store.find_near(fire_at_utc)
                     )
-                    local = format_local(record["fire_at_utc"])
-                    yield {"type": "tool_marker", "text": f"\n⏰ *Alarm set: {local}*\n"}
-                    result = {
-                        "status": "ok",
-                        "message": f"アラームを {local} に設定しました。",
-                        "id": record["id"],
-                        "at_local": local,
-                        "note": note,
-                    }
+                    if dup is not None:
+                        # Near-duplicate: don't create. Hand the existing alarm
+                        # back so the model can reconsider in this same turn and,
+                        # if it still judges another is needed, re-call with
+                        # force=true. No user involvement required.
+                        result = {
+                            "status": "duplicate_nearby",
+                            "message": (
+                                f"近い時刻（{format_local(dup['fire_at_utc'])}）に"
+                                f"既にアラームがある:「{dup.get('note', '')}」"
+                                f"(id: {dup['id']})。同じ用件ならこれ以上設定しなくてよい。"
+                                "別の用件で本当に必要だと自分で判断する場合のみ、"
+                                "force=true を付けて set_alarm を呼び直すこと。"
+                            ),
+                            "existing": {
+                                "id": dup["id"],
+                                "at_local": format_local(dup["fire_at_utc"]),
+                                "note": dup.get("note", ""),
+                            },
+                        }
+                    else:
+                        record = await self._alarm_store.add(
+                            fire_at_utc=fire_at_utc, note=note
+                        )
+                        local = format_local(record["fire_at_utc"])
+                        yield {
+                            "type": "tool_marker",
+                            "text": f"\n⏰ *Alarm set: {local}*\n",
+                        }
+                        result = {
+                            "status": "ok",
+                            "message": f"アラームを {local} に設定しました。",
+                            "id": record["id"],
+                            "at_local": local,
+                            "note": note,
+                        }
         elif name == "list_alarms":
             if self._alarm_store is None:
                 result = {"error": "alarm feature is not available"}
