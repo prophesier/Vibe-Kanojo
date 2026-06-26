@@ -113,7 +113,9 @@ character_config:
         # 是否使用 MCP（Model Context Protocol） Plus 以使 LLM 获得使用工具的能力（默认：False）
         # 'Plus' 意味着它包含了通过 OpenAI API 调用工具的能力。
         use_mcpp: False
-        mcp_enabled_servers: ["time", "ddg-search"] # 启用的 MCP 服务器
+        # "uber-eats" 为实验性(只读浏览 Uber Eats)。需先设置:pip install playwright;
+        # python experiments/uber_eats/login.py 登录。未设置时其工具只会返回错误。不用就删掉。
+        mcp_enabled_servers: ["time", "ddg-search", "uber-eats"] # 启用的 MCP 服务器
         # 客户端网页工具（仅 OpenAI 路径；Claude 路径用 llm_configs.claude_llm
         # 下的 Anthropic 原生工具）。模型可自行联网搜索并读取 URL 正文。
         enable_web_tools: false

@@ -136,7 +136,10 @@ character_config:
         # Use MCP (Model Context Protocol) Plus to let the LLM have the ability to use tools
         # 'Plus' means that it has the ability to call tools by using OpenAI API.
         use_mcpp: True
-        mcp_enabled_servers: ["time", "ddg-search"] # Enabled MCP servers
+        # "uber-eats" is experimental (browse-only Uber Eats). It needs setup
+        # first: pip install playwright; python experiments/uber_eats/login.py to
+        # log in. Without setup its tools just return errors. Remove it if unused.
+        mcp_enabled_servers: ["time", "ddg-search", "uber-eats"] # Enabled MCP servers
         # Client-side web tools (OpenAI path only; the Claude path uses
         # Anthropic's native web tools under llm_configs.claude_llm instead).
         # The model can search the web and read URL contents on its own.
