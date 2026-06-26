@@ -423,10 +423,22 @@ class AsyncLLM(StatelessLLMInterface):
             yield "Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details. Troubleshooting with documentation: [https://open-llm-vtuber.github.io/docs/faq#%E9%81%87%E5%88%B0-error-calling-the-chat-endpoint-%E9%94%99%E8%AF%AF%E6%80%8E%E4%B9%88%E5%8A%9E]"
 
         except RateLimitError as e:
-            logger.error(
-                f"Error calling the chat endpoint: Rate limit exceeded: {e.response}"
-            )
-            yield "Error calling the chat endpoint: Rate limit exceeded. Please try again later. See the logs for details."
+            # OpenAI returns 429 for BOTH real rate-limiting (rate_limit_exceeded:
+            # too many requests/tokens per minute) AND exhausted billing/quota
+            # (insufficient_quota: out of credit / monthly budget cap). str(e)
+            # carries the message + code, so log it to tell the two apart.
+            detail = f"{getattr(e, 'code', '') or ''} {e}"
+            logger.error(f"Error calling the chat endpoint: 429 Too Many Requests — {e}")
+            if "insufficient_quota" in detail:
+                yield (
+                    "Error calling the chat endpoint: OpenAI quota/credit exhausted "
+                    "(insufficient_quota). Check your billing. See the logs for details."
+                )
+            else:
+                yield (
+                    "Error calling the chat endpoint: Rate limit exceeded. "
+                    "Please try again later. See the logs for details."
+                )
 
         except APIError as e:
             if "does not support tools" in str(e):
