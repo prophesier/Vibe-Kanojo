@@ -715,14 +715,23 @@ class WebSocketHandler:
         )
         self._alarm_scheduler.start()
 
+    def _client_busy(self, client_uid: str) -> bool:
+        """True if a conversation turn is currently running for this client, so
+        an alarm shouldn't start a turn on it (would race the same agent + ws)."""
+        task = self.current_conversation_tasks.get(client_uid)
+        return task is not None and not task.done()
+
     def _pick_alarm_target(self) -> Optional[tuple]:
         """Choose (client_uid, skip_tts) for a fired alarm, or None if no
-        session-ready client is connected. Priority: last-active > Discord
-        (proxy) > frontend."""
+        free, session-ready client is connected. Priority: last-active > Discord
+        (proxy) > frontend. Clients mid-reply are skipped (the scheduler retries
+        them shortly)."""
         ready = [
             uid
             for uid, ctx in self.client_contexts.items()
-            if uid in self.client_connections and getattr(ctx, "history_uid", "")
+            if uid in self.client_connections
+            and getattr(ctx, "history_uid", "")
+            and not self._client_busy(uid)
         ]
         if not ready:
             return None
