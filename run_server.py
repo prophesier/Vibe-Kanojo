@@ -114,6 +114,13 @@ def parse_args():
     parser.add_argument(
         "--hf_mirror", action="store_true", help="Use Hugging Face mirror"
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue the previous conversation instead of starting a new "
+        "session (skips diary/fact backfill of that session; keeps context). "
+        "Equivalent to setting OLV_RESUME=1.",
+    )
     return parser.parse_args()
 
 
@@ -190,4 +197,7 @@ if __name__ == "__main__":
         )
     if args.hf_mirror:
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    if args.resume:
+        os.environ["OLV_RESUME"] = "1"
+        logger.info("Resume mode: will continue the previous conversation.")
     run(console_log_level=console_log_level)

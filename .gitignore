@@ -11,6 +11,7 @@ backup/
 
 # local launcher copies (tracked templates: *.example.bat)
 start_all.bat
+start_all_resume.bat
 restart.bat
 
 # ignore non-default background images

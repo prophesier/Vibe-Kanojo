@@ -523,6 +523,26 @@ class ServiceContext:
                             f"[memory] Could not build memory LLM "
                             f"('{mem_cfg.memory_llm_model}'); falling back to chat model: {e}"
                         )
+
+                # Resume mode (OLV_RESUME=1): continue the previous conversation
+                # instead of starting fresh. Mark the latest session as the
+                # in-progress one NOW — at startup, before load_cache kicks any
+                # backfill — so backfill SKIPS it (no diary/fact summarisation of
+                # the session we're continuing). The websocket handler adopts the
+                # same session for the first connection. No race: this runs once
+                # at startup on the shared memory_manager, well before backfill.
+                if os.environ.get("OLV_RESUME") == "1":
+                    from .chat_history_manager import get_latest_history_uid
+
+                    resume_uid = get_latest_history_uid(self.character_config.conf_uid)
+                    if resume_uid:
+                        self.memory_manager.set_current_session(resume_uid)
+                        logger.info(
+                            f"[resume] OLV_RESUME=1 → will continue session "
+                            f"{resume_uid} (its diary/fact backfill is skipped)."
+                        )
+                    else:
+                        logger.info("[resume] OLV_RESUME=1 but no prior session; starting fresh.")
             else:
                 self.memory_manager = None
 
