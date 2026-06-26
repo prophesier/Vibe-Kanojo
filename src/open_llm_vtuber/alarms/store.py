@@ -127,6 +127,24 @@ class AlarmStore:
         pending.sort(key=lambda a: a.get("fire_at_utc", ""))
         return pending
 
+    async def find_near(
+        self, fire_at_utc: datetime.datetime, within_seconds: int = 300
+    ) -> Optional[Dict[str, Any]]:
+        """Return the nearest pending alarm whose fire time is within
+        ``within_seconds`` of the given time, or None. Used to warn before
+        creating a near-duplicate (default window: 5 minutes)."""
+        target = fire_at_utc.astimezone(datetime.timezone.utc)
+        async with self._lock:
+            near = [
+                a
+                for a in self._read()
+                if a.get("status") == STATUS_PENDING
+                and (fa := _parse_iso(a.get("fire_at_utc", ""))) is not None
+                and abs((fa - target).total_seconds()) <= within_seconds
+            ]
+        near.sort(key=lambda a: a.get("fire_at_utc", ""))
+        return near[0] if near else None
+
     async def get_due(
         self, now_utc: Optional[datetime.datetime] = None
     ) -> List[Dict[str, Any]]:
