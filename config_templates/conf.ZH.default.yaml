@@ -126,6 +126,9 @@ character_config:
         max_web_searches: 3      # 单次回复上限
         max_web_fetches: 3       # 单次回复上限
         max_fetch_chars: 20000   # 每个抓取页面截断到的字符数
+        # 允许角色给自己设定闹钟提醒，到点后以主动消息触发。存本地文件，重启后仍有效。
+        # 触发时投递到你最近使用的那一端（否则 Discord，再否则前端）。
+        enable_alarms: true
 
       hume_ai_agent:
         api_key: ''

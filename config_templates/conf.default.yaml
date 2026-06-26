@@ -151,6 +151,10 @@ character_config:
         max_web_searches: 3      # per reply
         max_web_fetches: 3       # per reply
         max_fetch_chars: 20000   # truncate each fetched page to this many chars
+        # Let the character set self-reminders (alarms) that fire later as a
+        # proactive message. Stored in a local file; survives restarts. A fired
+        # alarm is routed to the end you were last using (else Discord, else web).
+        enable_alarms: true
 
       letta_agent:
         host: 'localhost' # Host address

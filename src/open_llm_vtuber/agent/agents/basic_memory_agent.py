@@ -16,6 +16,7 @@ from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
 from ...web_tools import web_search, web_fetch
+from ...alarms import resolve_fire_at, format_local
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
@@ -76,6 +77,7 @@ class BasicMemoryAgent(AgentInterface):
         self._mcp_prompt_string = mcp_prompt_string
         self._json_detector = StreamJSONDetector()
         self._memory_manager = None  # set via set_memory_manager()
+        self._alarm_store = None  # set via set_alarm_store()
 
         # Diary RAG (long-tail recall). The in-context list is ephemeral: it
         # holds retrieved diaries with a per-turn TTL and is injected only into
@@ -226,6 +228,11 @@ class BasicMemoryAgent(AgentInterface):
     def set_memory_manager(self, manager) -> None:
         """Attach a PersistentMemoryManager for fact extraction and diary injection."""
         self._memory_manager = manager
+
+    def set_alarm_store(self, store) -> None:
+        """Attach an AlarmStore, which also turns on the set/list/cancel_alarm
+        built-in tools (they're only advertised when a store is present)."""
+        self._alarm_store = store
 
     @staticmethod
     def _format_timestamp(ts: str) -> str:
@@ -1033,6 +1040,7 @@ class BasicMemoryAgent(AgentInterface):
             "fetches": int(cfg.get("max_fetches", 3) or 0),
         }
         builtin_names = self._builtin_tool_names()
+        emitted_markers: set = set()  # inline tool tags shown once per turn
 
         while True:
             if self.prompt_mode_flag:
@@ -1202,6 +1210,13 @@ class BasicMemoryAgent(AgentInterface):
                                 yield marker
 
                 if mcp_calls:
+                    # Inline tag so the user/character sees an MCP tool was used
+                    # (e.g. Uber Eats), once per turn per tool.
+                    for tc in mcp_calls:
+                        marker = self._mcp_tool_marker(tc.function.name)
+                        if marker and marker not in emitted_markers:
+                            emitted_markers.add(marker)
+                            yield marker
                     if not self._tool_executor:
                         logger.error(
                             "MCP tool call requested but ToolExecutor/MCPClient is not available."
@@ -1353,11 +1368,21 @@ class BasicMemoryAgent(AgentInterface):
         tools: List[Dict[str, Any]] = []
         if self._web_tools_enabled():
             tools.extend(self._build_web_tools_openai())
+        if self._alarm_store is not None:
+            tools.extend(self._build_alarm_tools_openai())
         return tools
 
     def _builtin_tool_names(self) -> set:
         """Names the OpenAI loop should handle in-process instead of via MCP."""
         return {t["function"]["name"] for t in self._build_builtin_tools_openai()}
+
+    @staticmethod
+    def _mcp_tool_marker(tool_name: str) -> str:
+        """Short inline tag flagging that an MCP tool was used (kept minimal —
+        currently just Uber Eats)."""
+        if tool_name.startswith("uber"):
+            return "\n🍔 *Uber Eats*\n"
+        return ""
 
     @staticmethod
     def _build_web_tools_openai() -> List[Dict[str, Any]]:
@@ -1402,6 +1427,77 @@ class BasicMemoryAgent(AgentInterface):
                             }
                         },
                         "required": ["url"],
+                    },
+                },
+            },
+        ]
+
+    @staticmethod
+    def _build_alarm_tools_openai() -> List[Dict[str, Any]]:
+        """OpenAI function-tool definitions for self-set alarms. Descriptions
+        are in Japanese, matching the persona/model's working language."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_alarm",
+                    "description": (
+                        "指定した時刻に自分宛てのリマインダー（アラーム）をセットする。"
+                        "時間になるとメモが自分に届き、あなたから話しかけるきっかけになる。"
+                        "「30分後」のような相対指定は in_minutes、「20時に」のような"
+                        "時刻指定は at を使う（どちらか一方でよい）。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "note": {
+                                "type": "string",
+                                "description": (
+                                    "時間になったとき自分に思い出させる内容。"
+                                    "例：「ユーザーに薬を飲んだか聞く」。"
+                                ),
+                            },
+                            "in_minutes": {
+                                "type": "number",
+                                "description": "今から何分後に鳴らすか。例：30。",
+                            },
+                            "at": {
+                                "type": "string",
+                                "description": (
+                                    "鳴らす時刻。「HH:MM」（その時刻の次の発生）"
+                                    "または「YYYY-MM-DD HH:MM」。"
+                                ),
+                            },
+                        },
+                        "required": ["note"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_alarms",
+                    "description": "今セットされている（未発火の）アラームの一覧を取得する。",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "cancel_alarm",
+                    "description": (
+                        "セット済みのアラームを取り消す。alarm_id は list_alarms で"
+                        "得られる id を指定する。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "alarm_id": {
+                                "type": "string",
+                                "description": "取り消すアラームの id。",
+                            }
+                        },
+                        "required": ["alarm_id"],
                     },
                 },
             },
@@ -1456,6 +1552,74 @@ class BasicMemoryAgent(AgentInterface):
                 result = await web_fetch(
                     url, max_chars=int(cfg.get("max_fetch_chars", 20000) or 20000)
                 )
+        elif name == "set_alarm":
+            if self._alarm_store is None:
+                result = {"error": "alarm feature is not available"}
+            else:
+                note = str(args.get("note", "")).strip()
+                fire_at_utc, err = resolve_fire_at(
+                    in_minutes=args.get("in_minutes"), at=args.get("at")
+                )
+                if not note:
+                    result = {
+                        "status": "error",
+                        "message": "note（思い出す内容）が必要です。",
+                    }
+                elif err:
+                    result = {
+                        "status": "error",
+                        "message": f"時刻を解釈できませんでした: {err}",
+                    }
+                else:
+                    record = await self._alarm_store.add(
+                        fire_at_utc=fire_at_utc, note=note
+                    )
+                    local = format_local(record["fire_at_utc"])
+                    yield {"type": "tool_marker", "text": f"\n⏰ *Alarm set: {local}*\n"}
+                    result = {
+                        "status": "ok",
+                        "message": f"アラームを {local} に設定しました。",
+                        "id": record["id"],
+                        "at_local": local,
+                        "note": note,
+                    }
+        elif name == "list_alarms":
+            if self._alarm_store is None:
+                result = {"error": "alarm feature is not available"}
+            else:
+                pending = await self._alarm_store.list_pending()
+                result = {
+                    "status": "ok",
+                    "count": len(pending),
+                    "alarms": [
+                        {
+                            "id": a["id"],
+                            "at_local": format_local(a["fire_at_utc"]),
+                            "note": a.get("note", ""),
+                        }
+                        for a in pending
+                    ],
+                }
+        elif name == "cancel_alarm":
+            if self._alarm_store is None:
+                result = {"error": "alarm feature is not available"}
+            else:
+                alarm_id = str(args.get("alarm_id", "")).strip()
+                record = await self._alarm_store.cancel(alarm_id)
+                if record is None:
+                    result = {
+                        "status": "error",
+                        "message": (
+                            f"アラーム {alarm_id} が見つかりませんでした"
+                            "（既に取り消し済み、または通知済みかもしれません）。"
+                        ),
+                    }
+                else:
+                    result = {
+                        "status": "ok",
+                        "message": "アラームを取り消しました。",
+                        "id": alarm_id,
+                    }
         else:
             result = {"error": f"unknown builtin tool {name!r}"}
 

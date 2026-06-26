@@ -39,6 +39,7 @@ from .config_manager import (
 )
 from .memory.persistent_memory import PersistentMemoryManager
 from .pidfile import mark_backfill_settled
+from .alarms import get_alarm_store
 
 
 class ServiceContext:
@@ -459,6 +460,18 @@ class ServiceContext:
             chat_llm = getattr(self.agent_engine, "_llm", None)
             if chat_llm is not None and hasattr(chat_llm, "set_prompt_cache_key"):
                 chat_llm.set_prompt_cache_key(self.character_config.conf_uid)
+
+            # Attach the self-set alarm store (shared per character) when enabled.
+            # This also enables the set/list/cancel_alarm built-in tools.
+            bma_cfg = getattr(agent_config.agent_settings, "basic_memory_agent", None)
+            if (
+                bma_cfg
+                and getattr(bma_cfg, "enable_alarms", True)
+                and hasattr(self.agent_engine, "set_alarm_store")
+            ):
+                self.agent_engine.set_alarm_store(
+                    get_alarm_store(self.character_config.conf_uid)
+                )
 
             # Wire up persistent memory if enabled. Backfill is *not* scheduled
             # here because init_agent runs inside asyncio.run() during server

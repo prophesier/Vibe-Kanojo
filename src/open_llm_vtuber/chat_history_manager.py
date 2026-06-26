@@ -270,8 +270,12 @@ def get_history_list(conf_uid: str) -> List[dict]:
             if not filename.endswith(".json"):
                 continue
             # Skip sidecar files that share the conf dir but aren't chat history:
-            # the facts store and the diary/fact RAG embedding indexes.
-            if filename == "facts.json" or filename.endswith(".embeddings.json"):
+            # the facts store, the self-set alarms store, and the diary/fact RAG
+            # embedding indexes. (These would otherwise be parsed as sessions and
+            # error out per scan.)
+            if filename in ("facts.json", "alarms.json") or filename.endswith(
+                ".embeddings.json"
+            ):
                 continue
 
             history_uid = filename[:-5]
