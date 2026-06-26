@@ -7,6 +7,10 @@
       "ddg-search": {
         "command": "uvx",
         "args": ["duckduckgo-mcp-server"]
+      },
+      "uber-eats": {
+        "command": "python",
+        "args": ["experiments/uber_eats/server.py"]
       }
     }
 }
