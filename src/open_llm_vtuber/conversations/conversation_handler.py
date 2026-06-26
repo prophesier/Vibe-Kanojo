@@ -96,18 +96,28 @@ async def handle_conversation_trigger(
                 )
             )
     else:
-        # Use client_uid as task key for individual conversations
-        current_conversation_tasks[client_uid] = asyncio.create_task(
-            process_single_conversation(
-                context=context,
-                websocket_send=websocket.send_text,
-                client_uid=client_uid,
-                user_input=user_input,
-                images=images,
-                session_emoji=session_emoji,
-                metadata=metadata,
+        # Use client_uid as task key for individual conversations. Mirror the
+        # group guard: don't start a turn while one is already running for this
+        # client, so a fired alarm or a barge-in text can't race an in-progress
+        # reply on the same agent + websocket. (Real barge-in goes through
+        # interrupt-signal, which cancels the running turn first.)
+        existing = current_conversation_tasks.get(client_uid)
+        if existing is None or existing.done():
+            current_conversation_tasks[client_uid] = asyncio.create_task(
+                process_single_conversation(
+                    context=context,
+                    websocket_send=websocket.send_text,
+                    client_uid=client_uid,
+                    user_input=user_input,
+                    images=images,
+                    session_emoji=session_emoji,
+                    metadata=metadata,
+                )
             )
-        )
+        else:
+            logger.info(
+                f"Skipping new turn for {client_uid}: a reply is already in progress."
+            )
 
 
 async def handle_individual_interrupt(

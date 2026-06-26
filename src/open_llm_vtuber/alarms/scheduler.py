@@ -86,12 +86,13 @@ class AlarmScheduler:
         logger.info(f"[alarm] {len(due)} alarm(s) due; delivering.")
         delivered = await self._deliver(due)
         if not delivered:
-            # No client (ready) to receive it. Leave the alarms pending and
-            # retry: wake on the next add/cancel, or re-check every 30s so a
-            # client that connects a moment later still gets it (covers the
-            # startup window where clients reconnect after the server).
-            logger.info("[alarm] no client ready; will retry on connect / in 30s.")
+            # No client could receive it right now — none connected/ready, or
+            # the target is mid-reply (we don't barge into an in-progress turn).
+            # Leave the alarms pending and retry: wake on the next add/cancel,
+            # or re-check every 20s so a client that connects / finishes its
+            # reply a moment later still gets it.
+            logger.info("[alarm] no free client; will retry on connect / in 20s.")
             try:
-                await asyncio.wait_for(self._store.changed.wait(), timeout=30)
+                await asyncio.wait_for(self._store.changed.wait(), timeout=20)
             except asyncio.TimeoutError:
                 pass
