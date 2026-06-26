@@ -30,6 +30,11 @@ from .conversations.conversation_handler import (
     handle_group_interrupt,
     handle_individual_interrupt,
 )
+from .conversations.single_conversation import process_single_conversation
+from .conversations.conversation_utils import EMOJI_LIST
+from .alarms import get_alarm_store
+from .alarms.scheduler import AlarmScheduler
+from .alarms.prompts import build_fire_prompt
 
 
 class MessageType(Enum):
@@ -83,6 +88,15 @@ class WebSocketHandler:
         # continues the previous session instead of starting fresh. One-shot.
         self._resume_consumed: bool = False
 
+        # --- Self-set alarms ---
+        # Per-client end type ("frontend" | "proxy"), used to route a fired
+        # alarm (last-active client first, else Discord/proxy, else frontend).
+        self._client_end_type: Dict[str, str] = {}
+        self._last_active_uid: str = ""  # most recent client to drive a turn
+        # One scheduler for the default character; started on first connection.
+        self._alarm_scheduler: Optional[AlarmScheduler] = None
+        self._alarm_delivery_lock = asyncio.Lock()
+
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
 
@@ -135,6 +149,17 @@ class WebSocketHandler:
             await self._store_client_data(
                 websocket, client_uid, session_service_context
             )
+
+            # Tag the end type for alarm routing: the Discord proxy connects to
+            # /client-ws?source=proxy; a real frontend sends no such param.
+            try:
+                source = websocket.query_params.get("source", "")
+            except Exception:
+                source = ""
+            self._client_end_type[client_uid] = (
+                "proxy" if source == "proxy" else "frontend"
+            )
+            self._ensure_alarm_scheduler()
 
             await self._send_initial_messages(
                 websocket, client_uid, session_service_context
@@ -336,6 +361,9 @@ class WebSocketHandler:
         self.client_connections.pop(client_uid, None)
         self.client_contexts.pop(client_uid, None)
         self.received_data_buffers.pop(client_uid, None)
+        self._client_end_type.pop(client_uid, None)
+        if self._last_active_uid == client_uid:
+            self._last_active_uid = ""
         if client_uid in self.current_conversation_tasks:
             task = self.current_conversation_tasks[client_uid]
             if task and not task.done():
@@ -648,6 +676,9 @@ class WebSocketHandler:
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
         """Handle triggers that start a conversation"""
+        # Remember who last drove a turn, so a fired alarm speaks on the end the
+        # user was last using.
+        self._last_active_uid = client_uid
         await handle_conversation_trigger(
             msg_type=data.get("type", ""),
             data=data,
@@ -661,6 +692,104 @@ class WebSocketHandler:
             current_conversation_tasks=self.current_conversation_tasks,
             broadcast_to_group=self.broadcast_to_group,
         )
+
+    # ----------------------------------------------------------- alarms
+    def _alarms_enabled(self) -> bool:
+        try:
+            bma = (
+                self.default_context_cache.character_config.agent_config.agent_settings.basic_memory_agent
+            )
+            return bool(bma and getattr(bma, "enable_alarms", True))
+        except Exception:
+            return False
+
+    def _ensure_alarm_scheduler(self) -> None:
+        """Start the per-character alarm scheduler once (on first connection)."""
+        if self._alarm_scheduler is not None or not self._alarms_enabled():
+            return
+        conf_uid = self.default_context_cache.character_config.conf_uid
+        if not conf_uid:
+            return
+        self._alarm_scheduler = AlarmScheduler(
+            get_alarm_store(conf_uid), self._deliver_alarms
+        )
+        self._alarm_scheduler.start()
+
+    def _pick_alarm_target(self) -> Optional[tuple]:
+        """Choose (client_uid, skip_tts) for a fired alarm, or None if no
+        session-ready client is connected. Priority: last-active > Discord
+        (proxy) > frontend."""
+        ready = [
+            uid
+            for uid, ctx in self.client_contexts.items()
+            if uid in self.client_connections and getattr(ctx, "history_uid", "")
+        ]
+        if not ready:
+            return None
+        if self._last_active_uid in ready:
+            uid = self._last_active_uid
+            return uid, self._client_end_type.get(uid) == "proxy"
+        proxies = [u for u in ready if self._client_end_type.get(u) == "proxy"]
+        if proxies:
+            return proxies[-1], True
+        uid = ready[-1]
+        return uid, self._client_end_type.get(uid) == "proxy"
+
+    async def _deliver_alarms(self, due: List[dict]) -> bool:
+        """Scheduler callback: speak the due alarm(s) on the best end. Returns
+        False if nothing could receive it (the scheduler retries later)."""
+        async with self._alarm_delivery_lock:
+            target = self._pick_alarm_target()
+            if target is None:
+                return False
+            client_uid, skip_tts = target
+            prompt = build_fire_prompt(due)
+            ok = await self._fire_proactive(client_uid, prompt, skip_tts)
+            if ok:
+                conf_uid = self.default_context_cache.character_config.conf_uid
+                await get_alarm_store(conf_uid).mark_delivered([a["id"] for a in due])
+            return ok
+
+    async def _fire_proactive(
+        self, client_uid: str, user_input: str, skip_tts: bool
+    ) -> bool:
+        """Run one proactive conversation turn for a client (the alarm opening)."""
+        context = self.client_contexts.get(client_uid)
+        websocket = self.client_connections.get(client_uid)
+        if context is None or websocket is None:
+            return False
+        metadata = {
+            "proactive_speak": True,
+            # Don't persist the injected alarm prompt as a fake "human" turn.
+            # The AI's proactive REPLY is still saved to history (that store is
+            # unconditional) and to memory (assistant messages always are), so
+            # the character remembers what it said — just not the machinery.
+            "skip_history": True,
+            "skip_memory": True,
+            "skip_tts": skip_tts,
+        }
+        try:
+            task = asyncio.create_task(
+                process_single_conversation(
+                    context=context,
+                    websocket_send=websocket.send_text,
+                    client_uid=client_uid,
+                    user_input=user_input,
+                    images=None,
+                    session_emoji=np.random.choice(EMOJI_LIST),
+                    metadata=metadata,
+                )
+            )
+            self.current_conversation_tasks[client_uid] = task
+            await task
+            logger.info(
+                f"[alarm] proactive turn delivered to {client_uid} "
+                f"(end={self._client_end_type.get(client_uid)})."
+            )
+            return True
+        except Exception as e:
+            logger.error(f"[alarm] proactive turn failed for {client_uid}: {e}")
+            return False
 
     async def _handle_fetch_configs(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

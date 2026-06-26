@@ -45,6 +45,10 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     max_web_fetches: Optional[int] = Field(3, alias="max_web_fetches")
     max_fetch_chars: Optional[int] = Field(20000, alias="max_fetch_chars")
 
+    # Self-set alarms: the character can schedule a reminder for itself that
+    # fires later (even across restarts) as a proactive message.
+    enable_alarms: Optional[bool] = Field(True, alias="enable_alarms")
+
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
             en="LLM provider to use for this agent",
@@ -98,6 +102,17 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "max_fetch_chars": Description(
             en="Truncate each fetched page to this many characters.",
             zh="每个抓取页面截断到的字符数。",
+        ),
+        "enable_alarms": Description(
+            en=(
+                "Let the character set self-reminders (alarms) that fire later "
+                "as a proactive message. Persisted to a local file; survives "
+                "restarts. (default: True)"
+            ),
+            zh=(
+                "允许角色给自己设定闹钟提醒，到点后以主动消息触发。存本地文件，"
+                "重启后仍有效。（默认：True）"
+            ),
         ),
     }
 

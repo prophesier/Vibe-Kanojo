@@ -88,6 +88,17 @@ class OLVBridge:
         self._turn_lock = asyncio.Lock()
         # Resolves when an expression-capture-complete arrives (for /refresh-faces).
         self._capture_future: Optional[asyncio.Future] = None
+        # Server-initiated (proactive) turns — e.g. a fired alarm — arrive with
+        # no pending request. Buffer their text and flush on chain-end.
+        self._proactive_callback: Optional[Callable[[str], Awaitable[None]]] = None
+        self._proactive_parts: list[str] = []
+
+    def set_proactive_callback(
+        self, cb: Callable[[str], Awaitable[None]]
+    ) -> None:
+        """Register a callback invoked with the text of an unsolicited turn the
+        server pushes (no pending request), such as a fired alarm."""
+        self._proactive_callback = cb
 
     @property
     def is_connected(self) -> bool:
@@ -286,6 +297,10 @@ class OLVBridge:
             text = (display.get("text") or "").strip()
             if text and self._current_turn is not None:
                 self._current_turn.result.text_parts.append(text)
+            elif text:
+                # No pending request → this is a proactive (server-initiated)
+                # turn, e.g. a fired alarm. Buffer until chain-end.
+                self._proactive_parts.append(text)
             # Pick the face for this turn: the LLM-marked primary wins; otherwise
             # fall back to the first expression seen.
             actions = data.get("actions") or {}
@@ -323,8 +338,11 @@ class OLVBridge:
 
         if msg_type == "control":
             ctrl = data.get("text")
-            if ctrl == "conversation-chain-end" and self._current_turn is not None:
-                self._current_turn.done.set()
+            if ctrl == "conversation-chain-end":
+                if self._current_turn is not None:
+                    self._current_turn.done.set()
+                else:
+                    await self._flush_proactive()
             return
 
         if msg_type == "error":
@@ -355,3 +373,15 @@ class OLVBridge:
         if turn is not None and not turn.done.is_set():
             turn.result.error = reason
             turn.done.set()
+
+    async def _flush_proactive(self) -> None:
+        """Hand a completed proactive turn's text to the callback (if any)."""
+        if not self._proactive_parts:
+            return
+        text = " ".join(p.strip() for p in self._proactive_parts if p).strip()
+        self._proactive_parts = []
+        if text and self._proactive_callback is not None:
+            try:
+                await self._proactive_callback(text)
+            except Exception as e:
+                logger.warning(f"proactive callback raised: {e}")

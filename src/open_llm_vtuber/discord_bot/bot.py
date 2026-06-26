@@ -128,10 +128,16 @@ class DiscordVTuberBot(discord.Client):
         self._full_config = full_config
         # Last expression face sent to Discord; only re-send when it changes.
         self._last_face_index: Optional[int] = None
+        # Last channel the bot interacted in, used as the target for proactive
+        # (server-initiated) messages such as a fired alarm.
+        self._last_channel: Optional[discord.abc.Messageable] = None
         self._tree = app_commands.CommandTree(self)
         self._started_at = time.time()
         if self._admin_user_id:
             self._register_admin_commands()
+        # Receive proactive turns (fired alarms) pushed by OLV with no pending
+        # request, and post them to the last/first channel.
+        self._bridge.set_proactive_callback(self._on_proactive)
 
     def _register_admin_commands(self) -> None:
         """Register slash commands restricted to the configured admin user."""
@@ -675,6 +681,9 @@ class DiscordVTuberBot(discord.Client):
         if not _allowed(message.channel.id, self._channel_ids):
             return
 
+        # Remember where the conversation is happening, for proactive messages.
+        self._last_channel = message.channel
+
         content = (message.content or "").strip()
         images = (
             await _collect_images(message.attachments) if message.attachments else []
@@ -751,6 +760,29 @@ class DiscordVTuberBot(discord.Client):
             logger.warning(
                 f"Reply for req={result.request_id} had partial error: {result.error}"
             )
+
+    async def _on_proactive(self, text: str) -> None:
+        """Post a server-initiated (proactive) message — e.g. a fired alarm — to
+        the last active channel, falling back to the first configured channel."""
+        if not text:
+            return
+        channel = self._last_channel
+        if channel is None and self._channel_ids:
+            cid = int(self._channel_ids[0])
+            try:
+                channel = self.get_channel(cid) or await self.fetch_channel(cid)
+            except Exception as e:
+                logger.warning(f"[alarm] cannot resolve a channel to post to: {e}")
+                return
+        if channel is None:
+            logger.warning("[alarm] no channel available; dropping proactive message.")
+            return
+        try:
+            for chunk in _chunk_for_discord(text):
+                await channel.send(chunk)
+            logger.info("[alarm] proactive message posted to Discord.")
+        except Exception as e:
+            logger.warning(f"[alarm] failed to post proactive message: {e}")
 
     async def _maybe_send_face(
         self, source: discord.Message, face_index: Optional[int]

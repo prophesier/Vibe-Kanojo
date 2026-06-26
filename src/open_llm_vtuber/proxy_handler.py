@@ -23,7 +23,10 @@ class ProxyHandler:
         Args:
             server_url: The WebSocket URL of the actual server
         """
-        self.server_url = server_url
+        # Tag the proxy's own /client-ws connection so the server can tell a
+        # Discord-proxy client apart from a real frontend (for alarm routing).
+        sep = "&" if "?" in server_url else "?"
+        self.server_url = f"{server_url}{sep}source=proxy"
         self.server_ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self.clients: Dict[str, WebSocket] = {}
         self.connected = False
