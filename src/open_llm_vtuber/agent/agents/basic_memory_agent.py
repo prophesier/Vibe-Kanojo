@@ -1192,7 +1192,14 @@ class BasicMemoryAgent(AgentInterface):
                         if ev.get("type") == "_builtin_tool_result":
                             tool_results_for_llm.append(ev["message"])
                         else:
-                            yield ev
+                            # Display marker (e.g. the 🔍 web-search indicator):
+                            # yield it as plain text so the sentence pipeline
+                            # streams it to the UI, exactly as the old web-tool
+                            # loop did. (A bare dict would pass untouched through
+                            # the transformers and be dropped downstream.)
+                            marker = ev.get("text", "")
+                            if marker:
+                                yield marker
 
                 if mcp_calls:
                     if not self._tool_executor:
