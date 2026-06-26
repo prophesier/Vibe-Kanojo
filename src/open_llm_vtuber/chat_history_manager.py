@@ -389,6 +389,16 @@ def get_recent_histories(
     return result
 
 
+def get_latest_history_uid(conf_uid: str) -> str:
+    """Return the most recent NON-EMPTY history uid (or "" if none).
+
+    Used by resume mode to continue the previous conversation instead of
+    starting a fresh session.
+    """
+    recent = get_recent_histories(conf_uid, 1)
+    return recent[-1][0] if recent else ""
+
+
 def rename_history_file(
     conf_uid: str, old_history_uid: str, new_history_uid: str
 ) -> bool:

@@ -22,6 +22,7 @@ from .chat_history_manager import (
     get_history,
     delete_history,
     get_history_list,
+    get_latest_history_uid,
 )
 from .config_manager.utils import scan_config_alts_directory, scan_bg_directory
 from .conversations.conversation_handler import (
@@ -77,6 +78,10 @@ class WebSocketHandler:
         # auto-creating a duplicate session when another is already running.
         self._active_history_uid: Dict[str, str] = {}   # conf_uid → history_uid
         self._session_ref_count: Dict[str, int] = {}    # conf_uid → # clients using it
+
+        # Resume mode (OLV_RESUME=1): the first session creation this launch
+        # continues the previous session instead of starting fresh. One-shot.
+        self._resume_consumed: bool = False
 
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
@@ -529,8 +534,26 @@ class WebSocketHandler:
             else:
                 self._session_ref_count[conf_uid] = old_ref_count
 
-        # --- Create new session and register it globally ---
-        history_uid = create_new_history(conf_uid)
+        # --- Create new session (or, in resume mode, continue the last one) ---
+        resume_uid = ""
+        if (
+            not force
+            and not self._resume_consumed
+            and os.environ.get("OLV_RESUME") == "1"
+        ):
+            self._resume_consumed = True  # one-shot per launch
+            mgr = context.memory_manager
+            # init_agent set this to the latest session at startup (so backfill
+            # skips it); fall back to recomputing if memory is disabled.
+            cand = getattr(mgr, "_current_session_uid", "") if mgr else ""
+            cand = cand or get_latest_history_uid(conf_uid)
+            if cand and get_history(conf_uid, cand, quiet=True):
+                resume_uid = cand
+                logger.info(
+                    f"[resume] Continuing previous session {resume_uid} "
+                    "(no new session, no backfill)."
+                )
+        history_uid = resume_uid or create_new_history(conf_uid)
         if history_uid:
             context.history_uid = history_uid
             self._active_history_uid[conf_uid] = history_uid
