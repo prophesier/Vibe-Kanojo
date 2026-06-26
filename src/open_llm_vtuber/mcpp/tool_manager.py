@@ -25,7 +25,7 @@ class ToolManager:
             formatted_tools_claude or []
         )
 
-        logger.info(
+        logger.debug(
             f"ToolManager initialized with {len(self._formatted_tools_openai)} OpenAI tools and {len(self._formatted_tools_claude)} Claude tools."
         )
 

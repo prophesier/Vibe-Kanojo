@@ -59,24 +59,29 @@ class ServerRegistry:
                 )
                 continue
 
+            # A missing runtime for a server defined in mcp_servers.json is not
+            # an error — the server may simply be unused (not in the character's
+            # mcp_enabled_servers). Log at debug; if such a server IS enabled,
+            # ToolAdapter.get_server_and_tool_info warns "Enabled server not
+            # found" downstream, so the real problem still surfaces.
             command = server_details["command"]
             if command == "npx":
                 if not self.npx_available:
-                    logger.warning(
-                        f"MCPSR: npx is not available. Cannot load server '{server_name}'."
+                    logger.debug(
+                        f"MCPSR: npx is not available. Skipping server '{server_name}'."
                     )
                     continue
             elif command == "uvx":
                 if not self.uvx_available:
-                    logger.warning(
-                        f"MCPSR: uvx is not available. Cannot load server '{server_name}'."
+                    logger.debug(
+                        f"MCPSR: uvx is not available. Skipping server '{server_name}'."
                     )
                     continue
 
             elif command == "node":
                 if not self.node_available:
-                    logger.warning(
-                        f"MCPSR: node is not available. Cannot load server '{server_name}'."
+                    logger.debug(
+                        f"MCPSR: node is not available. Skipping server '{server_name}'."
                     )
                     continue
 
