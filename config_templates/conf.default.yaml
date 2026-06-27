@@ -40,6 +40,10 @@ system_config:
     # them at a cheaper model cuts cost without touching chat quality. Reuses the
     # chat provider's key/endpoint — only the model name changes.
     memory_llm_model: ""
+    # Provider whose key/endpoint memory tasks use (default openai_llm), kept
+    # independent of the chat provider so a Claude chat model doesn't push a gpt
+    # memory model onto the Claude endpoint. Blank = follow the chat provider.
+    memory_llm_provider: "openai_llm"
     # reasoning_effort for memory tasks (none/low/medium/high). Blank = don't
     # send it, i.e. use the model's default. NOTE: gpt-5.1 defaults to "none"
     # (no reasoning), which makes fact extraction lazily return "[]" — set "low"

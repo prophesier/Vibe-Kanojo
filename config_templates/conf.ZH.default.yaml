@@ -37,6 +37,9 @@ system_config:
     # 记忆任务（日记/事实抽取/合并）用的模型。留空=复用主对话模型。这些是大块、不缓存的
     # 一次性调用，指向更便宜的模型能省钱且不影响对话质量。复用主 provider 的 key/端点，只换模型名。
     memory_llm_model: ""
+    # 记忆任务用哪个 provider 的 key/端点（默认 openai_llm），与主对话 provider 解耦，
+    # 避免主对话用 Claude 时把 gpt 记忆模型打到 Claude 端点。留空=跟随主对话 provider。
+    memory_llm_provider: "openai_llm"
     # 记忆任务的推理强度（none/low/medium/high）。留空=不发送，用模型默认。
     # 注意：gpt-5.1 默认 none（不推理），会导致事实抽取摆烂返回 "[]"——记忆模型用
     # gpt-5.1 请设 "low"；gpt-5.5 默认就是 medium，留空即可。不支持该参数的模型会忽略。

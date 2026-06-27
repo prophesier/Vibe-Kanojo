@@ -507,18 +507,29 @@ class ServiceContext:
 
                 # Optional: route memory tasks (diary/fact/consolidate) through a
                 # separate model — they're big, uncached one-shot calls that don't
-                # need the (pricier) chat model. Reuses the chat provider's
-                # key/endpoint, only overriding the model name.
+                # need the (pricier) chat model. Memory uses its own provider
+                # (memory_llm_provider, default openai_llm) so it stays decoupled
+                # from the chat provider — otherwise a Claude chat model would push
+                # a gpt memory model onto the Claude endpoint and fail.
                 if mem_cfg.memory_llm_model:
                     try:
                         from .agent.stateless_llm_factory import LLMFactory
 
-                        provider = (
+                        chat_provider = (
                             agent_config.agent_settings.model_dump()
                             .get("basic_memory_agent", {})
                             .get("llm_provider")
                         )
-                        mcfg = dict(agent_config.llm_configs.model_dump().get(provider, {}))
+                        all_cfgs = agent_config.llm_configs.model_dump()
+                        provider = mem_cfg.memory_llm_provider or chat_provider
+                        mcfg = dict(all_cfgs.get(provider, {}))
+                        if not mcfg:
+                            logger.warning(
+                                f"[memory] provider '{provider}' has no llm_configs "
+                                f"block; falling back to chat provider '{chat_provider}'."
+                            )
+                            provider = chat_provider
+                            mcfg = dict(all_cfgs.get(provider, {}))
                         mcfg.pop("interrupt_method", None)
                         mcfg["model"] = mem_cfg.memory_llm_model
                         memory_llm = LLMFactory.create_llm(

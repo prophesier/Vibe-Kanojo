@@ -147,6 +147,7 @@ class PersistentMemoryConfig(I18nMixin):
     diary_count: int = Field(5, alias="diary_count")
     max_facts: int = Field(50, alias="max_facts")
     memory_llm_model: str = Field("", alias="memory_llm_model")
+    memory_llm_provider: str = Field("openai_llm", alias="memory_llm_provider")
     memory_reasoning_effort: str = Field("", alias="memory_reasoning_effort")
     diary_rag: DiaryRagConfig = Field(default_factory=DiaryRagConfig, alias="diary_rag")
     facts_rag: FactsRagConfig = Field(default_factory=FactsRagConfig, alias="facts_rag")
@@ -169,8 +170,12 @@ class PersistentMemoryConfig(I18nMixin):
             zh="facts.json 中保留的最大事实条数",
         ),
         "memory_llm_model": Description(
-            en="Model for memory tasks (diary/fact/consolidate); blank = reuse the chat model. Reuses the chat provider's key/endpoint",
-            zh="记忆任务（日记/事实/合并）用的模型；留空则复用主对话模型。复用主 provider 的 key/端点",
+            en="Model for memory tasks (diary/fact/consolidate); blank = reuse the chat model. Uses the provider set by memory_llm_provider",
+            zh="记忆任务（日记/事实/合并）用的模型；留空则复用主对话模型。使用 memory_llm_provider 指定的 provider",
+        ),
+        "memory_llm_provider": Description(
+            en="Provider whose key/endpoint memory tasks use (default openai_llm), independent of the chat provider — so a Claude chat model doesn't force a gpt memory model onto the Claude endpoint. Set blank to follow the chat provider",
+            zh="记忆任务使用哪个 provider 的 key/端点（默认 openai_llm），与主对话 provider 解耦——避免主对话用 Claude 时把 gpt 记忆模型打到 Claude 端点上。留空则跟随主对话 provider",
         ),
         "memory_reasoning_effort": Description(
             en="reasoning_effort for memory tasks (none/low/medium/high). Blank = don't send it (use the model's default). gpt-5.1 defaults to 'none' (no reasoning) so set 'low' there; gpt-5.5 already defaults to 'medium' so blank is fine",
