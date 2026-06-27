@@ -391,21 +391,32 @@ class DiscordVTuberBot(discord.Client):
         cfg = self._full_config
         char_cfg = cfg.character_config
         agent_cfg = char_cfg.agent_config
-        llm_provider = agent_cfg.agent_settings.basic_memory_agent.llm_provider
-        if llm_provider not in _CONSOLIDATION_LLM_PROVIDERS:
+        # Memory config lives at the system level.
+        mem_cfg = cfg.system_config.persistent_memory
+
+        # Consolidation is a memory task: use the memory provider/model (default
+        # openai_llm), decoupled from the chat provider — so a Claude chat model
+        # doesn't pull consolidation onto Claude. Fall back to chat if the memory
+        # provider has no config block.
+        chat_provider = agent_cfg.agent_settings.basic_memory_agent.llm_provider
+        provider = mem_cfg.memory_llm_provider or chat_provider
+        llm_cfg = getattr(agent_cfg.llm_configs, provider, None)
+        if llm_cfg is None:
+            provider = chat_provider
+            llm_cfg = getattr(agent_cfg.llm_configs, provider, None)
+
+        if provider not in _CONSOLIDATION_LLM_PROVIDERS:
             return {
                 "ok": False,
                 "before": 0,
                 "after": 0,
                 "merges": [],
                 "message": (
-                    f"Active LLM provider is {llm_provider!r}; facts consolidation "
-                    "is currently enabled only for Claude and OpenAI-compatible "
+                    f"LLM provider {provider!r} for consolidation is currently "
+                    "supported only for Claude and OpenAI-compatible "
                     "chat-completion providers."
                 ),
             }
-
-        llm_cfg = getattr(agent_cfg.llm_configs, llm_provider, None)
         if llm_cfg is None:
             return {
                 "ok": False,
@@ -413,14 +424,15 @@ class DiscordVTuberBot(discord.Client):
                 "after": 0,
                 "merges": [],
                 "message": (
-                    f"Active LLM provider is {llm_provider!r}, but no matching "
-                    "LLM config was found."
+                    f"LLM provider {provider!r} for consolidation has no matching "
+                    "LLM config."
                 ),
             }
-        llm_kwargs = llm_cfg.model_dump(by_alias=True, exclude_none=True)
 
-        # Memory config lives at the system level.
-        mem_cfg = cfg.system_config.persistent_memory
+        llm_kwargs = llm_cfg.model_dump(by_alias=True, exclude_none=True)
+        if mem_cfg.memory_llm_model:
+            llm_kwargs["model"] = mem_cfg.memory_llm_model
+        llm_kwargs.pop("interrupt_method", None)
 
         mem = PersistentMemoryManager(
             conf_uid=char_cfg.conf_uid,
@@ -429,7 +441,7 @@ class DiscordVTuberBot(discord.Client):
             recent_sessions=mem_cfg.recent_sessions,
         )
         llm = StatelessLLMFactory.create_llm(
-            llm_provider=llm_provider,
+            llm_provider=provider,
             system_prompt=None,
             **llm_kwargs,
         )
