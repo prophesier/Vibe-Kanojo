@@ -132,6 +132,13 @@ character_config:
         # 允许角色给自己设定闹钟提醒，到点后以主动消息触发。存本地文件，重启后仍有效。
         # 触发时投递到你最近使用的那一端（否则 Discord，再否则前端）。
         enable_alarms: true
+        # 仅 Claude：会话空闲达到该分钟数时（Anthropic 提示缓存有效期 1 小时），
+        # 提示角色随便说一句以刷新缓存、避免过期。0 关闭。任意端的真实用户消息和
+        # 闹钟回复都会重置计时。
+        claude_cache_keepalive_minutes: 55
+        # 连续提示这么多次仍无真实用户消息就放弃（判定用户已离开）；用户消息清零。
+        # 0 表示不设上限。
+        claude_cache_keepalive_max: 6
 
       hume_ai_agent:
         api_key: ''

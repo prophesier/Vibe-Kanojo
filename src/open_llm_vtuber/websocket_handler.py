@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 from enum import Enum
 import numpy as np
 from loguru import logger
@@ -97,6 +98,17 @@ class WebSocketHandler:
         self._alarm_scheduler: Optional[AlarmScheduler] = None
         self._alarm_delivery_lock = asyncio.Lock()
 
+        # --- Claude prompt-cache keepalive ---
+        # Monotonic time of the last turn that refreshed the cache (any end's
+        # user message, an alarm reply, or a keepalive nudge). When idle nears
+        # the 1h TTL we nudge the character to speak so the cache survives.
+        # None until the first real turn — before that the cache is cold, so
+        # there's nothing to keep alive (and a restart starts fresh: no nudge
+        # fires until a turn actually happens).
+        self._last_turn_at: Optional[float] = None
+        self._keepalive_count: int = 0  # consecutive nudges since a real user msg
+        self._keepalive_task: Optional[asyncio.Task] = None
+
         # Message handlers mapping
         self._message_handlers = self._init_message_handlers()
 
@@ -160,6 +172,7 @@ class WebSocketHandler:
                 "proxy" if source == "proxy" else "frontend"
             )
             self._ensure_alarm_scheduler()
+            self._ensure_keepalive_timer()
 
             await self._send_initial_messages(
                 websocket, client_uid, session_service_context
@@ -679,6 +692,10 @@ class WebSocketHandler:
         # Remember who last drove a turn, so a fired alarm speaks on the end the
         # user was last using.
         self._last_active_uid = client_uid
+        # A real user message (from any end) refreshes the Claude cache and
+        # signals the user is present: reset the keepalive timer and counter.
+        self._last_turn_at = time.monotonic()
+        self._keepalive_count = 0
         await handle_conversation_trigger(
             msg_type=data.get("type", ""),
             data=data,
@@ -791,14 +808,99 @@ class WebSocketHandler:
             )
             self.current_conversation_tasks[client_uid] = task
             await task
+            # A delivered proactive turn (alarm or keepalive) refreshed the cache.
+            self._last_turn_at = time.monotonic()
             logger.info(
-                f"[alarm] proactive turn delivered to {client_uid} "
+                f"[proactive] turn delivered to {client_uid} "
                 f"(end={self._client_end_type.get(client_uid)})."
             )
             return True
         except Exception as e:
-            logger.error(f"[alarm] proactive turn failed for {client_uid}: {e}")
+            logger.error(f"[proactive] turn failed for {client_uid}: {e}")
             return False
+
+    # ------------------------------------------------- Claude cache keepalive
+    _KEEPALIVE_PROMPT = (
+        "【システム】Anthropic のプロンプトキャッシュの保持時間がもうすぐ切れる。"
+        "キャッシュを維持するため、内容は何でもいいので自由に一言話しかけて。"
+    )
+
+    def _bma_cfg(self):
+        try:
+            return (
+                self.default_context_cache.character_config.agent_config.agent_settings.basic_memory_agent
+            )
+        except Exception:
+            return None
+
+    def _claude_active(self) -> bool:
+        bma = self._bma_cfg()
+        return bool(bma and getattr(bma, "llm_provider", "") == "claude_llm")
+
+    def _keepalive_minutes(self) -> int:
+        bma = self._bma_cfg()
+        return int(getattr(bma, "claude_cache_keepalive_minutes", 0) or 0) if bma else 0
+
+    def _keepalive_max(self) -> int:
+        bma = self._bma_cfg()
+        return int(getattr(bma, "claude_cache_keepalive_max", 0) or 0) if bma else 0
+
+    def _ensure_keepalive_timer(self) -> None:
+        """Start the Claude prompt-cache keepalive loop once (Claude only)."""
+        if self._keepalive_task is not None and not self._keepalive_task.done():
+            return
+        if not self._claude_active() or self._keepalive_minutes() <= 0:
+            return
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        logger.info("[keepalive] Claude cache keepalive timer started.")
+
+    async def _keepalive_loop(self) -> None:
+        """When the conversation idles toward Claude's 1h cache TTL, nudge the
+        character to speak so the cache is refreshed instead of expiring."""
+        while True:
+            try:
+                mins = self._keepalive_minutes()
+                if mins <= 0 or not self._claude_active():
+                    await asyncio.sleep(60)
+                    continue
+                if self._last_turn_at is None:
+                    # No turn has warmed the cache yet — nothing to keep alive.
+                    await asyncio.sleep(60)
+                    continue
+                remaining = (mins * 60) - (time.monotonic() - self._last_turn_at)
+                if remaining > 0:
+                    await asyncio.sleep(min(remaining, 60.0))
+                    continue
+                # Idle reached the threshold. Stop once we've nudged enough times
+                # with no real user message in between (assume the user left);
+                # a cap of <=0 means no limit.
+                cap = self._keepalive_max()
+                if cap > 0 and self._keepalive_count >= cap:
+                    await asyncio.sleep(60)
+                    continue
+                await self._fire_keepalive()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[keepalive] loop error: {e}")
+                await asyncio.sleep(60)
+
+    async def _fire_keepalive(self) -> None:
+        """Nudge the character to speak so the Claude prompt cache is refreshed."""
+        async with self._alarm_delivery_lock:
+            target = self._pick_alarm_target()
+            if target is None:
+                return  # no free, connected end right now; the loop retries
+            client_uid, skip_tts = target
+            ok = await self._fire_proactive(
+                client_uid, self._KEEPALIVE_PROMPT, skip_tts
+            )
+            if ok:
+                self._keepalive_count += 1
+                logger.info(
+                    f"[keepalive] cache keepalive fired (#{self._keepalive_count}, "
+                    f"cap={self._keepalive_max() or '∞'})."
+                )
 
     async def _handle_fetch_configs(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
