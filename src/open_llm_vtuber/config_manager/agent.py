@@ -49,6 +49,16 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     # fires later (even across restarts) as a proactive message.
     enable_alarms: Optional[bool] = Field(True, alias="enable_alarms")
 
+    # Claude-only prompt-cache keepalive: when the conversation has been idle
+    # for ~this many minutes (Anthropic's cache TTL is 1h), nudge the character
+    # to say something so the cache is refreshed instead of expiring.
+    claude_cache_keepalive_minutes: Optional[int] = Field(
+        55, alias="claude_cache_keepalive_minutes"
+    )
+    claude_cache_keepalive_max: Optional[int] = Field(
+        6, alias="claude_cache_keepalive_max"
+    )
+
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
             en="LLM provider to use for this agent",
@@ -112,6 +122,29 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
             zh=(
                 "允许角色给自己设定闹钟提醒，到点后以主动消息触发。存本地文件，"
                 "重启后仍有效。（默认：True）"
+            ),
+        ),
+        "claude_cache_keepalive_minutes": Description(
+            en=(
+                "Claude only. If the conversation is idle this many minutes "
+                "(Anthropic's prompt-cache TTL is 1h), nudge the character to "
+                "say something so the cache is refreshed instead of expiring. "
+                "0 disables. (default: 55)"
+            ),
+            zh=(
+                "仅 Claude。会话空闲达到该分钟数时（Anthropic 提示缓存有效期 1 "
+                "小时），提示角色随便说点什么以刷新缓存、避免过期。0 关闭。（默认：55）"
+            ),
+        ),
+        "claude_cache_keepalive_max": Description(
+            en=(
+                "Max consecutive keepalive nudges before giving up (assume the "
+                "user has left); any real user message resets the count. "
+                "(default: 6)"
+            ),
+            zh=(
+                "连续保活提示的最大次数，超过则放弃（判定用户已离开）；任何真实用户"
+                "消息都会清零重新计。（默认：6）"
             ),
         ),
     }

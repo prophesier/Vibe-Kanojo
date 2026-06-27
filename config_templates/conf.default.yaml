@@ -159,6 +159,14 @@ character_config:
         # proactive message. Stored in a local file; survives restarts. A fired
         # alarm is routed to the end you were last using (else Discord, else web).
         enable_alarms: true
+        # Claude only: when the chat has been idle this many minutes (Anthropic's
+        # prompt-cache TTL is 1h), nudge the character to say something so the
+        # cache is refreshed instead of expiring. 0 disables. Any real user
+        # message (from any end) and alarm replies reset the timer.
+        claude_cache_keepalive_minutes: 55
+        # Give up after this many consecutive nudges with no real user message
+        # (assume the user left); a user message resets the count. 0 = no limit.
+        claude_cache_keepalive_max: 6
 
       letta_agent:
         host: 'localhost' # Host address
