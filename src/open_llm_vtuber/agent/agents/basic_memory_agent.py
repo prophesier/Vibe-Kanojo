@@ -938,6 +938,7 @@ class BasicMemoryAgent(AgentInterface):
         current_turn_text = ""
         pending_tool_calls = []
         current_assistant_message_content = []
+        emitted_markers: set = set()  # inline tool tags shown once per turn
 
         while True:
             stream = self._llm.chat_completion(messages, self._build_system_for_llm(), tools=tools)
@@ -972,6 +973,13 @@ class BasicMemoryAgent(AgentInterface):
                             "input": tool_call_data["input"],
                         }
                     )
+                elif event["type"] == "web_search_marker":
+                    # Inline 🔍/🔗 tag from Claude's native web tools: surface it
+                    # (and let it persist to history) like the OpenAI path. Not
+                    # added to the assistant message echoed back to Claude.
+                    mk = event.get("text", "")
+                    if mk:
+                        yield mk
                 # elif event["type"] == "message_delta":
                 #     if event["data"]["delta"].get("stop_reason"):
                 #         stop_reason = event["data"]["delta"].get("stop_reason")
@@ -1006,35 +1014,66 @@ class BasicMemoryAgent(AgentInterface):
                     if assistant_text_for_memory:
                         self._add_message(assistant_text_for_memory, "assistant")
 
-                tool_results_for_llm = []
-                if not self._tool_executor:
-                    logger.error(
-                        "Claude Tool interaction requested but ToolExecutor is not available."
-                    )
-                    yield "[Error: ToolExecutor not configured]"
-                    return
+                # Split: built-in ALARM tools handled in-process (provider-
+                # agnostic); everything else goes to the MCP executor.
+                alarm_calls = [
+                    c for c in pending_tool_calls
+                    if c.get("name") in self._ALARM_TOOL_NAMES
+                ]
+                mcp_calls = [
+                    c for c in pending_tool_calls
+                    if c.get("name") not in self._ALARM_TOOL_NAMES
+                ]
 
-                tool_executor_iterator = self._tool_executor.execute_tools(
-                    tool_calls=pending_tool_calls,
-                    caller_mode="Claude",
-                )
-                try:
-                    while True:
-                        update = await anext(tool_executor_iterator)
-                        if update.get("type") == "final_tool_results":
-                            tool_results_for_llm = update.get("results", [])
-                            break
-                        else:
-                            yield update
-                except StopAsyncIteration:
-                    logger.warning(
-                        "Tool executor finished without final results marker."
+                tool_results_for_llm = []
+
+                for c in alarm_calls:
+                    marker, result = await self._run_alarm_tool(
+                        c.get("name", ""), c.get("input") or {}
                     )
+                    if marker:
+                        yield marker
+                    tool_results_for_llm.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": c["id"],
+                            "content": json.dumps(result, ensure_ascii=False),
+                            "is_error": bool(result.get("error"))
+                            or result.get("status") == "error",
+                        }
+                    )
+
+                if mcp_calls:
+                    for c in mcp_calls:
+                        mk = self._mcp_tool_marker(c.get("name", ""))
+                        if mk and mk not in emitted_markers:
+                            emitted_markers.add(mk)
+                            yield mk
+                    if not self._tool_executor:
+                        logger.error(
+                            "Claude MCP tool call requested but ToolExecutor is not available."
+                        )
+                        yield "[Error: ToolExecutor not configured]"
+                        return
+                    tool_executor_iterator = self._tool_executor.execute_tools(
+                        tool_calls=mcp_calls,
+                        caller_mode="Claude",
+                    )
+                    try:
+                        while True:
+                            update = await anext(tool_executor_iterator)
+                            if update.get("type") == "final_tool_results":
+                                tool_results_for_llm.extend(update.get("results", []))
+                                break
+                            else:
+                                yield update
+                    except StopAsyncIteration:
+                        logger.warning(
+                            "Tool executor finished without final results marker."
+                        )
 
                 if tool_results_for_llm:
                     messages.append({"role": "user", "content": tool_results_for_llm})
-
-                # stop_reason = None
                 continue
             else:
                 if current_turn_text:
@@ -1293,56 +1332,40 @@ class BasicMemoryAgent(AgentInterface):
             await self._maybe_inject_diary_rag(input_data)
             await self._maybe_inject_facts_rag(input_data)
             messages = self._to_messages(input_data)
-            tools = None
-            tool_mode = None
-            llm_supports_native_tools = False
-
-            if self._use_mcpp and self._tool_manager:
-                if isinstance(self._llm, ClaudeAsyncLLM):
-                    tool_mode = "Claude"
-                    tools = self._formatted_tools_claude
-                    llm_supports_native_tools = True
-                elif isinstance(self._llm, OpenAICompatibleAsyncLLM):
-                    tool_mode = "OpenAI"
-                    tools = self._formatted_tools_openai
-                    llm_supports_native_tools = True
-                else:
-                    logger.warning(
-                        f"LLM type {type(self._llm)} not explicitly handled for tool mode determination."
+            # Claude path: MCP tools (if enabled) + built-in ALARM tools share
+            # the Claude tool loop. web_search/fetch are NOT added here — Claude
+            # uses Anthropic's native server tools for those.
+            if isinstance(self._llm, ClaudeAsyncLLM):
+                claude_tools: List[Dict[str, Any]] = []
+                if self._use_mcpp and self._tool_manager:
+                    claude_tools.extend(self._formatted_tools_claude or [])
+                if self._alarm_store is not None:
+                    claude_tools.extend(self._build_alarm_tools_claude())
+                if claude_tools:
+                    logger.debug(
+                        f"Starting Claude tool loop with {len(claude_tools)} tools."
                     )
+                    async for output in self._claude_tool_interaction_loop(
+                        messages, claude_tools
+                    ):
+                        yield output
+                    return
 
-                if llm_supports_native_tools and not tools:
-                    logger.warning(
-                        f"No tools available/formatted for '{tool_mode}' mode, despite MCP being enabled."
-                    )
-
-            # Claude + MCP keeps its dedicated loop.
-            if self._use_mcpp and tool_mode == "Claude":
-                logger.debug(
-                    f"Starting Claude tool interaction loop with {len(tools)} tools."
-                )
-                async for output in self._claude_tool_interaction_loop(
-                    messages, tools if tools else []
-                ):
-                    yield output
-                return
-
-            # OpenAI path: MCP tools (if enabled) and built-in tools (web
-            # search/fetch, and later alarms) share ONE tool-calling loop,
-            # dispatched by name. This is what lets the built-in Brave web tools
-            # run even while an MCP server (e.g. uber) is enabled — they used to
-            # be mutually exclusive.
+            # OpenAI path: MCP tools (if enabled) + built-in tools (web
+            # search/fetch + alarms) share ONE tool-calling loop, dispatched by
+            # name — so the built-in Brave web tools run even alongside MCP.
             if isinstance(self._llm, OpenAICompatibleAsyncLLM):
+                mcp_tools = (
+                    self._formatted_tools_openai
+                    if (self._use_mcpp and self._tool_manager)
+                    else []
+                )
                 builtin_tools = self._build_builtin_tools_openai()
-                openai_tools: List[Dict[str, Any]] = []
-                if self._use_mcpp and tool_mode == "OpenAI" and tools:
-                    openai_tools.extend(tools)
-                openai_tools.extend(builtin_tools)
+                openai_tools = list(mcp_tools or []) + builtin_tools
                 if openai_tools:
                     logger.debug(
                         f"Starting OpenAI tool loop: {len(openai_tools)} tools "
-                        f"(mcp={len(openai_tools) - len(builtin_tools)}, "
-                        f"builtin={len(builtin_tools)})."
+                        f"(mcp={len(mcp_tools or [])}, builtin={len(builtin_tools)})."
                     )
                     async for output in self._openai_tool_interaction_loop(
                         messages, openai_tools
@@ -1540,6 +1563,21 @@ class BasicMemoryAgent(AgentInterface):
             },
         ]
 
+    def _build_alarm_tools_claude(self) -> List[Dict[str, Any]]:
+        """Alarm tools in Claude's schema shape (input_schema, no function
+        wrapper), derived from the OpenAI definitions so they stay in sync."""
+        out: List[Dict[str, Any]] = []
+        for t in self._build_alarm_tools_openai():
+            fn = t["function"]
+            out.append(
+                {
+                    "name": fn["name"],
+                    "description": fn["description"],
+                    "input_schema": fn["parameters"],
+                }
+            )
+        return out
+
     async def _run_builtin_tool_call(
         self, tc: ToolCallObject, budget: Dict[str, int]
     ) -> AsyncIterator[Dict[str, Any]]:
@@ -1589,104 +1627,10 @@ class BasicMemoryAgent(AgentInterface):
                 result = await web_fetch(
                     url, max_chars=int(cfg.get("max_fetch_chars", 20000) or 20000)
                 )
-        elif name == "set_alarm":
-            if self._alarm_store is None:
-                result = {"error": "alarm feature is not available"}
-            else:
-                note = str(args.get("note", "")).strip()
-                fire_at_utc, err = resolve_fire_at(
-                    in_minutes=args.get("in_minutes"), at=args.get("at")
-                )
-                if not note:
-                    result = {
-                        "status": "error",
-                        "message": "note（思い出す内容）が必要です。",
-                    }
-                elif err:
-                    result = {
-                        "status": "error",
-                        "message": f"時刻を解釈できませんでした: {err}",
-                    }
-                else:
-                    force = bool(args.get("force", False))
-                    dup = (
-                        None
-                        if force
-                        else await self._alarm_store.find_near(fire_at_utc)
-                    )
-                    if dup is not None:
-                        # Near-duplicate: don't create. Hand the existing alarm
-                        # back so the model can reconsider in this same turn and,
-                        # if it still judges another is needed, re-call with
-                        # force=true. No user involvement required.
-                        result = {
-                            "status": "duplicate_nearby",
-                            "message": (
-                                f"近い時刻（{format_local(dup['fire_at_utc'])}）に"
-                                f"既にアラームがある:「{dup.get('note', '')}」"
-                                f"(id: {dup['id']})。同じ用件ならこれ以上設定しなくてよい。"
-                                "別の用件で本当に必要だと自分で判断する場合のみ、"
-                                "force=true を付けて set_alarm を呼び直すこと。"
-                            ),
-                            "existing": {
-                                "id": dup["id"],
-                                "at_local": format_local(dup["fire_at_utc"]),
-                                "note": dup.get("note", ""),
-                            },
-                        }
-                    else:
-                        record = await self._alarm_store.add(
-                            fire_at_utc=fire_at_utc, note=note
-                        )
-                        local = format_local(record["fire_at_utc"])
-                        yield {
-                            "type": "tool_marker",
-                            "text": f"\n⏰ *Alarm set: {local}*\n",
-                        }
-                        result = {
-                            "status": "ok",
-                            "message": f"アラームを {local} に設定しました。",
-                            "id": record["id"],
-                            "at_local": local,
-                            "note": note,
-                        }
-        elif name == "list_alarms":
-            if self._alarm_store is None:
-                result = {"error": "alarm feature is not available"}
-            else:
-                pending = await self._alarm_store.list_pending()
-                result = {
-                    "status": "ok",
-                    "count": len(pending),
-                    "alarms": [
-                        {
-                            "id": a["id"],
-                            "at_local": format_local(a["fire_at_utc"]),
-                            "note": a.get("note", ""),
-                        }
-                        for a in pending
-                    ],
-                }
-        elif name == "cancel_alarm":
-            if self._alarm_store is None:
-                result = {"error": "alarm feature is not available"}
-            else:
-                alarm_id = str(args.get("alarm_id", "")).strip()
-                record = await self._alarm_store.cancel(alarm_id)
-                if record is None:
-                    result = {
-                        "status": "error",
-                        "message": (
-                            f"アラーム {alarm_id} が見つかりませんでした"
-                            "（既に取り消し済み、または通知済みかもしれません）。"
-                        ),
-                    }
-                else:
-                    result = {
-                        "status": "ok",
-                        "message": "アラームを取り消しました。",
-                        "id": alarm_id,
-                    }
+        elif name in self._ALARM_TOOL_NAMES:
+            marker, result = await self._run_alarm_tool(name, args)
+            if marker:
+                yield {"type": "tool_marker", "text": marker}
         else:
             result = {"error": f"unknown builtin tool {name!r}"}
 
@@ -1698,6 +1642,87 @@ class BasicMemoryAgent(AgentInterface):
                 "content": json.dumps(result, ensure_ascii=False),
             },
         }
+
+    _ALARM_TOOL_NAMES = ("set_alarm", "list_alarms", "cancel_alarm")
+
+    async def _run_alarm_tool(self, name: str, args: Dict[str, Any]) -> tuple:
+        """Execute one alarm tool call. Returns (marker_text|None, result_dict).
+        Shared by the OpenAI and Claude loops — alarms are provider-agnostic."""
+        if self._alarm_store is None:
+            return None, {"error": "alarm feature is not available"}
+        if name == "set_alarm":
+            note = str(args.get("note", "")).strip()
+            fire_at_utc, err = resolve_fire_at(
+                in_minutes=args.get("in_minutes"), at=args.get("at")
+            )
+            if not note:
+                return None, {"status": "error", "message": "note（思い出す内容）が必要です。"}
+            if err:
+                return None, {
+                    "status": "error",
+                    "message": f"時刻を解釈できませんでした: {err}",
+                }
+            force = bool(args.get("force", False))
+            dup = None if force else await self._alarm_store.find_near(fire_at_utc)
+            if dup is not None:
+                # Near-duplicate: don't create. Hand the existing alarm back so the
+                # model can reconsider this same turn and, if it still judges
+                # another is needed, re-call with force=true.
+                return None, {
+                    "status": "duplicate_nearby",
+                    "message": (
+                        f"近い時刻（{format_local(dup['fire_at_utc'])}）に"
+                        f"既にアラームがある:「{dup.get('note', '')}」"
+                        f"(id: {dup['id']})。同じ用件ならこれ以上設定しなくてよい。"
+                        "別の用件で本当に必要だと自分で判断する場合のみ、"
+                        "force=true を付けて set_alarm を呼び直すこと。"
+                    ),
+                    "existing": {
+                        "id": dup["id"],
+                        "at_local": format_local(dup["fire_at_utc"]),
+                        "note": dup.get("note", ""),
+                    },
+                }
+            record = await self._alarm_store.add(fire_at_utc=fire_at_utc, note=note)
+            local = format_local(record["fire_at_utc"])
+            return f"\n⏰ *Alarm set: {local}*\n", {
+                "status": "ok",
+                "message": f"アラームを {local} に設定しました。",
+                "id": record["id"],
+                "at_local": local,
+                "note": note,
+            }
+        if name == "list_alarms":
+            pending = await self._alarm_store.list_pending()
+            return None, {
+                "status": "ok",
+                "count": len(pending),
+                "alarms": [
+                    {
+                        "id": a["id"],
+                        "at_local": format_local(a["fire_at_utc"]),
+                        "note": a.get("note", ""),
+                    }
+                    for a in pending
+                ],
+            }
+        if name == "cancel_alarm":
+            alarm_id = str(args.get("alarm_id", "")).strip()
+            record = await self._alarm_store.cancel(alarm_id)
+            if record is None:
+                return None, {
+                    "status": "error",
+                    "message": (
+                        f"アラーム {alarm_id} が見つかりませんでした"
+                        "（既に取り消し済み、または通知済みかもしれません）。"
+                    ),
+                }
+            return None, {
+                "status": "ok",
+                "message": "アラームを取り消しました。",
+                "id": alarm_id,
+            }
+        return None, {"error": f"unknown alarm tool {name!r}"}
 
     async def chat(
         self,
