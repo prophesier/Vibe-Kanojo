@@ -35,6 +35,11 @@ def _sniff_image_media_type(base64_data: str, declared: str) -> str:
 
 
 class AsyncLLM(StatelessLLMInterface):
+    # When thinking is on, the reply shares the max_tokens budget with the
+    # (billed) thinking tokens. Raise the ceiling so reasoning doesn't truncate
+    # a normal-length reply.
+    _THINKING_MAX_TOKENS_FLOOR = 8000
+
     def __init__(
         self,
         model: str = "claude-3-haiku-latest",
@@ -46,6 +51,8 @@ class AsyncLLM(StatelessLLMInterface):
         enable_web_fetch: bool = False,
         max_web_fetches: int = 5,
         max_fetch_tokens: int = 30000,
+        thinking: bool = False,
+        thinking_effort: str = "medium",
     ):
         """
         Initialize Claude LLM.
@@ -72,6 +79,8 @@ class AsyncLLM(StatelessLLMInterface):
         self._enable_web_fetch = enable_web_fetch
         self._max_web_fetches = max_web_fetches
         self._max_fetch_tokens = max_fetch_tokens
+        self._thinking = thinking
+        self._thinking_effort = thinking_effort
         if enable_web_search:
             logger.info(
                 f"Claude native web search enabled (max {max_web_searches}/reply)."
@@ -80,6 +89,10 @@ class AsyncLLM(StatelessLLMInterface):
             logger.info(
                 f"Claude native web fetch enabled "
                 f"(max {max_web_fetches}/reply, max {max_fetch_tokens} tokens/page)."
+            )
+        if thinking:
+            logger.info(
+                f"Claude extended thinking enabled (adaptive, effort={thinking_effort})."
             )
 
         # Initialize Claude client. The extended-cache-ttl beta header lets us
@@ -182,6 +195,7 @@ class AsyncLLM(StatelessLLMInterface):
             - {"type": "tool_use_start", "data": {"id": ..., "name": ..., "input": None}}
             - {"type": "tool_input_delta", "tool_id": ..., "partial_json": "..."} # Optional
             - {"type": "tool_use_complete", "data": {"id": ..., "name": ..., "input": {...}}}
+            - {"type": "thinking_complete", "data": {"type": "thinking", "thinking": ..., "signature": ...}}
             - {"type": "message_delta", "data": ...} # e.g., stop_reason
             - {"type": "message_stop"}
             - {"type": "error", "message": "..."}
@@ -233,12 +247,29 @@ class AsyncLLM(StatelessLLMInterface):
             logger.debug(f"Sending messages to Claude API: {converted_messages}")
             logger.debug(f"Tools provided: {final_tools}")
 
+            # Extended thinking (adaptive). Skipped for one-shot utility calls
+            # (disable_server_tools) — fact extraction / diary / pruning don't
+            # benefit from a reasoning pass and shouldn't pay for it. Passed via
+            # extra_body so it goes straight to the API regardless of the SDK
+            # version's typed-param support for thinking/output_config.
+            think_kwargs: Dict[str, Any] = {}
+            if self._thinking and not disable_server_tools:
+                extra_body: Dict[str, Any] = {
+                    "thinking": {"type": "adaptive", "display": "summarized"}
+                }
+                if self._thinking_effort:
+                    extra_body["output_config"] = {"effort": self._thinking_effort}
+                think_kwargs["extra_body"] = extra_body
+                if max_tokens < self._THINKING_MAX_TOKENS_FLOOR:
+                    max_tokens = self._THINKING_MAX_TOKENS_FLOOR
+
             async with self.client.messages.stream(
                 messages=converted_messages,
                 system=system if system else (self.system if self.system else ""),
                 model=self.model,
                 max_tokens=max_tokens,
                 tools=final_tools if final_tools else NOT_GIVEN,
+                **think_kwargs,
             ) as stream:
                 current_tool_call_info = None
                 partial_json_accumulator = ""
@@ -249,6 +280,15 @@ class AsyncLLM(StatelessLLMInterface):
                 server_tool_index = None
                 server_tool_name = ""
                 server_tool_input_json = ""
+                # Track an in-flight thinking block (adaptive thinking): collect
+                # the summary text + signature so we can log it and hand the
+                # complete block back for tool-loop replay (Anthropic requires
+                # thinking blocks echoed verbatim, signature included, ahead of
+                # any tool_use in the same turn).
+                thinking_index = None
+                thinking_text = ""
+                thinking_signature = ""
+                thinking_redacted_data = None
 
                 async for event in stream:
                     if event.type == "message_start":
@@ -256,8 +296,12 @@ class AsyncLLM(StatelessLLMInterface):
                         usage = getattr(event.message, "usage", None)
                         if usage:
                             fresh = getattr(usage, "input_tokens", 0) or 0
-                            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
-                            cache_write = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                            cache_read = (
+                                getattr(usage, "cache_read_input_tokens", 0) or 0
+                            )
+                            cache_write = (
+                                getattr(usage, "cache_creation_input_tokens", 0) or 0
+                            )
                             total_input = fresh + cache_read + cache_write
                             hit_pct = (
                                 (cache_read / total_input * 100) if total_input else 0
@@ -276,6 +320,18 @@ class AsyncLLM(StatelessLLMInterface):
                         )
                         if event.content_block.type == "text":
                             pass  # Handled by text_delta
+                        elif event.content_block.type == "thinking":
+                            thinking_index = event.index
+                            thinking_text = ""
+                            thinking_signature = ""
+                            thinking_redacted_data = None
+                        elif event.content_block.type == "redacted_thinking":
+                            thinking_index = event.index
+                            thinking_text = ""
+                            thinking_signature = ""
+                            thinking_redacted_data = getattr(
+                                event.content_block, "data", ""
+                            )
                         elif event.content_block.type == "tool_use":
                             current_tool_call_info = {
                                 "id": event.content_block.id,
@@ -295,9 +351,7 @@ class AsyncLLM(StatelessLLMInterface):
                             # Native server-side tool (e.g. web_search).
                             # Anthropic executes it inline; we only log it.
                             server_tool_index = event.index
-                            server_tool_name = getattr(
-                                event.content_block, "name", "?"
-                            )
+                            server_tool_name = getattr(event.content_block, "name", "?")
                             server_tool_input_json = ""
                             tag = (
                                 "web_fetch"
@@ -339,6 +393,10 @@ class AsyncLLM(StatelessLLMInterface):
                         if event.delta.type == "text_delta":
                             text_emitted = True
                             yield {"type": "text_delta", "text": event.delta.text}
+                        elif event.delta.type == "thinking_delta":
+                            thinking_text += getattr(event.delta, "thinking", "")
+                        elif event.delta.type == "signature_delta":
+                            thinking_signature += getattr(event.delta, "signature", "")
                         elif event.delta.type == "input_json_delta":
                             if (
                                 current_tool_call_info
@@ -364,6 +422,31 @@ class AsyncLLM(StatelessLLMInterface):
                         logger.debug(
                             f"Stream: content_block_stop - Index: {event.index}"
                         )
+                        # Thinking block finished — log the summary and hand the
+                        # complete block (text + signature, or redacted data)
+                        # back so the tool loop can replay it. Not shown to the
+                        # user and not stored to chat history.
+                        if thinking_index is not None and event.index == thinking_index:
+                            if thinking_redacted_data is not None:
+                                block = {
+                                    "type": "redacted_thinking",
+                                    "data": thinking_redacted_data,
+                                }
+                                logger.info("[thinking] (redacted)")
+                            else:
+                                block = {
+                                    "type": "thinking",
+                                    "thinking": thinking_text,
+                                    "signature": thinking_signature,
+                                }
+                                summary = thinking_text.strip()
+                                if summary:
+                                    logger.info(f"[thinking] {summary}")
+                            yield {"type": "thinking_complete", "data": block}
+                            thinking_index = None
+                            thinking_text = ""
+                            thinking_signature = ""
+                            thinking_redacted_data = None
                         # Server-side tool input finished — parse the JSON,
                         # log it, and emit the appropriate inline marker.
                         if (
@@ -392,9 +475,7 @@ class AsyncLLM(StatelessLLMInterface):
                                 }
                             elif server_tool_name == "web_fetch":
                                 url_str = str(parsed.get("url", "")).strip()
-                                logger.info(
-                                    f"[web_fetch] url: {url_str or '(empty)'}"
-                                )
+                                logger.info(f"[web_fetch] url: {url_str or '(empty)'}")
                                 shown = url_str[:200] if url_str else "..."
                                 yield {
                                     "type": "web_search_marker",
@@ -446,12 +527,8 @@ class AsyncLLM(StatelessLLMInterface):
                         # fetch is free but content tokens hit input.
                         server_use = getattr(event.usage, "server_tool_use", None)
                         if server_use:
-                            n_searches = getattr(
-                                server_use, "web_search_requests", 0
-                            )
-                            n_fetches = getattr(
-                                server_use, "web_fetch_requests", 0
-                            )
+                            n_searches = getattr(server_use, "web_search_requests", 0)
+                            n_fetches = getattr(server_use, "web_fetch_requests", 0)
                             if n_searches:
                                 logger.info(
                                     f"[web_search] this reply used {n_searches} "

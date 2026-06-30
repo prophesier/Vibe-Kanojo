@@ -234,6 +234,16 @@ character_config:
         # Per-page truncation cap: any fetched page over this many tokens
         # is truncated. Caps input cost on huge docs / PDFs.
         max_fetch_tokens: 30000
+        # Extended thinking (adaptive): Claude reasons before replying, which
+        # helps with multi-step logic, time/context tracking, and actually
+        # calling tools instead of fabricating. Adds latency and bills thinking
+        # tokens as output; adaptive means simple turns skip it. The reply
+        # token ceiling is auto-raised when this is on so reasoning doesn't
+        # truncate the reply. The reasoning summary is logged ([thinking]),
+        # never spoken or saved to chat history.
+        thinking: false
+        # Thinking depth when 'thinking' is on: low | medium | high | max.
+        thinking_effort: 'medium'
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>'
