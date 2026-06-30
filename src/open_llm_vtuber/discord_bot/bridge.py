@@ -88,16 +88,23 @@ class OLVBridge:
         self._turn_lock = asyncio.Lock()
         # Resolves when an expression-capture-complete arrives (for /refresh-faces).
         self._capture_future: Optional[asyncio.Future] = None
-        # Server-initiated (proactive) turns — e.g. a fired alarm — arrive with
-        # no pending request. Buffer their text and flush on chain-end.
-        self._proactive_callback: Optional[Callable[[str], Awaitable[None]]] = None
+        # Server-initiated (proactive) turns — e.g. a fired alarm or a cache
+        # keepalive — arrive with no pending request. Buffer their text + face
+        # and flush on chain-end.
+        self._proactive_callback: Optional[
+            Callable[[str, Optional[int]], Awaitable[None]]
+        ] = None
         self._proactive_parts: list[str] = []
+        # Expression face for the in-flight proactive turn (primary wins, else
+        # first expression seen) — mirrors _current_turn.result.face_index.
+        self._proactive_face: Optional[int] = None
 
     def set_proactive_callback(
-        self, cb: Callable[[str], Awaitable[None]]
+        self, cb: Callable[[str, Optional[int]], Awaitable[None]]
     ) -> None:
-        """Register a callback invoked with the text of an unsolicited turn the
-        server pushes (no pending request), such as a fired alarm."""
+        """Register a callback invoked with (text, face_index) of an unsolicited
+        turn the server pushes (no pending request) — a fired alarm or a cache
+        keepalive. ``face_index`` is the Live2D expression for that turn, or None."""
         self._proactive_callback = cb
 
     @property
@@ -145,9 +152,7 @@ class OLVBridge:
         self._capture_future = loop.create_future()
         try:
             async with self._send_lock:
-                await self._ws.send(
-                    json.dumps({"type": "request-expression-capture"})
-                )
+                await self._ws.send(json.dumps({"type": "request-expression-capture"}))
             return await asyncio.wait_for(self._capture_future, timeout=timeout)
         finally:
             self._capture_future = None
@@ -304,14 +309,23 @@ class OLVBridge:
             # Pick the face for this turn: the LLM-marked primary wins; otherwise
             # fall back to the first expression seen.
             actions = data.get("actions") or {}
+            primary = actions.get("primary_expression")
             if self._current_turn is not None:
-                primary = actions.get("primary_expression")
                 if primary is not None:
                     self._current_turn.result.face_index = primary
                 elif self._current_turn.result.face_index is None:
                     exprs = actions.get("expressions") or []
                     if exprs:
                         self._current_turn.result.face_index = exprs[0]
+            else:
+                # Proactive turn (no pending request): capture its face too, so
+                # alarms / keepalive posts carry an expression like normal replies.
+                if primary is not None:
+                    self._proactive_face = primary
+                elif self._proactive_face is None:
+                    exprs = actions.get("expressions") or []
+                    if exprs:
+                        self._proactive_face = exprs[0]
             return
 
         if msg_type == "full-text":
@@ -375,13 +389,16 @@ class OLVBridge:
             turn.done.set()
 
     async def _flush_proactive(self) -> None:
-        """Hand a completed proactive turn's text to the callback (if any)."""
+        """Hand a completed proactive turn's text + face to the callback (if any)."""
         if not self._proactive_parts:
+            self._proactive_face = None
             return
         text = " ".join(p.strip() for p in self._proactive_parts if p).strip()
+        face = self._proactive_face
         self._proactive_parts = []
+        self._proactive_face = None
         if text and self._proactive_callback is not None:
             try:
-                await self._proactive_callback(text)
+                await self._proactive_callback(text, face)
             except Exception as e:
                 logger.warning(f"proactive callback raised: {e}")

@@ -148,9 +148,7 @@ class DiscordVTuberBot(discord.Client):
         )
         async def restart(interaction: discord.Interaction) -> None:  # noqa: ARG001
             if interaction.user.id != self._admin_user_id:
-                await interaction.response.send_message(
-                    "Unauthorized.", ephemeral=True
-                )
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
             restart_bat = self._project_root / "restart.bat"
             if not restart_bat.exists():
@@ -192,9 +190,7 @@ class DiscordVTuberBot(discord.Client):
             lines: int = 30,
         ) -> None:
             if interaction.user.id != self._admin_user_id:
-                await interaction.response.send_message(
-                    "Unauthorized.", ephemeral=True
-                )
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
             lines = max(1, min(200, lines))
             await interaction.response.defer(ephemeral=True)
@@ -234,9 +230,7 @@ class DiscordVTuberBot(discord.Client):
         )
         async def status_cmd(interaction: discord.Interaction) -> None:
             if interaction.user.id != self._admin_user_id:
-                await interaction.response.send_message(
-                    "Unauthorized.", ephemeral=True
-                )
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=True)
 
@@ -261,7 +255,9 @@ class DiscordVTuberBot(discord.Client):
                 value=f"`{commit}`" if commit else "(unknown)",
                 inline=False,
             )
-            embed.set_footer(text=f"Reported {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            embed.set_footer(
+                text=f"Reported {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            )
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         @self._tree.command(
@@ -270,9 +266,7 @@ class DiscordVTuberBot(discord.Client):
         )
         async def refresh_faces_cmd(interaction: discord.Interaction) -> None:
             if interaction.user.id != self._admin_user_id:
-                await interaction.response.send_message(
-                    "Unauthorized.", ephemeral=True
-                )
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
             if self._bridge is None or not self._bridge.is_connected:
                 await interaction.response.send_message(
@@ -314,9 +308,7 @@ class DiscordVTuberBot(discord.Client):
         )
         async def consolidate_cmd(interaction: discord.Interaction) -> None:
             if interaction.user.id != self._admin_user_id:
-                await interaction.response.send_message(
-                    "Unauthorized.", ephemeral=True
-                )
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
             if self._full_config is None:
                 await interaction.response.send_message(
@@ -350,13 +342,14 @@ class DiscordVTuberBot(discord.Client):
             embed.add_field(name="Before", value=str(result["before"]), inline=True)
             embed.add_field(name="After", value=str(result["after"]), inline=True)
             embed.add_field(
-                name="Merge groups", value=str(len(result.get("merges", []))), inline=True
+                name="Merge groups",
+                value=str(len(result.get("merges", []))),
+                inline=True,
             )
             # Show up to 5 merge groups in the embed; truncate fact strings.
             for m in result.get("merges", [])[:5]:
                 src_lines = "\n".join(
-                    f"← [{s['date']}] {s['fact'][:60]}"
-                    for s in m["sources"]
+                    f"← [{s['date']}] {s['fact'][:60]}" for s in m["sources"]
                 )
                 embed.add_field(
                     name=f"→ {m['into'][:200]}",
@@ -371,7 +364,9 @@ class DiscordVTuberBot(discord.Client):
                     )
                 )
             else:
-                embed.set_footer(text="Active session unaffected. Restart OLV to apply.")
+                embed.set_footer(
+                    text="Active session unaffected. Restart OLV to apply."
+                )
             await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _run_facts_consolidation(self) -> dict:
@@ -624,7 +619,9 @@ class DiscordVTuberBot(discord.Client):
             value="完了" if settled else "進行中の可能性",
             inline=True,
         )
-        embed.set_footer(text="このメッセージはシステム通知であり、会話履歴には記録されません。")
+        embed.set_footer(
+            text="このメッセージはシステム通知であり、会話履歴には記録されません。"
+        )
 
         channel = None
         if channel_id:
@@ -758,7 +755,7 @@ class DiscordVTuberBot(discord.Client):
                 delivered = False
 
         # Show the expression face at the end, only when it changed from last time.
-        await self._maybe_send_face(source, result.face_index)
+        await self._maybe_send_face(source.channel, result.face_index)
 
         if delivered:
             logger.info(f"Reply for req={result.request_id} delivered to Discord.")
@@ -773,9 +770,10 @@ class DiscordVTuberBot(discord.Client):
                 f"Reply for req={result.request_id} had partial error: {result.error}"
             )
 
-    async def _on_proactive(self, text: str) -> None:
-        """Post a server-initiated (proactive) message — e.g. a fired alarm — to
-        the last active channel, falling back to the first configured channel."""
+    async def _on_proactive(self, text: str, face_index: Optional[int] = None) -> None:
+        """Post a server-initiated (proactive) message — a fired alarm or a cache
+        keepalive — to the last active channel, falling back to the first
+        configured channel. Sends the expression face too, like a normal reply."""
         if not text:
             return
         channel = self._last_channel
@@ -792,14 +790,16 @@ class DiscordVTuberBot(discord.Client):
         try:
             for chunk in _chunk_for_discord(text):
                 await channel.send(chunk)
+            await self._maybe_send_face(channel, face_index)
             logger.info("[alarm] proactive message posted to Discord.")
         except Exception as e:
             logger.warning(f"[alarm] failed to post proactive message: {e}")
 
     async def _maybe_send_face(
-        self, source: discord.Message, face_index: Optional[int]
+        self, channel: discord.abc.Messageable, face_index: Optional[int]
     ) -> None:
-        """Attach the cached expression face PNG, but only when it changed.
+        """Attach the cached expression face PNG to ``channel``, but only when it
+        changed.
 
         Faces are produced by ``/refresh-faces`` into
         ``cache/discord_faces/<conf_uid>/<index>.png``.
@@ -828,7 +828,7 @@ class DiscordVTuberBot(discord.Client):
                 buf = io.BytesIO()
                 out.save(buf, format="PNG")
             buf.seek(0)
-            await source.channel.send(
+            await channel.send(
                 file=discord.File(buf, filename=f"face_{face_index}.png")
             )
             self._last_face_index = face_index
