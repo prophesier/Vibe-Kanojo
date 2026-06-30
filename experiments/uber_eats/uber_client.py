@@ -39,11 +39,20 @@ _CALL_TIMEOUT_MS = 15000  # per API call; well under the MCP client's read timeo
 # Header keys worth replaying (stable auth/session/location). x-uber-request-id
 # is regenerated per call; cookies are supplied by the context, not here.
 _REPLAY_HEADER_KEYS = {
-    "x-csrf-token", "x-uber-ciid", "x-uber-client-gitref", "x-uber-session-id",
-    "x-uber-device-location-latitude", "x-uber-device-location-longitude",
-    "x-uber-target-location-latitude", "x-uber-target-location-longitude",
-    "user-agent", "accept-language", "content-type",
-    "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+    "x-csrf-token",
+    "x-uber-ciid",
+    "x-uber-client-gitref",
+    "x-uber-session-id",
+    "x-uber-device-location-latitude",
+    "x-uber-device-location-longitude",
+    "x-uber-target-location-latitude",
+    "x-uber-target-location-longitude",
+    "user-agent",
+    "accept-language",
+    "content-type",
+    "sec-ch-ua",
+    "sec-ch-ua-mobile",
+    "sec-ch-ua-platform",
 }
 
 
@@ -71,8 +80,47 @@ def _strip_xssi(text: str) -> str:
     """Strip the ``)]}'`` anti-JSON-hijacking prefix some Uber responses carry."""
     s = text.lstrip()
     if s.startswith(")]}'"):
-        return s[s.index("\n") + 1:] if "\n" in s else s[4:]
+        return s[s.index("\n") + 1 :] if "\n" in s else s[4:]
     return text
+
+
+def _item_endorsement(it: Dict[str, Any]) -> Dict[str, Any]:
+    """Pull a catalog item's eater endorsement — the 👍 figure shown under items
+    in the Uber app. Two shapes from Uber's ``endorsementMetadata``:
+      - ``ratings``    → a like/positive-rating rate, e.g. rating="94%", numRatings=879
+      - ``most_liked`` → a top seller ranked by like count (the "「ライク」数 #N"
+        overlay badge); no percentage.
+    This is a 好評率 (like rate), NOT a repeat/reorder rate.
+    Returns ``{"like_rate": "94%"|"", "num_ratings": int, "top_liked_rank": int}``.
+    """
+    endo = (it.get("catalogItemAnalyticsData") or {}).get("endorsementMetadata") or {}
+    etype = endo.get("endorsementType")
+    if etype == "ratings":
+        try:
+            n = int(endo.get("numRatings") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        return {
+            "like_rate": str(endo.get("rating") or ""),
+            "num_ratings": n,
+            "top_liked_rank": 0,
+        }
+    if etype == "most_liked":
+        rank = 0
+        for ov in it.get("imageOverlayElements") or []:
+            tags = (
+                ((ov.get("element") or {}).get("payload") or {}).get("tagsPayload")
+                or {}
+            ).get("tags") or []
+            for t in tags:
+                m = re.search(r"#\s*(\d+)", str(t.get("text") or ""))
+                if m:
+                    rank = int(m.group(1))
+                    break
+            if rank:
+                break
+        return {"like_rate": "", "num_ratings": 0, "top_liked_rank": rank}
+    return {"like_rate": "", "num_ratings": 0, "top_liked_rank": 0}
 
 
 def _parse_store_card(st: Dict[str, Any]) -> Dict[str, Any]:
@@ -87,6 +135,7 @@ def _parse_store_card(st: Dict[str, Any]) -> Dict[str, Any]:
         m = re.search(r"([\d,]+)\s*件(以上)?", r.get("accessibilityText", "") or "")
         if m:
             count = m.group(1).replace(",", "") + ("+" if m.group(2) else "")
+
     def _yen(s: str) -> str:
         m = re.search(r"[¥￥]\s*([\d,]+)", s or "")
         return f"¥{m.group(1)}" if m else (s or "").strip()
@@ -94,7 +143,7 @@ def _parse_store_card(st: Dict[str, Any]) -> Dict[str, Any]:
     fee = eta = original_fee = ""
     uber_one = surge = False
     sponsored = bool(st.get("storeAd"))
-    for b in (st.get("meta") or []):
+    for b in st.get("meta") or []:
         if not isinstance(b, dict):
             continue
         bt, t = b.get("badgeType"), (b.get("text") or "").strip()
@@ -135,7 +184,9 @@ def _parse_store_card(st: Dict[str, Any]) -> Dict[str, Any]:
 
 # Cross-promo sections mix in OTHER stores' products ("【ドリンクもどうぞ】",
 # "【その他の商品もどうぞ】" etc.); exclude them from a store's own menu by title.
-_CROSS_PROMO_RE = re.compile(r"もどうぞ|その他の商品|他のお店|別のお店|他店|一緒に(頼|注文)")
+_CROSS_PROMO_RE = re.compile(
+    r"もどうぞ|その他の商品|他のお店|別のお店|他店|一緒に(頼|注文)"
+)
 
 
 def _opt_price(cents: Any) -> str:
@@ -147,15 +198,17 @@ def _opt_price(cents: Any) -> str:
     return f"+¥{c // 100}" if c > 0 else ""
 
 
-def _parse_customizations(cl: Any, depth: int = 0, max_depth: int = 2) -> List[Dict[str, Any]]:
+def _parse_customizations(
+    cl: Any, depth: int = 0, max_depth: int = 2
+) -> List[Dict[str, Any]]:
     """Flatten a customizationsList into groups → options (one level of nesting,
     e.g. McDonald's 'Drink M' → the actual drink choices)."""
     groups: List[Dict[str, Any]] = []
-    for g in (cl or []):
+    for g in cl or []:
         if not isinstance(g, dict):
             continue
         options = []
-        for o in (g.get("options") or []):
+        for o in g.get("options") or []:
             if not isinstance(o, dict):
                 continue
             opt = {
@@ -167,12 +220,14 @@ def _parse_customizations(cl: Any, depth: int = 0, max_depth: int = 2) -> List[D
             if child and depth < max_depth:
                 opt["children"] = _parse_customizations(child, depth + 1, max_depth)
             options.append(opt)
-        groups.append({
-            "title": g.get("title", ""),
-            "min": g.get("minPermitted"),
-            "max": g.get("maxPermitted"),
-            "options": options,
-        })
+        groups.append(
+            {
+                "title": g.get("title", ""),
+                "min": g.get("minPermitted"),
+                "max": g.get("maxPermitted"),
+                "options": options,
+            }
+        )
     return groups
 
 
@@ -212,7 +267,9 @@ class UberEatsClient:
         except Exception as e:
             raise UberUnavailable(f"Uberセッション情報の読み込みに失敗しました: {e}")
         if not hdrs.get("x-csrf-token"):
-            raise UberUnavailable("Uberセッション情報が不完全です。login.py で再ログインしてください。")
+            raise UberUnavailable(
+                "Uberセッション情報が不完全です。login.py で再ログインしてください。"
+            )
         self._headers = hdrs
         return hdrs
 
@@ -236,8 +293,10 @@ class UberEatsClient:
                 try:
                     pw = await async_playwright().start()
                     ctx = await pw.chromium.launch_persistent_context(
-                        user_data_dir=str(PROFILE), headless=self._headless,
-                        locale="ja-JP", timezone_id="Asia/Tokyo",
+                        user_data_dir=str(PROFILE),
+                        headless=self._headless,
+                        locale="ja-JP",
+                        timezone_id="Asia/Tokyo",
                         args=["--disable-blink-features=AutomationControlled"],
                         ignore_default_args=["--enable-automation"],
                     )
@@ -247,20 +306,29 @@ class UberEatsClient:
                     )
                 try:
                     resp = await ctx.request.post(
-                        url, headers=headers, data=json.dumps(body), timeout=_CALL_TIMEOUT_MS
+                        url,
+                        headers=headers,
+                        data=json.dumps(body),
+                        timeout=_CALL_TIMEOUT_MS,
                     )
                 except Exception as e:
                     raise UberUnavailable(f"Uberへの接続に失敗しました: {e}")
                 if resp.status in (401, 403):
-                    raise UberUnavailable("Uberのセッションが切れました。login.py で再ログインしてください。")
+                    raise UberUnavailable(
+                        "Uberのセッションが切れました。login.py で再ログインしてください。"
+                    )
                 if resp.status != 200:
-                    raise UberUnavailable(f"Uber APIエラー (status {resp.status})。少し待って再試行してください。")
+                    raise UberUnavailable(
+                        f"Uber APIエラー (status {resp.status})。少し待って再試行してください。"
+                    )
                 try:
                     data = json.loads(_strip_xssi(await resp.text()))
                 except Exception as e:
                     raise UberUnavailable(f"Uberの応答を解析できませんでした: {e}")
                 inner = data.get("data") if isinstance(data, dict) else None
-                if isinstance(inner, dict) and "challenge" in str(inner.get("nextUrl", "")):
+                if isinstance(inner, dict) and "challenge" in str(
+                    inner.get("nextUrl", "")
+                ):
                     raise UberUnavailable(
                         "Uberが本人確認(reCAPTCHA)を要求しました。login.py で再ログインしてください。"
                     )
@@ -291,15 +359,26 @@ class UberEatsClient:
         """
         if not keyword or not keyword.strip():
             return []
-        data = await self._call("getSearchFeedV1", {
-            "userQuery": keyword.strip(), "displayType": "SEARCH_RESULTS",
-            "date": "", "startTime": 0, "endTime": 0, "sortAndFilters": [],
-            "vertical": "", "searchSource": "", "searchType": "", "keyName": "",
-            "cacheKey": "", "recaptchaToken": "",
-        })
+        data = await self._call(
+            "getSearchFeedV1",
+            {
+                "userQuery": keyword.strip(),
+                "displayType": "SEARCH_RESULTS",
+                "date": "",
+                "startTime": 0,
+                "endTime": 0,
+                "sortAndFilters": [],
+                "vertical": "",
+                "searchSource": "",
+                "searchType": "",
+                "keyName": "",
+                "cacheKey": "",
+                "recaptchaToken": "",
+            },
+        )
         out: List[Dict[str, Any]] = []
         seen: set = set()
-        for fi in ((data.get("data") or {}).get("feedItems") or []):
+        for fi in (data.get("data") or {}).get("feedItems") or []:
             if not isinstance(fi, dict):
                 continue
             st = fi.get("store") or {}
@@ -322,16 +401,24 @@ class UberEatsClient:
         """
         if not store_uuid or not store_uuid.strip():
             raise UberUnavailable("store_uuid が指定されていません。")
-        data = await self._call("getStoreV1", {
-            "storeUuid": store_uuid.strip(), "diningMode": "DELIVERY",
-            "time": {"asap": True}, "cbType": "EATER_ENDORSED",
-        })
+        data = await self._call(
+            "getStoreV1",
+            {
+                "storeUuid": store_uuid.strip(),
+                "diningMode": "DELIVERY",
+                "time": {"asap": True},
+                "cbType": "EATER_ENDORSED",
+            },
+        )
         d = data.get("data") or {}
         if not d:
-            raise UberUnavailable("店舗情報が取得できませんでした（store_uuid が無効かもしれません）。")
+            raise UberUnavailable(
+                "店舗情報が取得できませんでした（store_uuid が無効かもしれません）。"
+            )
         sec_titles = {
             s.get("uuid"): (s.get("title") or "")
-            for s in (d.get("sections") or []) if isinstance(s, dict)
+            for s in (d.get("sections") or [])
+            if isinstance(s, dict)
         }
         menu: List[Dict[str, Any]] = []
         total = 0
@@ -341,9 +428,11 @@ class UberEatsClient:
             if sec_title and _CROSS_PROMO_RE.search(sec_title):
                 continue  # other stores' products spliced in — not this store's menu
             items: List[Dict[str, Any]] = []
-            for entry in (entries or []):
+            for entry in entries or []:
                 payload = (entry or {}).get("payload") or {}
-                catalog = (payload.get("standardItemsPayload") or {}).get("catalogItems") or []
+                catalog = (payload.get("standardItemsPayload") or {}).get(
+                    "catalogItems"
+                ) or []
                 for it in catalog:
                     if not isinstance(it, dict):
                         continue
@@ -354,14 +443,19 @@ class UberEatsClient:
                     price = it.get("priceTagline")
                     if isinstance(price, dict):
                         price = price.get("text", "")
-                    items.append({
-                        "name": it.get("title", ""),
-                        "price": price or "",
-                        "item_uuid": it.get("uuid", ""),
-                        "desc": " ".join((it.get("itemDescription") or "").split())[:80],
-                        "sold_out": bool(it.get("isSoldOut")),
-                        "customizable": bool(it.get("hasCustomizations")),
-                    })
+                    items.append(
+                        {
+                            "name": it.get("title", ""),
+                            "price": price or "",
+                            "item_uuid": it.get("uuid", ""),
+                            "desc": " ".join((it.get("itemDescription") or "").split())[
+                                :80
+                            ],
+                            "sold_out": bool(it.get("isSoldOut")),
+                            "customizable": bool(it.get("hasCustomizations")),
+                            **_item_endorsement(it),
+                        }
+                    )
                     total += 1
                     if total >= max_items:
                         break
@@ -376,7 +470,7 @@ class UberEatsClient:
         rating = (r.get("text") or r.get("ratingValue")) if isinstance(r, dict) else r
         count = r.get("reviewCount", "") if isinstance(r, dict) else ""
         fee = ""
-        for mo in ((d.get("modalityInfo") or {}).get("modalityOptions") or []):
+        for mo in (d.get("modalityInfo") or {}).get("modalityOptions") or []:
             if isinstance(mo, dict) and mo.get("diningMode") == "DELIVERY":
                 fee = _richtext(mo.get("priceTitleRichText"))
                 break
@@ -386,8 +480,14 @@ class UberEatsClient:
             "rating": str(rating or ""),
             "rating_count": str(count or ""),
             "cuisines": [c for c in (d.get("categories") or []) if isinstance(c, str)],
-            "eta": _tidy_eta((d.get("etaRange") or {}).get("text", "") if isinstance(d.get("etaRange"), dict) else ""),
-            "distance": (d.get("distanceBadge") or {}).get("text", "") if isinstance(d.get("distanceBadge"), dict) else "",
+            "eta": _tidy_eta(
+                (d.get("etaRange") or {}).get("text", "")
+                if isinstance(d.get("etaRange"), dict)
+                else ""
+            ),
+            "distance": (d.get("distanceBadge") or {}).get("text", "")
+            if isinstance(d.get("distanceBadge"), dict)
+            else "",
             "fee": fee,
             "is_open": bool(d.get("isOpen")),
             "hours": str(meta.get("workingHoursTagline", "") or ""),
@@ -401,17 +501,31 @@ class UberEatsClient:
         choices). getMenuItemV1 needs the item's section + subsection, so we look
         those up from getStoreV1 first (the item carries subsectionUuid; the
         section is its catalogSectionsMap key)."""
-        if not store_uuid or not store_uuid.strip() or not item_uuid or not item_uuid.strip():
+        if (
+            not store_uuid
+            or not store_uuid.strip()
+            or not item_uuid
+            or not item_uuid.strip()
+        ):
             raise UberUnavailable("store_uuid と item_uuid が必要です。")
         store_uuid, item_uuid = store_uuid.strip(), item_uuid.strip()
-        sd = (await self._call("getStoreV1", {
-            "storeUuid": store_uuid, "diningMode": "DELIVERY",
-            "time": {"asap": True}, "cbType": "EATER_ENDORSED",
-        })).get("data") or {}
+        sd = (
+            await self._call(
+                "getStoreV1",
+                {
+                    "storeUuid": store_uuid,
+                    "diningMode": "DELIVERY",
+                    "time": {"asap": True},
+                    "cbType": "EATER_ENDORSED",
+                },
+            )
+        ).get("data") or {}
         section_uuid = subsection_uuid = None
         for sec_uuid, entries in (sd.get("catalogSectionsMap") or {}).items():
-            for entry in (entries or []):
-                for it in ((entry or {}).get("payload") or {}).get("standardItemsPayload", {}).get("catalogItems") or []:
+            for entry in entries or []:
+                for it in ((entry or {}).get("payload") or {}).get(
+                    "standardItemsPayload", {}
+                ).get("catalogItems") or []:
                     if isinstance(it, dict) and it.get("uuid") == item_uuid:
                         section_uuid = it.get("sectionUuid") or sec_uuid
                         subsection_uuid = it.get("subsectionUuid")
@@ -421,9 +535,15 @@ class UberEatsClient:
             if section_uuid:
                 break
         if not section_uuid:
-            raise UberUnavailable("指定された item_uuid がこの店舗に見つかりませんでした。")
+            raise UberUnavailable(
+                "指定された item_uuid がこの店舗に見つかりませんでした。"
+            )
 
-        body = {"storeUuid": store_uuid, "menuItemUuid": item_uuid, "sectionUuid": section_uuid}
+        body = {
+            "storeUuid": store_uuid,
+            "menuItemUuid": item_uuid,
+            "sectionUuid": section_uuid,
+        }
         if subsection_uuid:
             body["subsectionUuid"] = subsection_uuid
         d = (await self._call("getMenuItemV1", body)).get("data") or {}
@@ -440,13 +560,16 @@ class UberEatsClient:
             if isinstance(t, dict) and t.get("text")
         ]
         dietary = [
-            str(x) for x in ((d.get("itemAttributeInfo") or {}).get("dietaryLabels") or [])
+            str(x)
+            for x in ((d.get("itemAttributeInfo") or {}).get("dietaryLabels") or [])
             if x
         ]
         return {
             "name": d.get("title", ""),
             "price": price,
-            "desc": " ".join((d.get("itemDescription") or "").split()),  # full, untruncated
+            "desc": " ".join(
+                (d.get("itemDescription") or "").split()
+            ),  # full, untruncated
             "sold_out": bool(d.get("isSoldOut")),
             "tags": tags + dietary,
             "customizations": _parse_customizations(d.get("customizationsList")),
