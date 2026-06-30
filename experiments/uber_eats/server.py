@@ -61,7 +61,10 @@ async def _run(coro, what: str):
         return False, str(e)
     except asyncio.TimeoutError:
         logger.warning(f"{what}: timed out after {_TOOL_TIMEOUT}s")
-        return False, "Uberの応答が遅すぎます（タイムアウト）。少し待って試してください。"
+        return (
+            False,
+            "Uberの応答が遅すぎます（タイムアウト）。少し待って試してください。",
+        )
     except Exception:
         logger.exception(f"{what}: unexpected error")
         return False, "Uberの処理中に問題が発生しました。"
@@ -112,7 +115,8 @@ async def uber_search(keyword: str) -> str:
 @mcp.tool()
 async def uber_store(store_uuid: str) -> str:
     """指定した store_uuid の店舗のメニューを取得する。store_uuid は uber_search の
-    結果から渡す。店名・評価・配達目安と、メニュー（カテゴリ・料理名・価格）を返す。
+    結果から渡す。店名・評価・配達目安と、メニュー（カテゴリ・料理名・価格・好評率）を返す。
+    各商品の「好評率」は「ライク」（高評価）の割合で、評価数も併記される——リピート率ではない。
     閲覧専用で、注文や支払いはできない。
     返り値はあなたの参照用で会話には残らないので、伝えたいことは返信本文に書くこと。"""
     ok, data = await _run(_client.store(store_uuid), f"uber_store({store_uuid!r})")
@@ -147,7 +151,16 @@ async def uber_store(store_uuid: str) -> str:
         for it in sec["items"]:
             so = "[品切れ] " if it.get("sold_out") else ""
             price = f"  {it['price']}" if it.get("price") else ""
-            line = f"- {so}{it['name']}{price}"
+            # Eater endorsement (好評率 = 「ライク」率, NOT リピート率) — labelled
+            # explicitly so it can't be misread as a repeat rate.
+            if it.get("like_rate"):
+                cnt = f"({it['num_ratings']}件)" if it.get("num_ratings") else ""
+                endo = f"  👍好評率{it['like_rate']}{cnt}"
+            elif it.get("top_liked_rank"):
+                endo = f"  👍ライク数#{it['top_liked_rank']}"
+            else:
+                endo = ""
+            line = f"- {so}{it['name']}{price}{endo}"
             if it.get("desc"):
                 line += f"\n    {it['desc']}"
             # only customizable items are worth drilling into; expose their id
@@ -165,7 +178,9 @@ async def uber_item(store_uuid: str, item_uuid: str) -> str:
     商品に表示される）を渡す。トッピング・セット内容・サイズなどの選択肢（と追加料金）を返す。
     閲覧専用で、注文や支払いはできない。
     返り値はあなたの参照用で会話には残らないので、伝えたいことは返信本文に書くこと。"""
-    ok, data = await _run(_client.item(store_uuid, item_uuid), f"uber_item({item_uuid!r})")
+    ok, data = await _run(
+        _client.item(store_uuid, item_uuid), f"uber_item({item_uuid!r})"
+    )
     if not ok:
         return f"商品詳細を取得できませんでした: {data}"
     head = data["name"] + (f"  {data['price']}" if data.get("price") else "")
