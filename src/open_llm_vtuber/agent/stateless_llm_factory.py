@@ -78,6 +78,8 @@ class LLMFactory:
                 enable_web_fetch=kwargs.get("enable_web_fetch", False),
                 max_web_fetches=kwargs.get("max_web_fetches", 5),
                 max_fetch_tokens=kwargs.get("max_fetch_tokens", 30000),
+                thinking=kwargs.get("thinking", False),
+                thinking_effort=kwargs.get("thinking_effort", "medium"),
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {llm_provider}")

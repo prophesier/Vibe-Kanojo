@@ -204,6 +204,14 @@ character_config:
         # 单页内容截断上限：超过该 token 数的页面会被自动截断，
         # 防止大文档/PDF 把 input 成本撑爆。
         max_fetch_tokens: 30000
+        # 扩展思考（自适应）：回复前先推理，有助于多步逻辑、时间/上下文追踪，
+        # 以及真去调工具而不是凭空编。会增加延迟、思考 token 按 output 计费；
+        # 自适应模式下简单回合会自动跳过。开启时回复 token 上限会自动抬高，
+        # 避免推理把回复挤掉。推理摘要只写进日志（[thinking]），不会朗读、
+        # 也不存进聊天记录。
+        thinking: false
+        # thinking 开启时的思考深度：low | medium | high | max。
+        thinking_effort: 'medium'
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>' # GGUF 模型文件路径

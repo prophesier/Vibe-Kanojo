@@ -275,6 +275,47 @@ class BasicMemoryAgent(AgentInterface):
         "実際にそのツールを呼び出すこと（文字列を書いても何も実行されない）。"
     )
 
+    # Affirmative capability note for the self-set alarm tools. Claude tends to
+    # ignore raw tool schemas, so state plainly the tool is real and must
+    # actually be called. Framed as future proactive speech, not only literal
+    # reminders. Static / cache-stable; gated on alarms being active.
+    _ALARM_CAPABILITY_NOTE = (
+        "【アラーム（自分用リマインダー／予約発話）について】\n"
+        "あなたには未来の時刻に自分から話しかけるためのツールが実際に備わっている。"
+        "これは実在する機能で、呼び出せば本当に動く：\n"
+        "- set_alarm：指定した時刻、または「今から◯分後」に発火を予約する（メモを添えられる）\n"
+        "- list_alarms：予約済みのものを確認する\n"
+        "- cancel_alarm：予約を取り消す\n"
+        "用途はリマインダーに限らない。ユーザーからの「○時に教えて」という頼みごとだけでなく、"
+        "あなた自身が「後でこの話の続きをしたい」「少し時間を置いてから様子を聞きたい」など、"
+        "未来のある時点で自分から声をかけたいと思った時にも、自由に使ってよい。\n"
+        "時刻になると、システムが自動であなたに合図し、あなたから話しかける形で"
+        "ユーザーに伝わる（相手のクライアントが起動していなければ、次に繋がった時に届く）。\n"
+        "「後で知らせる」「覚えておく」と言葉で言うだけでは何も起きない。"
+        "本当に未来のその時に話したいなら、必ず set_alarm を実際に呼び出すこと。"
+    )
+
+    # Affirmative capability note for the Uber Eats MCP tools, with a hard rule
+    # against fabricating store data — the observed Claude failure mode was
+    # emitting the 🍔 marker and inventing stores without calling the tool.
+    # Static / cache-stable; gated on uber tools actually being loaded.
+    _UBER_CAPABILITY_NOTE = (
+        "【Uber Eats（出前）について】\n"
+        "あなたには Uber Eats（日本）を閲覧できるツールが実際に備わっている"
+        "（閲覧専用——注文や支払いはできない）。"
+        "これは実在する機能で、呼び出せば本物の店舗データが返る：\n"
+        "- uber_search：キーワードで配達可能な店舗を検索する\n"
+        "- uber_store：store_uuid を渡してその店のメニューを見る\n"
+        "- uber_item：商品の詳細（トッピング・サイズ等）を見る\n"
+        "【厳守】店名・評価・配送時間・配送料・メニュー・価格など、"
+        "Uber Eats の具体的な情報を口にする前に、必ずその場で "
+        "uber_search / uber_store を実際に呼び出すこと。"
+        "記憶・過去の会話・履歴に残る「🍔 *Uber Eats*」マーカーを根拠に、"
+        "ツールを呼ばずに店舗情報を作り出してはならない。"
+        "まだ呼び出していなければ、あなたは実在のデータを一切持っていない——"
+        "その状態で店名や数値を述べることは、ユーザーへの虚偽の案内になる。"
+    )
+
     # Trailing system block placed right before the message history.
     # No cache_control marker — small, static, and positional. By sitting
     # last in the system prompt, it's the closest instruction to the
@@ -360,9 +401,7 @@ class BasicMemoryAgent(AgentInterface):
         the message history, giving the LLM the strictest instructions
         right before it encounters the data they apply to.
         """
-        parts = [self._system, self._TIMESTAMP_NOTE]
-        if self._has_marker_tools():
-            parts.append(self._TOOL_MARKER_NOTE)
+        parts = [self._system, self._TIMESTAMP_NOTE] + self._tool_capability_notes()
         facts_fp = diaries_fp = "-"
         if self._memory_manager:
             facts_text = self._memory_manager.get_facts_prompt()
@@ -428,8 +467,7 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "text",
                 "text": "\n\n".join(
-                    [self._system, self._TIMESTAMP_NOTE]
-                    + ([self._TOOL_MARKER_NOTE] if self._has_marker_tools() else [])
+                    [self._system, self._TIMESTAMP_NOTE] + self._tool_capability_notes()
                 ),
                 "cache_control": self._CACHE_CONTROL_1H,
             }
@@ -511,9 +549,7 @@ class BasicMemoryAgent(AgentInterface):
         parts = uid.split("_")
         if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
             try:
-                dt = datetime.strptime(
-                    f"{parts[0]}_{parts[1]}", "%Y-%m-%d_%H-%M-%S"
-                )
+                dt = datetime.strptime(f"{parts[0]}_{parts[1]}", "%Y-%m-%d_%H-%M-%S")
                 timestamp = (
                     f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}"
                 )
@@ -605,9 +641,7 @@ class BasicMemoryAgent(AgentInterface):
                     if not entry:
                         continue
                     if first_in_session:
-                        banner = self._session_header_text(
-                            current_uid, is_current=True
-                        )
+                        banner = self._session_header_text(current_uid, is_current=True)
                         entry["content"] = f"{banner}\n{entry['content']}"
                         first_in_session = False
                         self._current_session_banner_added = True
@@ -804,9 +838,18 @@ class BasicMemoryAgent(AgentInterface):
                     query[:30],
                     keywords,
                     # scored shortlist (pre-judge) — tune lexical_weight / prefilter_floor from these
-                    [((c[1][:10] if c[1] else c[0][:19]), c[2], c[3], c[4]) for c in candidates],
+                    [
+                        ((c[1][:10] if c[1] else c[0][:19]), c[2], c[3], c[4])
+                        for c in candidates
+                    ],
                     # what the judge picked (may include already-injected → no-op)
-                    [(h["uid"][:19], (h.get("reason") or round(h.get("score", 0.0), 3))) for h in hits],
+                    [
+                        (
+                            h["uid"][:19],
+                            (h.get("reason") or round(h.get("score", 0.0), 3)),
+                        )
+                        for h in hits
+                    ],
                     # what was actually newly injected this turn
                     [h["uid"][:19] for h in new_hits],
                     len(self._session_injected_uids),
@@ -841,7 +884,7 @@ class BasicMemoryAgent(AgentInterface):
         if n_turns <= 0 or not self._memory:
             return ""
         lines: List[str] = []
-        for m in self._memory[-(2 * n_turns):]:
+        for m in self._memory[-(2 * n_turns) :]:
             role = m.get("role", "")
             if role not in ("user", "assistant"):
                 continue
@@ -893,7 +936,9 @@ class BasicMemoryAgent(AgentInterface):
             hits, candidates, keywords = await mgr.retrieve_facts_context(
                 query, exclude, context=context
             )
-            new_hits = [h for h in hits if h["id"] not in self._session_injected_fact_ids]
+            new_hits = [
+                h for h in hits if h["id"] not in self._session_injected_fact_ids
+            ]
             if new_hits:
                 self._pending_facts_block = self._format_facts_rag_block(new_hits)
                 self._session_injected_fact_ids.update(h["id"] for h in new_hits)
@@ -903,8 +948,17 @@ class BasicMemoryAgent(AgentInterface):
                 % (
                     query[:30],
                     keywords,
-                    [((c[1][:10] if c[1] else c[0][:8]), c[2], c[3], c[4]) for c in candidates],
-                    [(h["id"][:8], (h.get("reason") or round(h.get("score", 0.0), 3))) for h in hits],
+                    [
+                        ((c[1][:10] if c[1] else c[0][:8]), c[2], c[3], c[4])
+                        for c in candidates
+                    ],
+                    [
+                        (
+                            h["id"][:8],
+                            (h.get("reason") or round(h.get("score", 0.0), 3)),
+                        )
+                        for h in hits
+                    ],
                     [h["id"][:8] for h in new_hits],
                     len(self._session_injected_fact_ids),
                 )
@@ -941,7 +995,9 @@ class BasicMemoryAgent(AgentInterface):
         emitted_markers: set = set()  # inline tool tags shown once per turn
 
         while True:
-            stream = self._llm.chat_completion(messages, self._build_system_for_llm(), tools=tools)
+            stream = self._llm.chat_completion(
+                messages, self._build_system_for_llm(), tools=tools
+            )
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
 
@@ -980,6 +1036,12 @@ class BasicMemoryAgent(AgentInterface):
                     mk = event.get("text", "")
                     if mk:
                         yield mk
+                elif event["type"] == "thinking_complete":
+                    # Keep the thinking block (text + signature) in the assistant
+                    # turn so it's replayed ahead of any tool_use when we echo
+                    # this turn back — Anthropic requires that when thinking is
+                    # on. Not yielded to the user, not stored to memory.
+                    current_assistant_message_content.append(event["data"])
                 # elif event["type"] == "message_delta":
                 #     if event["data"]["delta"].get("stop_reason"):
                 #         stop_reason = event["data"]["delta"].get("stop_reason")
@@ -1017,11 +1079,13 @@ class BasicMemoryAgent(AgentInterface):
                 # Split: built-in ALARM tools handled in-process (provider-
                 # agnostic); everything else goes to the MCP executor.
                 alarm_calls = [
-                    c for c in pending_tool_calls
+                    c
+                    for c in pending_tool_calls
                     if c.get("name") in self._ALARM_TOOL_NAMES
                 ]
                 mcp_calls = [
-                    c for c in pending_tool_calls
+                    c
+                    for c in pending_tool_calls
                     if c.get("name") not in self._ALARM_TOOL_NAMES
                 ]
 
@@ -1411,6 +1475,35 @@ class BasicMemoryAgent(AgentInterface):
             or bool(self._use_mcpp)
         )
 
+    def _uber_tools_active(self) -> bool:
+        """Whether Uber Eats MCP tools are actually advertised this session, so
+        the Uber capability note is only injected when the tool really exists
+        (never describe a tool that isn't loaded)."""
+        if not self._use_mcpp:
+            return False
+        tools = self._formatted_tools_claude or self._formatted_tools_openai or []
+        for t in tools:
+            name = t.get("name") or (t.get("function") or {}).get("name", "")
+            if name.startswith("uber"):
+                return True
+        return False
+
+    def _tool_capability_notes(self) -> List[str]:
+        """Static, cache-stable system-prompt notes describing the homegrown
+        tools, each included only when that tool is active. Shared by the
+        plain-string (OpenAI) and Claude system builders so both paths
+        advertise the same capabilities. Claude in particular tends to ignore
+        raw tool schemas, so these affirmative notes (plus a hard no-fabricate
+        rule for Uber) live in the prompt itself."""
+        notes: List[str] = []
+        if self._has_marker_tools():
+            notes.append(self._TOOL_MARKER_NOTE)
+        if self._alarm_store is not None:
+            notes.append(self._ALARM_CAPABILITY_NOTE)
+        if self._uber_tools_active():
+            notes.append(self._UBER_CAPABILITY_NOTE)
+        return notes
+
     def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:
         """OpenAI schemas for in-process (non-MCP) tools to advertise to the LLM.
 
@@ -1656,7 +1749,10 @@ class BasicMemoryAgent(AgentInterface):
                 in_minutes=args.get("in_minutes"), at=args.get("at")
             )
             if not note:
-                return None, {"status": "error", "message": "note（思い出す内容）が必要です。"}
+                return None, {
+                    "status": "error",
+                    "message": "note（思い出す内容）が必要です。",
+                }
             if err:
                 return None, {
                     "status": "error",

@@ -197,6 +197,8 @@ class ClaudeConfig(StatelessLLMBaseConfig):
     enable_web_fetch: bool = Field(False, alias="enable_web_fetch")
     max_web_fetches: int = Field(5, alias="max_web_fetches")
     max_fetch_tokens: int = Field(30000, alias="max_fetch_tokens")
+    thinking: bool = Field(False, alias="thinking")
+    thinking_effort: str = Field("medium", alias="thinking_effort")
 
     _CLAUDE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(
@@ -247,6 +249,31 @@ class ClaudeConfig(StatelessLLMBaseConfig):
             zh=(
                 "单页内容截断上限。超过这个 token 数的页面会被自动截断，"
                 "避免大文档把 input 成本撑爆。"
+            ),
+        ),
+        "thinking": Description(
+            en=(
+                "Enable Claude extended thinking (adaptive). Claude reasons "
+                "before replying — helps with multi-step logic, time/context "
+                "tracking, and actually calling tools instead of fabricating. "
+                "Adds latency and bills thinking tokens as output; adaptive "
+                "means simple turns skip it."
+            ),
+            zh=(
+                "启用 Claude 扩展思考（自适应）。回复前先推理——有助于多步逻辑、"
+                "时间/上下文追踪，以及真去调工具而不是凭空编。会增加延迟、思考 "
+                "token 按 output 计费；自适应模式下简单回合会自动跳过。"
+            ),
+        ),
+        "thinking_effort": Description(
+            en=(
+                "Thinking depth when 'thinking' is on: low | medium | high | "
+                "max. Higher = more reasoning, more tokens, more latency. "
+                "medium is a balanced default for chat."
+            ),
+            zh=(
+                "thinking 开启时的思考深度：low | medium | high | max。"
+                "越高推理越多、token 和延迟也越多。对话场景 medium 较均衡。"
             ),
         ),
     }
