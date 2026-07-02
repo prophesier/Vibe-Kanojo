@@ -82,8 +82,8 @@ class WebSocketHandler:
         # Global session registry: one active session per conf_uid shared across
         # all connected clients (web + proxy).  Prevents a second client from
         # auto-creating a duplicate session when another is already running.
-        self._active_history_uid: Dict[str, str] = {}   # conf_uid → history_uid
-        self._session_ref_count: Dict[str, int] = {}    # conf_uid → # clients using it
+        self._active_history_uid: Dict[str, str] = {}  # conf_uid → history_uid
+        self._session_ref_count: Dict[str, int] = {}  # conf_uid → # clients using it
 
         # Resume mode (OLV_RESUME=1): the first session creation this launch
         # continues the previous session instead of starting fresh. One-shot.
@@ -292,6 +292,13 @@ class WebSocketHandler:
             logger.error(f"Fatal error in WebSocket communication: {e}")
             raise
 
+    # Client→server message types with no server-side handler: display/echo
+    # artifacts (e.g. the user's own transcribed input bounced back through a
+    # proxy/broadcast) that we drop silently instead of warning about.
+    _IGNORED_MESSAGE_TYPES = frozenset(
+        {"frontend-playback-complete", "user-input-transcription"}
+    )
+
     async def _route_message(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
@@ -311,9 +318,8 @@ class WebSocketHandler:
         handler = self._message_handlers.get(msg_type)
         if handler:
             await handler(websocket, client_uid, data)
-        else:
-            if msg_type != "frontend-playback-complete":
-                logger.warning(f"Unknown message type: {msg_type}")
+        elif msg_type not in self._IGNORED_MESSAGE_TYPES:
+            logger.warning(f"Unknown message type: {msg_type}")
 
     async def _handle_group_operation(
         self, websocket: WebSocket, client_uid: str, data: dict
@@ -559,6 +565,7 @@ class WebSocketHandler:
             old_ref_count = self._session_ref_count.get(conf_uid, 1) - 1
             if old_ref_count <= 0:
                 from .chat_history_manager import get_history as _get_history
+
                 old_messages = _get_history(conf_uid, old_uid)
                 llm = getattr(context.agent_engine, "_llm", None)
                 persona = getattr(context.agent_engine, "_system", "") or ""
@@ -713,9 +720,7 @@ class WebSocketHandler:
     # ----------------------------------------------------------- alarms
     def _alarms_enabled(self) -> bool:
         try:
-            bma = (
-                self.default_context_cache.character_config.agent_config.agent_settings.basic_memory_agent
-            )
+            bma = self.default_context_cache.character_config.agent_config.agent_settings.basic_memory_agent
             return bool(bma and getattr(bma, "enable_alarms", True))
         except Exception:
             return False
@@ -827,9 +832,7 @@ class WebSocketHandler:
 
     def _bma_cfg(self):
         try:
-            return (
-                self.default_context_cache.character_config.agent_config.agent_settings.basic_memory_agent
-            )
+            return self.default_context_cache.character_config.agent_config.agent_settings.basic_memory_agent
         except Exception:
             return None
 
