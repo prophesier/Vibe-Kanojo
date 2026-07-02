@@ -34,11 +34,23 @@ def _sniff_image_media_type(base64_data: str, declared: str) -> str:
     return declared
 
 
+def _budget_tokens_removed(model: str) -> bool:
+    """Whether manual extended thinking (``budget_tokens``) is removed for this
+    model. Still functional on Opus 4.6 and older, but 400s on Opus 4.7/4.8,
+    Fable 5, and Mythos 5 — so forced thinking must fall back to adaptive there."""
+    m = (model or "").lower()
+    return any(x in m for x in ("opus-4-7", "opus-4-8", "fable", "mythos"))
+
+
 class AsyncLLM(StatelessLLMInterface):
     # When thinking is on, the reply shares the max_tokens budget with the
     # (billed) thinking tokens. Raise the ceiling so reasoning doesn't truncate
     # a normal-length reply.
     _THINKING_MAX_TOKENS_FLOOR = 8000
+    # Forced (always-on) extended thinking: the fixed budget, plus the reply
+    # headroom kept above it (budget_tokens must stay under max_tokens).
+    _THINKING_FORCED_BUDGET = 4096
+    _THINKING_FORCED_REPLY_ROOM = 4000
 
     def __init__(
         self,
@@ -53,6 +65,7 @@ class AsyncLLM(StatelessLLMInterface):
         max_fetch_tokens: int = 30000,
         thinking: bool = False,
         thinking_effort: str = "medium",
+        thinking_force: bool = False,
     ):
         """
         Initialize Claude LLM.
@@ -81,6 +94,7 @@ class AsyncLLM(StatelessLLMInterface):
         self._max_fetch_tokens = max_fetch_tokens
         self._thinking = thinking
         self._thinking_effort = thinking_effort
+        self._thinking_force = thinking_force
         if enable_web_search:
             logger.info(
                 f"Claude native web search enabled (max {max_web_searches}/reply)."
@@ -91,9 +105,12 @@ class AsyncLLM(StatelessLLMInterface):
                 f"(max {max_web_fetches}/reply, max {max_fetch_tokens} tokens/page)."
             )
         if thinking:
-            logger.info(
-                f"Claude extended thinking enabled (adaptive, effort={thinking_effort})."
+            mode = (
+                "forced/every-turn"
+                if thinking_force and not _budget_tokens_removed(model)
+                else f"adaptive, effort={thinking_effort}"
             )
+            logger.info(f"Claude extended thinking enabled ({mode}).")
 
         # Initialize Claude client. The extended-cache-ttl beta header lets us
         # request 1-hour prompt cache TTL on cache_control blocks; without it
@@ -247,21 +264,38 @@ class AsyncLLM(StatelessLLMInterface):
             logger.debug(f"Sending messages to Claude API: {converted_messages}")
             logger.debug(f"Tools provided: {final_tools}")
 
-            # Extended thinking (adaptive). Skipped for one-shot utility calls
+            # Extended thinking. Skipped for one-shot utility calls
             # (disable_server_tools) — fact extraction / diary / pruning don't
             # benefit from a reasoning pass and shouldn't pay for it. Passed via
             # extra_body so it goes straight to the API regardless of the SDK
             # version's typed-param support for thinking/output_config.
             think_kwargs: Dict[str, Any] = {}
             if self._thinking and not disable_server_tools:
-                extra_body: Dict[str, Any] = {
-                    "thinking": {"type": "adaptive", "display": "summarized"}
-                }
-                if self._thinking_effort:
-                    extra_body["output_config"] = {"effort": self._thinking_effort}
+                extra_body: Dict[str, Any] = {}
+                if self._thinking_force and not _budget_tokens_removed(self.model):
+                    # Forced extended thinking: reason on EVERY turn. Adaptive
+                    # skips turns it judges simple — which is exactly where
+                    # coherence errors slip through (e.g. delivering an alarm's
+                    # content inline instead of at fire time). budget_tokens must
+                    # stay under max_tokens, so lift the reply ceiling.
+                    budget = self._THINKING_FORCED_BUDGET
+                    max_tokens = max(
+                        max_tokens, budget + self._THINKING_FORCED_REPLY_ROOM
+                    )
+                    extra_body["thinking"] = {
+                        "type": "enabled",
+                        "budget_tokens": budget,
+                    }
+                else:
+                    extra_body["thinking"] = {
+                        "type": "adaptive",
+                        "display": "summarized",
+                    }
+                    if self._thinking_effort:
+                        extra_body["output_config"] = {"effort": self._thinking_effort}
+                    if max_tokens < self._THINKING_MAX_TOKENS_FLOOR:
+                        max_tokens = self._THINKING_MAX_TOKENS_FLOOR
                 think_kwargs["extra_body"] = extra_body
-                if max_tokens < self._THINKING_MAX_TOKENS_FLOOR:
-                    max_tokens = self._THINKING_MAX_TOKENS_FLOOR
 
             async with self.client.messages.stream(
                 messages=converted_messages,

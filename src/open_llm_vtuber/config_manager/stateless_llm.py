@@ -199,6 +199,7 @@ class ClaudeConfig(StatelessLLMBaseConfig):
     max_fetch_tokens: int = Field(30000, alias="max_fetch_tokens")
     thinking: bool = Field(False, alias="thinking")
     thinking_effort: str = Field("medium", alias="thinking_effort")
+    thinking_force: bool = Field(False, alias="thinking_force")
 
     _CLAUDE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(
@@ -274,6 +275,20 @@ class ClaudeConfig(StatelessLLMBaseConfig):
             zh=(
                 "thinking 开启时的思考深度：low | medium | high | max。"
                 "越高推理越多、token 和延迟也越多。对话场景 medium 较均衡。"
+            ),
+        ),
+        "thinking_force": Description(
+            en=(
+                "Force thinking on EVERY turn (extended thinking) instead of "
+                "adaptive, which skips turns it judges simple — exactly where "
+                "coherence errors slip in. Opus 4.6 and older only; on 4.7/4.8/"
+                "Fable it auto-falls back to adaptive. Adds latency to every turn."
+            ),
+            zh=(
+                "强制每一回合都思考（扩展思考），而非 adaptive——adaptive 会跳过"
+                "它自认为简单的回合，而恰恰那些回合最容易出连贯性错误。"
+                "仅 Opus 4.6 及更早；4.7/4.8/Fable 会自动回退到 adaptive。"
+                "每一回合都会增加延迟。"
             ),
         ),
     }

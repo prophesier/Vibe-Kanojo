@@ -212,6 +212,10 @@ character_config:
         thinking: false
         # thinking 开启时的思考深度：low | medium | high | max。
         thinking_effort: 'medium'
+        # 强制每一回合都思考（扩展思考），而非 adaptive。
+        # adaptive 会跳过它自认为简单的回合，而那些回合最容易出连贯性错误。
+        # 仅 Opus 4.6 及更早；4.7/4.8/Fable 会自动回退到 adaptive。
+        thinking_force: false
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>' # GGUF 模型文件路径

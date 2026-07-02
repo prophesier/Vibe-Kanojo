@@ -244,6 +244,10 @@ character_config:
         thinking: false
         # Thinking depth when 'thinking' is on: low | medium | high | max.
         thinking_effort: 'medium'
+        # Force thinking on EVERY turn (extended thinking) instead of adaptive.
+        # adaptive skips turns it judges simple — where coherence errors slip in.
+        # Opus 4.6/older only; on 4.7/4.8/Fable it auto-falls back to adaptive.
+        thinking_force: false
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>'
