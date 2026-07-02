@@ -37,6 +37,7 @@ from .config_manager import (
     read_yaml,
     validate_config,
 )
+from .config_manager.utils import redact_secrets
 from .memory.persistent_memory import PersistentMemoryManager
 from .pidfile import mark_backfill_settled
 from .alarms import get_alarm_store
@@ -84,11 +85,11 @@ class ServiceContext:
             f"    Details: {json.dumps(self.system_config.model_dump(), indent=6) if self.system_config else 'None'}\n"
             f"  Live2D Model: {self.live2d_model.model_info if self.live2d_model else 'Not Loaded'}\n"
             f"  ASR Engine: {type(self.asr_engine).__name__ if self.asr_engine else 'Not Loaded'}\n"
-            f"    Config: {json.dumps(self.character_config.asr_config.model_dump(), indent=6) if self.character_config.asr_config else 'None'}\n"
+            f"    Config: {json.dumps(redact_secrets(self.character_config.asr_config.model_dump()), indent=6) if self.character_config.asr_config else 'None'}\n"
             f"  TTS Engine: {type(self.tts_engine).__name__ if self.tts_engine else 'Not Loaded'}\n"
-            f"    Config: {json.dumps(self.character_config.tts_config.model_dump(), indent=6) if self.character_config.tts_config else 'None'}\n"
+            f"    Config: {json.dumps(redact_secrets(self.character_config.tts_config.model_dump()), indent=6) if self.character_config.tts_config else 'None'}\n"
             f"  LLM Engine: {type(self.agent_engine).__name__ if self.agent_engine else 'Not Loaded'}\n"
-            f"    Agent Config: {json.dumps(self.character_config.agent_config.model_dump(), indent=6) if self.character_config.agent_config else 'None'}\n"
+            f"    Agent Config: {json.dumps(redact_secrets(self.character_config.agent_config.model_dump()), indent=6) if self.character_config.agent_config else 'None'}\n"
             f"  VAD Engine: {type(self.vad_engine).__name__ if self.vad_engine else 'Not Loaded'}\n"
             f"    Agent Config: {json.dumps(self.character_config.vad_config.model_dump(), indent=6) if self.character_config.vad_config else 'None'}\n"
             f"  System Prompt: {self.system_prompt or 'Not Set'}\n"
@@ -281,7 +282,9 @@ class ServiceContext:
         else:
             mark_backfill_settled(conf_uid=conf_uid)
 
-        logger.debug(f"Loaded service context with cache: {character_config}")
+        logger.debug(
+            f"Loaded service context with cache: {redact_secrets(character_config)}"
+        )
 
     async def _backfill_then_mark_settled(
         self, conf_uid: str, llm, persona: str
@@ -481,8 +484,10 @@ class ServiceContext:
             # a client connects.
             mem_cfg = self.system_config.persistent_memory
             if mem_cfg.enabled:
-                embed_key, embed_base = PersistentMemoryManager.resolve_embed_credentials(
-                    mem_cfg.diary_rag, self.character_config.agent_config
+                embed_key, embed_base = (
+                    PersistentMemoryManager.resolve_embed_credentials(
+                        mem_cfg.diary_rag, self.character_config.agent_config
+                    )
                 )
                 self.memory_manager = PersistentMemoryManager(
                     conf_uid=self.character_config.conf_uid,
@@ -570,7 +575,9 @@ class ServiceContext:
                             f"{resume_uid} (its diary/fact backfill is skipped)."
                         )
                     else:
-                        logger.info("[resume] OLV_RESUME=1 but no prior session; starting fresh.")
+                        logger.info(
+                            "[resume] OLV_RESUME=1 but no prior session; starting fresh."
+                        )
             else:
                 self.memory_manager = None
 
@@ -689,7 +696,7 @@ class ServiceContext:
                 await self.load_from_config(new_config)  # Await the async load
                 logger.debug(f"New config: {self}")
                 logger.debug(
-                    f"New character config: {self.character_config.model_dump()}"
+                    f"New character config: {redact_secrets(self.character_config.model_dump())}"
                 )
 
                 # Send responses to client

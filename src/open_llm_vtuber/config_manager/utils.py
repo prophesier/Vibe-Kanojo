@@ -12,6 +12,33 @@ from .main import Config
 
 T = TypeVar("T", bound=BaseModel)
 
+# Field-name patterns whose string values are secrets and must never be logged.
+_SECRET_KEY_RE = re.compile(r"api_key|secret|token|password|_key$", re.IGNORECASE)
+
+
+def redact_secrets(data: Any) -> Any:
+    """Deep-copy a config structure (pydantic model / dict / list) with
+    secret-looking string fields masked, for safe logging. Masks any key
+    matching api_key / secret / token / password / *_key."""
+    if hasattr(data, "model_dump"):
+        data = data.model_dump()
+    if isinstance(data, dict):
+        out: Dict[str, Any] = {}
+        for k, v in data.items():
+            if (
+                isinstance(k, str)
+                and _SECRET_KEY_RE.search(k)
+                and isinstance(v, str)
+                and v
+            ):
+                out[k] = "***REDACTED***"
+            else:
+                out[k] = redact_secrets(v)
+        return out
+    if isinstance(data, (list, tuple)):
+        return [redact_secrets(v) for v in data]
+    return data
+
 
 def read_yaml(config_path: str) -> Dict[str, Any]:
     """
@@ -70,7 +97,7 @@ def validate_config(config_data: dict) -> Config:
     except ValidationError as e:
         logger.critical(f"Error validating configuration: {e}")
         logger.error("Configuration data:")
-        logger.error(config_data)
+        logger.error(redact_secrets(config_data))
         raise e
 
 
