@@ -131,6 +131,9 @@ class DiscordVTuberBot(discord.Client):
         # Last channel the bot interacted in, used as the target for proactive
         # (server-initiated) messages such as a fired alarm.
         self._last_channel: Optional[discord.abc.Messageable] = None
+        # Channel id persisted to disk so proactive messages still reach Discord
+        # after a restart, before any new user message has set _last_channel.
+        self._proactive_channel_id: Optional[int] = None
         self._tree = app_commands.CommandTree(self)
         self._started_at = time.time()
         if self._admin_user_id:
@@ -690,8 +693,10 @@ class DiscordVTuberBot(discord.Client):
         if not _allowed(message.channel.id, self._channel_ids):
             return
 
-        # Remember where the conversation is happening, for proactive messages.
+        # Remember where the conversation is happening, for proactive messages
+        # (also persisted so it survives a restart before the next message).
         self._last_channel = message.channel
+        self._remember_proactive_channel(message.channel.id)
 
         content = (message.content or "").strip()
         images = (
@@ -770,20 +775,52 @@ class DiscordVTuberBot(discord.Client):
                 f"Reply for req={result.request_id} had partial error: {result.error}"
             )
 
+    def _proactive_channel_path(self) -> Path:
+        return self._project_root / "pids" / "discord_last_channel.json"
+
+    def _remember_proactive_channel(self, channel_id: int) -> None:
+        """Persist the last-active channel so proactive messages (fired alarms,
+        keepalive) still reach Discord after a restart — before the user has
+        sent any new message this session."""
+        if channel_id == self._proactive_channel_id:
+            return
+        self._proactive_channel_id = channel_id
+        try:
+            path = self._proactive_channel_path()
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps({"channel_id": channel_id}))
+        except Exception as e:
+            logger.debug(f"could not persist proactive channel: {e}")
+
+    def _load_proactive_channel_id(self) -> Optional[int]:
+        try:
+            path = self._proactive_channel_path()
+            if path.is_file():
+                cid = int(json.loads(path.read_text()).get("channel_id") or 0)
+                return cid or None
+        except Exception as e:
+            logger.debug(f"could not load persisted proactive channel: {e}")
+        return None
+
     async def _on_proactive(self, text: str, face_index: Optional[int] = None) -> None:
         """Post a server-initiated (proactive) message — a fired alarm or a cache
-        keepalive — to the last active channel, falling back to the first
-        configured channel. Sends the expression face too, like a normal reply."""
+        keepalive. Targets the last active channel; if none this session (e.g.
+        right after a restart), falls back to the persisted last-active channel
+        and then to a configured channel, so it still reaches Discord. Sends the
+        expression face too, like a normal reply."""
         if not text:
             return
         channel = self._last_channel
-        if channel is None and self._channel_ids:
-            cid = int(self._channel_ids[0])
-            try:
-                channel = self.get_channel(cid) or await self.fetch_channel(cid)
-            except Exception as e:
-                logger.warning(f"[alarm] cannot resolve a channel to post to: {e}")
-                return
+        if channel is None:
+            cid = self._proactive_channel_id or self._load_proactive_channel_id()
+            if cid is None and self._channel_ids:
+                cid = int(self._channel_ids[0])
+            if cid is not None:
+                try:
+                    channel = self.get_channel(cid) or await self.fetch_channel(cid)
+                except Exception as e:
+                    logger.warning(f"[alarm] cannot resolve a channel to post to: {e}")
+                    return
         if channel is None:
             logger.warning("[alarm] no channel available; dropping proactive message.")
             return
