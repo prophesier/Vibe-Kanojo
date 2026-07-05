@@ -37,6 +37,40 @@ from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
 
 
+# Tool-execution marker lines that get streamed to the UI and persisted into
+# chat history for human review (see _mcp_tool_marker, _run_builtin_tool /
+# _run_alarm_tool, and claude_llm's native web tags). They must be STRIPPED from
+# the copy of history replayed to the model: the model imitates them, emitting
+# the marker (and inventing the tool's result) without actually calling the tool
+# — the failure a "don't imitate" system note could not suppress. Live chat and
+# the stored history keep them; only the model's replay copy is cleaned.
+#
+# Each alternative is anchored to one marker's exact emoji + label on its OWN
+# line, so a URL/query inside a marker (which may contain '*') can't over- or
+# under-match — the trailing `.*\*` binds to the line's closing `*` — and the
+# character's own emoji use won't collide. Keep this in sync if a new marker is
+# added (currently: 🍔 Uber / 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set).
+_TOOL_MARKER_LINE_RE = re.compile(
+    r"^[ \t]*(?:"
+    r"🍔[ \t]*\*Uber Eats\*"
+    r"|🔍[ \t]*\*Web検索:.*\*"
+    r"|🔗[ \t]*\*Web取得:.*\*"
+    r"|⏰[ \t]*\*Alarm set:.*\*"
+    r")[ \t]*$"
+)
+
+
+def _strip_tool_markers(text: str) -> str:
+    """Remove tool-execution marker lines from an assistant turn before it is
+    replayed to the model. Operates line-wise (each marker occupies its own
+    line), so it can never eat adjacent reply text; leftover blank runs are
+    collapsed. See :data:`_TOOL_MARKER_LINE_RE`."""
+    if "*" not in text:  # every marker contains '*' — cheap fast path
+        return text
+    kept = [ln for ln in text.split("\n") if not _TOOL_MARKER_LINE_RE.match(ln)]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+
 class BasicMemoryAgent(AgentInterface):
     """Agent with basic chat memory and tool calling support."""
 
@@ -261,19 +295,10 @@ class BasicMemoryAgent(AgentInterface):
         "返信本文には絶対に含めてはならない。"
     )
 
-    # Tool-execution markers (🔍/🔗/🍔/⏰) get persisted into chat history as a
-    # display-only record, and the model otherwise imitates them. State plainly
-    # that they are auto-inserted history, not something to reproduce.
-    _TOOL_MARKER_NOTE = (
-        "【ツール実行マーカーについて】\n"
-        "会話履歴に時々現れる絵文字付きの短いマーカー"
-        "（例:「🔍 *Web検索: …*」「🔗 *Web取得: …*」「🍔 *Uber Eats*」"
-        "「⏰ *Alarm set: …*」）は、ツールが実行されたことをシステムが"
-        "自動で挿入した表示専用の記録であり、あなた自身が書くものではない。"
-        "これらのマーカーを真似て本文に出力してはならない。"
-        "ツールを使いたいときは、マーカー文字列を書くのではなく"
-        "実際にそのツールを呼び出すこと（文字列を書いても何も実行されない）。"
-    )
+    # (The old _TOOL_MARKER_NOTE — a "don't imitate these markers" instruction —
+    # is gone: markers are now stripped from the history replayed to the model
+    # (_strip_tool_markers), so it never sees them. The note both was moot and
+    # itself listed the marker glyphs in the prompt, which could seed imitation.)
 
     # Affirmative capability note for the self-set alarm tools. Claude tends to
     # ignore raw tool schemas, so state plainly the tool is real and must
@@ -310,8 +335,8 @@ class BasicMemoryAgent(AgentInterface):
         "【厳守】店名・評価・配送時間・配送料・メニュー・価格など、"
         "Uber Eats の具体的な情報を口にする前に、必ずその場で "
         "uber_search / uber_store を実際に呼び出すこと。"
-        "記憶・過去の会話・履歴に残る「🍔 *Uber Eats*」マーカーを根拠に、"
-        "ツールを呼ばずに店舗情報を作り出してはならない。"
+        "記憶や過去の会話にある店舗情報を根拠に、"
+        "ツールを呼ばずに新たな店舗情報を述べてはならない。"
         "まだ呼び出していなければ、あなたは実在のデータを一切持っていない——"
         "その状態で店名や数値を述べることは、ユーザーへの虚偽の案内になる。"
     )
@@ -569,7 +594,13 @@ class BasicMemoryAgent(AgentInterface):
         content = msg.get("content")
         if not isinstance(content, str) or not content:
             return None
-        if role == "user":
+        if role == "assistant":
+            # Strip tool-execution markers so the model doesn't see (and imitate)
+            # its own past 🍔/🔍/🔗/⏰ tags. They stay in the stored history.
+            content = _strip_tool_markers(content)
+            if not content:
+                return None
+        else:
             tag = self._format_timestamp(msg.get("timestamp", ""))
             content = f"{tag} {content}".strip()
         return {"role": role, "content": content}
@@ -1466,15 +1497,6 @@ class BasicMemoryAgent(AgentInterface):
             self._llm, OpenAICompatibleAsyncLLM
         )
 
-    def _has_marker_tools(self) -> bool:
-        """Whether any tool that emits an inline marker is active (web / MCP /
-        alarms), so the don't-imitate note is only added when it's relevant."""
-        return (
-            self._web_tools_enabled()
-            or self._alarm_store is not None
-            or bool(self._use_mcpp)
-        )
-
     def _uber_tools_active(self) -> bool:
         """Whether Uber Eats MCP tools are actually advertised this session, so
         the Uber capability note is only injected when the tool really exists
@@ -1496,8 +1518,6 @@ class BasicMemoryAgent(AgentInterface):
         raw tool schemas, so these affirmative notes (plus a hard no-fabricate
         rule for Uber) live in the prompt itself."""
         notes: List[str] = []
-        if self._has_marker_tools():
-            notes.append(self._TOOL_MARKER_NOTE)
         if self._alarm_store is not None:
             notes.append(self._ALARM_CAPABILITY_NOTE)
         if self._uber_tools_active():
