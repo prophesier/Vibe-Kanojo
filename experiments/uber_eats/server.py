@@ -143,6 +143,24 @@ async def uber_store(store_uuid: str) -> str:
     lines.append("  " + " · ".join(sub))
     if data.get("closed_message"):
         lines.append(f"  ⚠ {data['closed_message']}")
+    # Convenience/supermarket:商品数が多すぎるので商品は出さず、カテゴリ一覧だけ返す。
+    # 具体的な商品は uber_category で カテゴリ→サブカテゴリ と絞り込んでから見る。
+    if data.get("is_convenience"):
+        cats = data.get("categories") or []
+        if not cats:
+            lines.append("（カテゴリ一覧を取得できませんでした）")
+            return "\n".join(lines) + _RESULT_NOTE
+        lines.append(
+            f"\n■ コンビニ／スーパー（商品数が多いのでカテゴリのみ表示・{len(cats)}カテゴリ）"
+        )
+        for c in cats:
+            cnt = f"（約{c['num_items']}点）" if c.get("num_items") else ""
+            lines.append(f"- {c['title']}{cnt}\n    section_uuid: {c['section_uuid']}")
+        lines.append(
+            "\n※ カテゴリの中身は uber_category に store_uuid と section_uuid を渡す。"
+            "サブカテゴリ（細分類）が出たら、その subsection_uuid を渡すと商品が表示される。"
+        )
+        return "\n".join(lines) + _RESULT_NOTE
     if not data.get("menu"):
         lines.append("（メニュー項目を取得できませんでした）")
     for sec in data["menu"]:
@@ -169,6 +187,71 @@ async def uber_store(store_uuid: str) -> str:
             lines.append(line)
     if data.get("truncated"):
         lines.append("\n…（メニューは一部のみ表示）")
+    return "\n".join(lines) + _RESULT_NOTE
+
+
+def _fmt_catalog_item(it: dict) -> str:
+    """One catalog line: [品切れ] 名前  ¥価格  👍好評率…（uber_store と同じ体裁）。"""
+    so = "[品切れ] " if it.get("sold_out") else ""
+    price = f"  {it['price']}" if it.get("price") else ""
+    if it.get("like_rate"):
+        cnt = f"({it['num_ratings']}件)" if it.get("num_ratings") else ""
+        endo = f"  👍好評率{it['like_rate']}{cnt}"
+    elif it.get("top_liked_rank"):
+        endo = f"  👍ライク数#{it['top_liked_rank']}"
+    else:
+        endo = ""
+    line = f"- {so}{it['name']}{price}{endo}"
+    if it.get("customizable") and it.get("item_uuid"):
+        line += f"\n    ⚙ 選択肢あり → uber_item(item_uuid: {it['item_uuid']})"
+    return line
+
+
+@mcp.tool()
+async def uber_category(
+    store_uuid: str, section_uuid: str, subsection_uuid: str = "", offset: int = 0
+) -> str:
+    """コンビニ／スーパーなど商品数が多い店で、カテゴリの中身を見る。uber_store が返した
+    カテゴリの section_uuid を渡す。まずサブカテゴリ（細分類）の一覧が返るので、その中の
+    subsection_uuid を渡すと、そのサブカテゴリの商品（商品名・価格）が表示される。
+    サブカテゴリが無いカテゴリは、そのまま商品が表示される。offset で続きを取得できる。
+    閲覧専用で、注文や支払いはできない。
+    返り値はあなたの参照用で会話には残らないので、伝えたいことは返信本文に書くこと。"""
+    ok, data = await _run(
+        _client.catalog(store_uuid, section_uuid, subsection_uuid, offset),
+        f"uber_category({section_uuid!r},{subsection_uuid!r})",
+    )
+    if not ok:
+        return f"カテゴリを取得できませんでした: {data}"
+    subs = data.get("subcategories") or []
+    items = data.get("items") or []
+    chose_sub = bool((subsection_uuid or "").strip())
+    lines = []
+    # No subcategory chosen yet and this category HAS subcategories → show the
+    # 細分類 list only（ユーザー要望どおり、細分類を選んでから商品を出す）。
+    if not chose_sub and subs:
+        lines.append(
+            f"サブカテゴリ（細分類・{len(subs)}件）。"
+            "どれかの subsection_uuid を uber_category に渡すと商品が見られる："
+        )
+        for s in subs:
+            lines.append(f"- {s['title']}\n    subsection_uuid: {s['subsection_uuid']}")
+        return "\n".join(lines) + _RESULT_NOTE
+    # Otherwise show items (a subcategory was chosen, or the category has none).
+    if chose_sub:
+        cur = next(
+            (s["title"] for s in subs if s["subsection_uuid"] == subsection_uuid.strip()),
+            "",
+        )
+        if cur:
+            lines.append(f"■ {cur}")
+    if not items:
+        lines.append("（このカテゴリの商品を取得できませんでした）")
+    lines.extend(_fmt_catalog_item(it) for it in items)
+    if data.get("has_more"):
+        lines.append(
+            f"\n…（続きあり。offset={data['next_offset']} を uber_category に渡すと続き）"
+        )
     return "\n".join(lines) + _RESULT_NOTE
 
 

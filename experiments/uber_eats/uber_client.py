@@ -143,7 +143,10 @@ def _parse_store_card(st: Dict[str, Any]) -> Dict[str, Any]:
     fee = eta = original_fee = ""
     uber_one = surge = False
     sponsored = bool(st.get("storeAd"))
-    for b in st.get("meta") or []:
+    # MINI_STORE_WITH_ITEMS / ad cards carry the sponsor badge (and sometimes
+    # fee/ETA) in meta2 rather than meta; scan both. The `not fee`/`not eta`
+    # guards keep meta the primary source, so meta2 only fills gaps.
+    for b in (st.get("meta") or []) + (st.get("meta2") or []):
         if not isinstance(b, dict):
             continue
         bt, t = b.get("badgeType"), (b.get("text") or "").strip()
@@ -242,6 +245,33 @@ def _richtext(rt: Any) -> str:
             if isinstance(t, str):
                 out.append(t)
     return "".join(out).strip()
+
+
+def _label_text(t: Any) -> str:
+    """Pull display text from a title that may be a plain str, a ``{text}`` dict,
+    or a richText/segmented-control structure (aisle categories carry a plain
+    string; getCatalogPresentationV2 subcategory chips carry richText with an
+    ``accessibilityText``)."""
+    if isinstance(t, str):
+        return t.strip()
+    if isinstance(t, dict):
+        if t.get("accessibilityText"):
+            return str(t["accessibilityText"]).strip()
+        if isinstance(t.get("text"), str):
+            return t["text"].strip()
+        return _richtext(t)
+    return ""
+
+
+# Merchant types whose menus are "multi-level" category stores (conbini,
+# supermarket, drugstore…): hundreds/thousands of items across ~dozens of
+# aisles. These must be browsed by category, not dumped item-by-item.
+_CATEGORY_MERCHANT_TYPES = {
+    "MERCHANT_TYPE_CONVENIENCE",
+    "MERCHANT_TYPE_GROCERY",
+    "MERCHANT_TYPE_RETAIL",
+    "MERCHANT_TYPE_ALCOHOL",
+}
 
 
 class UberEatsClient:
@@ -381,7 +411,19 @@ class UberEatsClient:
         for fi in (data.get("data") or {}).get("feedItems") or []:
             if not isinstance(fi, dict):
                 continue
-            st = fi.get("store") or {}
+            # Two feed-card shapes carry a store:
+            #   REGULAR_STORE          -> fi["store"]
+            #   MINI_STORE_WITH_ITEMS  -> fi["miniStoreWithItems"]["store"]
+            # The mini cards are the dish-match tiles Uber groups under
+            # "その他の店"/related, and they are the BULK of a dish query
+            # (~65 of 79 for "ペペロンチーノ"). Reading only fi["store"] silently
+            # dropped them, so the character saw a tiny, unrepresentative subset.
+            # Handle both, preserving feed order.
+            st = fi.get("store")
+            if not isinstance(st, dict):
+                st = (fi.get("miniStoreWithItems") or {}).get("store")
+            if not isinstance(st, dict):
+                continue
             uid = st.get("storeUuid") or st.get("uuid")
             if not uid or uid in seen:
                 continue
@@ -391,6 +433,50 @@ class UberEatsClient:
                 break
         return out
 
+    @staticmethod
+    def _category_store_info(d: Dict[str, Any], store_uuid: str) -> List[Dict[str, Any]]:
+        """If ``d`` (a getStoreV1 data blob) is a multi-level category store
+        (conbini/supermarket/drugstore), return its aisle categories
+        (title + section_uuid + item count). Otherwise return ``[]``.
+
+        Detected via ``menuDisplayType == USE_SECTION_AS_CATEGORY`` (the grocery
+        layout flag) or a category merchant type — a normal restaurant matches
+        neither. Categories come from ``aisles`` (the app's L1 nav), which is the
+        clean list of top-level sections with per-section item counts.
+        """
+        merchant = (
+            ((d.get("storeMerchantTypeInfo") or {}).get("uberMerchantType") or {}).get(
+                "type"
+            )
+            or ""
+        )
+        is_category = (
+            d.get("menuDisplayType") == "USE_SECTION_AS_CATEGORY"
+            or merchant in _CATEGORY_MERCHANT_TYPES
+        )
+        if not is_category:
+            return []
+        aisles = d.get("aisles") or {}
+        lst = aisles.get(store_uuid) or next(iter(aisles.values()), []) if aisles else []
+        cats: List[Dict[str, Any]] = []
+        for a in lst or []:
+            if not isinstance(a, dict):
+                continue
+            p = (a.get("payload") or {}).get("categoryItemPayload") or {}
+            title = _label_text(p.get("title"))
+            sec = p.get("sectionUUID") or a.get("catalogSectionUUID")
+            if not title or not sec:
+                continue
+            an = p.get("catalogSectionAnalyticsData") or {}
+            cats.append(
+                {
+                    "title": title,
+                    "section_uuid": sec,
+                    "num_items": an.get("totalNumItems") or 0,
+                }
+            )
+        return cats
+
     async def store(self, store_uuid: str, max_items: int = 60) -> Dict[str, Any]:
         """Return a store's header (rating + review count, ETA, distance, delivery
         fee, open status/hours) and its menu (sectioned; each item has name, price,
@@ -398,13 +484,18 @@ class UberEatsClient:
 
         Cross-promo sections that splice in OTHER stores' products
         (【ドリンクもどうぞ】 etc.) are filtered out so the menu is the store's own.
+
+        For a multi-level category store (conbini/supermarket), the item menu is
+        skipped (too many items) and ``categories`` (aisles) is returned instead
+        with ``is_convenience=True``; the caller drills in via :meth:`catalog`.
         """
         if not store_uuid or not store_uuid.strip():
             raise UberUnavailable("store_uuid が指定されていません。")
+        store_uuid = store_uuid.strip()
         data = await self._call(
             "getStoreV1",
             {
-                "storeUuid": store_uuid.strip(),
+                "storeUuid": store_uuid,
                 "diningMode": "DELIVERY",
                 "time": {"asap": True},
                 "cbType": "EATER_ENDORSED",
@@ -415,6 +506,7 @@ class UberEatsClient:
             raise UberUnavailable(
                 "店舗情報が取得できませんでした（store_uuid が無効かもしれません）。"
             )
+        categories = self._category_store_info(d, store_uuid)
         sec_titles = {
             s.get("uuid"): (s.get("title") or "")
             for s in (d.get("sections") or [])
@@ -423,7 +515,11 @@ class UberEatsClient:
         menu: List[Dict[str, Any]] = []
         total = 0
         seen: set = set()  # de-dupe: Uber repeats items across sections (popular, etc.)
-        for sec_uuid, entries in (d.get("catalogSectionsMap") or {}).items():
+        # Category stores: skip the item flood — the header + aisle categories are
+        # returned instead (drill in with catalog()).
+        for sec_uuid, entries in (
+            {} if categories else (d.get("catalogSectionsMap") or {})
+        ).items():
             sec_title = sec_titles.get(sec_uuid, "")
             if sec_title and _CROSS_PROMO_RE.search(sec_title):
                 continue  # other stores' products spliced in — not this store's menu
@@ -494,6 +590,85 @@ class UberEatsClient:
             "closed_message": str(d.get("closedMessage") or ""),
             "menu": menu,
             "truncated": total >= max_items,
+            "is_convenience": bool(categories),
+            "categories": categories,
+        }
+
+    async def catalog(
+        self,
+        store_uuid: str,
+        section_uuid: str,
+        subsection_uuid: str = "",
+        offset: int = 0,
+        max_items: int = 40,
+    ) -> Dict[str, Any]:
+        """Browse ONE category of a multi-level store (conbini/supermarket) via
+        getCatalogPresentationV2. Returns that category's subcategory chips
+        (``segmentedControlData`` — the 細分類) and its items (paged).
+
+        Pass ``subsection_uuid`` to scope items to one subcategory. ``offset``
+        pages within the (sub)category — ``next_offset`` / ``has_more`` tell the
+        caller how to continue.
+        """
+        if not store_uuid or not store_uuid.strip():
+            raise UberUnavailable("store_uuid が指定されていません。")
+        if not section_uuid or not section_uuid.strip():
+            raise UberUnavailable("section_uuid が指定されていません。")
+        subs = [subsection_uuid.strip()] if subsection_uuid and subsection_uuid.strip() else None
+        data = await self._call(
+            "getCatalogPresentationV2",
+            {
+                "storeFilters": {
+                    "storeUuid": store_uuid.strip(),
+                    "sectionUuids": [section_uuid.strip()],
+                    "subsectionUuids": subs,
+                    "shouldReturnSegmentedControlData": True,
+                },
+                "pagingInfo": {"enabled": True, "offset": int(offset or 0)},
+                "source": "NV_L1_CAROUSEL",
+            },
+        )
+        d = data.get("data") or {}
+        # Subcategories (細分類). The leading "すべて" (all) tab has uuid=None; drop it.
+        subcats: List[Dict[str, Any]] = []
+        for s in ((d.get("segmentedControlData") or {}).get("segmentedControlItems") or []):
+            if not isinstance(s, dict):
+                continue
+            su, title = s.get("uuid"), _label_text(s.get("title"))
+            if su and title:
+                subcats.append({"title": title, "subsection_uuid": su})
+        items: List[Dict[str, Any]] = []
+        for e in d.get("catalog") or []:
+            sip = ((e or {}).get("payload") or {}).get("standardItemsPayload") or {}
+            for it in sip.get("catalogItems") or []:
+                if not isinstance(it, dict):
+                    continue
+                price = it.get("price")
+                if isinstance(price, (int, float)) and price:
+                    price_s = f"¥{int(price) // 100}"  # price is in 1/100 yen
+                else:
+                    pt = it.get("priceTagline")
+                    price_s = pt.get("text", "") if isinstance(pt, dict) else (pt or "")
+                items.append(
+                    {
+                        "name": it.get("title", ""),
+                        "price": price_s,
+                        "item_uuid": it.get("uuid", ""),
+                        "sold_out": bool(it.get("isSoldOut")),
+                        "customizable": bool(it.get("hasCustomizations")),
+                        **_item_endorsement(it),
+                    }
+                )
+                if len(items) >= max_items:
+                    break
+            if len(items) >= max_items:
+                break
+        paging = d.get("pagingInfo") or {}
+        return {
+            "subcategories": subcats,
+            "items": items,
+            "has_more": bool(paging.get("hasMore")),
+            "next_offset": paging.get("offset") or 0,
         }
 
     async def item(self, store_uuid: str, item_uuid: str) -> Dict[str, Any]:
