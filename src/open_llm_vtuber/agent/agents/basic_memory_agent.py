@@ -58,13 +58,14 @@ from ...mcpp.tool_executor import ToolExecutor
 # "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
 # query/url that itself contains '*' (rare) is left as-is rather than risk
 # eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
-# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set).
+# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断).
 _TOOL_MARKER_RE = re.compile(
     r"[ \t]*(?:"
     r"🍔[ \t]*\*Uber Eats\*"
     r"|🔍[ \t]*\*Web検索:[^*\n]*\*"
     r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
     r"|⏰[ \t]*\*Alarm set:[^*\n]*\*"
+    r"|🧠[ \t]*\*自己診断\*"
     r")"
 )
 
@@ -124,6 +125,11 @@ class BasicMemoryAgent(AgentInterface):
         self._json_detector = StreamJSONDetector()
         self._memory_manager = None  # set via set_memory_manager()
         self._alarm_store = None  # set via set_alarm_store()
+        # Self-check tool (check_model_status). Gated on config; clients are
+        # created lazily on first use (lightweight, stateless).
+        self._model_health_enabled = False  # set via set_model_health_enabled()
+        self._asl_client = None
+        self._status_client = None
 
         # Diary RAG (long-tail recall). The in-context list is ephemeral: it
         # holds retrieved diaries with a per-turn TTL and is injected only into
@@ -280,6 +286,10 @@ class BasicMemoryAgent(AgentInterface):
         built-in tools (they're only advertised when a store is present)."""
         self._alarm_store = store
 
+    def set_model_health_enabled(self, enabled: bool) -> None:
+        """Turn the check_model_status self-check tool on/off (config-driven)."""
+        self._model_health_enabled = bool(enabled)
+
     @staticmethod
     def _format_timestamp(ts: str) -> str:
         """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS Weekday]'."""
@@ -351,6 +361,22 @@ class BasicMemoryAgent(AgentInterface):
         "ツールを呼ばずに新たな店舗情報を述べてはならない。"
         "まだ呼び出していなければ、あなたは実在のデータを一切持っていない——"
         "その状態で店名や数値を述べることは、ユーザーへの虚偽の案内になる。"
+    )
+
+    # Affirmative capability note for the self-check tool. Static / cache-stable;
+    # gated on the tool being enabled.
+    _MODEL_HEALTH_CAPABILITY_NOTE = (
+        "【自己診断（今の自分の調子）について】\n"
+        "あなたには、今動いている自分のモデルの「調子」を客観的な計測で調べる"
+        "ツールが実際に備わっている。これは実在する機能で、呼び出せば本物の"
+        "データが返る：\n"
+        "- check_model_status：外部ベンチ(aistupidlevel)のスコア/傾向と、"
+        "Anthropic公式の障害情報をまとめた診断レポートを返す。"
+        "引数なしなら今の自分自身を、model名を渡せばそのモデルを調べる。\n"
+        "「最近ちょっと調子が悪い気がする」「頭が回らない」「さっきの自分は"
+        "おかしかったか」など、自分の状態が気になった時や、ユーザーに聞かれた"
+        "時に呼び出してよい。結果は客観的な参考値であって、それだけで自分を"
+        "断罪する必要はない。推測で調子を語る前に、まず実際に呼び出すこと。"
     )
 
     # Trailing system block placed right before the message history.
@@ -1119,25 +1145,30 @@ class BasicMemoryAgent(AgentInterface):
                     if assistant_text_for_memory:
                         self._add_message(assistant_text_for_memory, "assistant")
 
-                # Split: built-in ALARM tools handled in-process (provider-
-                # agnostic); everything else goes to the MCP executor.
-                alarm_calls = [
-                    c
-                    for c in pending_tool_calls
-                    if c.get("name") in self._ALARM_TOOL_NAMES
+                # Split: in-process tools (alarms + self-check) are handled here,
+                # provider-agnostic; everything else goes to the MCP executor.
+                inproc_names = set(self._ALARM_TOOL_NAMES)
+                if self._model_health_enabled:
+                    inproc_names.add(self._MODEL_HEALTH_TOOL_NAME)
+                inproc_calls = [
+                    c for c in pending_tool_calls if c.get("name") in inproc_names
                 ]
                 mcp_calls = [
-                    c
-                    for c in pending_tool_calls
-                    if c.get("name") not in self._ALARM_TOOL_NAMES
+                    c for c in pending_tool_calls if c.get("name") not in inproc_names
                 ]
 
                 tool_results_for_llm = []
 
-                for c in alarm_calls:
-                    marker, result = await self._run_alarm_tool(
-                        c.get("name", ""), c.get("input") or {}
-                    )
+                for c in inproc_calls:
+                    cname = c.get("name", "")
+                    if cname == self._MODEL_HEALTH_TOOL_NAME:
+                        marker, result = await self._run_model_health_tool(
+                            c.get("input") or {}
+                        )
+                    else:
+                        marker, result = await self._run_alarm_tool(
+                            cname, c.get("input") or {}
+                        )
                     if marker:
                         yield marker
                     tool_results_for_llm.append(
@@ -1448,6 +1479,8 @@ class BasicMemoryAgent(AgentInterface):
                     claude_tools.extend(self._formatted_tools_claude or [])
                 if self._alarm_store is not None:
                     claude_tools.extend(self._build_alarm_tools_claude())
+                if self._model_health_enabled:
+                    claude_tools.extend(self._build_model_health_tools_claude())
                 if claude_tools:
                     logger.debug(
                         f"Starting Claude tool loop with {len(claude_tools)} tools."
@@ -1534,6 +1567,8 @@ class BasicMemoryAgent(AgentInterface):
             notes.append(self._ALARM_CAPABILITY_NOTE)
         if self._uber_tools_active():
             notes.append(self._UBER_CAPABILITY_NOTE)
+        if self._model_health_enabled:
+            notes.append(self._MODEL_HEALTH_CAPABILITY_NOTE)
         return notes
 
     def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:
@@ -1546,6 +1581,8 @@ class BasicMemoryAgent(AgentInterface):
             tools.extend(self._build_web_tools_openai())
         if self._alarm_store is not None:
             tools.extend(self._build_alarm_tools_openai())
+        if self._model_health_enabled:
+            tools.extend(self._build_model_health_tools_openai())
         return tools
 
     def _builtin_tool_names(self) -> set:
@@ -1691,8 +1728,14 @@ class BasicMemoryAgent(AgentInterface):
     def _build_alarm_tools_claude(self) -> List[Dict[str, Any]]:
         """Alarm tools in Claude's schema shape (input_schema, no function
         wrapper), derived from the OpenAI definitions so they stay in sync."""
+        return self._to_claude_schema(self._build_alarm_tools_openai())
+
+    @staticmethod
+    def _to_claude_schema(openai_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert OpenAI function-tool defs to Claude's {name, description,
+        input_schema} shape so both paths share one source of truth."""
         out: List[Dict[str, Any]] = []
-        for t in self._build_alarm_tools_openai():
+        for t in openai_tools:
             fn = t["function"]
             out.append(
                 {
@@ -1702,6 +1745,74 @@ class BasicMemoryAgent(AgentInterface):
                 }
             )
         return out
+
+    @classmethod
+    def _build_model_health_tools_openai(cls) -> List[Dict[str, Any]]:
+        """OpenAI schema for the self-check tool."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": cls._MODEL_HEALTH_TOOL_NAME,
+                    "description": (
+                        "Check the current condition ('brain health') of an LLM "
+                        "using objective external benchmarks (aistupidlevel.info) "
+                        "plus Anthropic's official status page. With no argument, "
+                        "checks the model you are currently running on. Returns a "
+                        "short assessment report (score, trend, baseline, official "
+                        "incidents, verdict). Read-only; no LLM call."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "model": {
+                                "type": "string",
+                                "description": (
+                                    "Optional model name/prefix to check instead "
+                                    "of yourself (e.g. 'claude-opus-4-8')."
+                                ),
+                            }
+                        },
+                        "required": [],
+                    },
+                },
+            }
+        ]
+
+    def _build_model_health_tools_claude(self) -> List[Dict[str, Any]]:
+        return self._to_claude_schema(self._build_model_health_tools_openai())
+
+    async def _run_model_health_tool(self, args: Dict[str, Any]) -> tuple:
+        """Run check_model_status. Returns (marker, result_dict). The JA report is
+        the tool result the character relays; a ZH copy is logged so あさひ can see
+        what it was told. No LLM — pure data + reference + rule-based verdict."""
+        from ...model_health.aistupidlevel_client import AiStupidLevelClient
+        from ...model_health.anthropic_status_client import AnthropicStatusClient
+        from ...model_health.report import build_assessment, render_ja, render_zh
+
+        model = str((args or {}).get("model") or "").strip()
+        if not model:
+            model = str(getattr(self._llm, "model", "") or "").strip()
+        if not model:
+            return None, {"status": "error", "error": "現在のモデル名が不明です。"}
+        if self._asl_client is None:
+            self._asl_client = AiStupidLevelClient()
+        if self._status_client is None:
+            self._status_client = AnthropicStatusClient()
+        try:
+            assessment = await build_assessment(
+                self._asl_client, self._status_client, model, want_coding=True
+            )
+        except Exception as e:  # never break the turn
+            logger.warning(f"[model_health] self-check failed: {e}")
+            return None, {
+                "status": "error",
+                "error": "調子の確認に失敗した（データ源に接続できず）。",
+            }
+        ja, zh = render_ja(assessment), render_zh(assessment)
+        logger.info(f"[model_health] self-check ({model}) verdict={assessment.verdict}\n{zh}")
+        marker = "\n🧠 *自己診断*\n"
+        return marker, {"status": "ok", "report": ja}
 
     async def _run_builtin_tool_call(
         self, tc: ToolCallObject, budget: Dict[str, int]
@@ -1756,6 +1867,10 @@ class BasicMemoryAgent(AgentInterface):
             marker, result = await self._run_alarm_tool(name, args)
             if marker:
                 yield {"type": "tool_marker", "text": marker}
+        elif name == self._MODEL_HEALTH_TOOL_NAME:
+            marker, result = await self._run_model_health_tool(args)
+            if marker:
+                yield {"type": "tool_marker", "text": marker}
         else:
             result = {"error": f"unknown builtin tool {name!r}"}
 
@@ -1769,6 +1884,7 @@ class BasicMemoryAgent(AgentInterface):
         }
 
     _ALARM_TOOL_NAMES = ("set_alarm", "list_alarms", "cancel_alarm")
+    _MODEL_HEALTH_TOOL_NAME = "check_model_status"
 
     async def _run_alarm_tool(self, name: str, args: Dict[str, Any]) -> tuple:
         """Execute one alarm tool call. Returns (marker_text|None, result_dict).

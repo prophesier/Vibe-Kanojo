@@ -653,3 +653,38 @@ discord_config:
   # mode (Settings → Advanced), right-click your profile, "Copy User ID".
   # NEVER commit a real ID — fill it in only in your local conf.yaml.
   admin_user_id: 0
+
+# Model-degradation monitor + the character's self-check tool. Both read
+# benchmark scores from aistupidlevel.info and the official Anthropic status
+# page. Fully independent of the LLM chat pipeline.
+model_health_config:
+  # Enable the background monitor in the Discord bot: it polls aistupidlevel and
+  # posts a standalone alert to Discord when a watched model degrades/recovers.
+  monitor_enabled: false
+  # Model name prefixes to watch (matched against aistupidlevel names).
+  watch_models:
+    - "claude-opus-4-8"
+    - "claude-fable-5"
+    - "claude-opus-4-6"
+  # Subset of watch_models whose coding-axis score is also checked/shown.
+  coding_models:
+    - "claude-opus-4-8"
+    - "claude-fable-5"
+  # Poll interval (seconds). Site data is hourly; 1200 (20 min) is plenty.
+  poll_seconds: 1200
+  # Absolute floor: currentScore below this always alerts (regardless of the
+  # site's status). Default 60.
+  score_floor: 60.0
+  # Alert when currentScore is at least this many points below the model's real
+  # 7-day average. Lower = more sensitive/chattier. (A 7-day DOWN trend below the
+  # average also alerts regardless of this value.) Default 8.
+  current_drop_warn: 8.0
+  # Channel ID for alerts. 0 = the character's active/last channel, so you see
+  # it where you actually look (mobile has no sidebar to catch a red dot).
+  alert_channel_id: 0
+  # Prefix alerts with an @mention of discord_config.admin_user_id so they ping
+  # you even when the channel is muted.
+  mention_admin_on_alert: true
+  # Give the character a check_model_status tool to look up its own (or a named
+  # model's) benchmark + official-status report.
+  self_check_tool_enabled: true

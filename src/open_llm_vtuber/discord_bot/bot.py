@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Literal, Optional
 
@@ -126,6 +126,8 @@ class DiscordVTuberBot(discord.Client):
         self._admin_user_id = int(admin_user_id or 0)
         self._project_root = Path(project_root) if project_root else Path.cwd()
         self._full_config = full_config
+        self._model_health_cfg = getattr(full_config, "model_health_config", None)
+        self._monitor_started = False  # guard: start the poll loop once
         # Last expression face sent to Discord; only re-send when it changes.
         self._last_face_index: Optional[int] = None
         # Last channel the bot interacted in, used as the target for proactive
@@ -262,6 +264,28 @@ class DiscordVTuberBot(discord.Client):
                 text=f"Reported {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
+
+        @self._tree.command(
+            name="model-status",
+            description="模型降智自检：手动触发一次检查并打印报告（admin only）",
+        )
+        @app_commands.describe(
+            model="可选：指定模型名前缀（如 claude-opus-4-8）。留空=所有监控中的模型"
+        )
+        async def model_status_cmd(
+            interaction: discord.Interaction, model: Optional[str] = None
+        ) -> None:
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+            await interaction.response.defer()  # public: print the report to the channel
+            try:
+                embed = await self._build_model_status_embed(model)
+            except Exception as e:
+                logger.exception("model-status failed")
+                await interaction.followup.send(f"自检失败: {type(e).__name__}: {e}")
+                return
+            await interaction.followup.send(embed=embed)
 
         @self._tree.command(
             name="refresh-faces",
@@ -580,6 +604,8 @@ class DiscordVTuberBot(discord.Client):
         # channel. This is a one-shot: the state file is deleted after the
         # attempt regardless of success.
         await self._maybe_announce_restart_complete()
+        # Standalone model-degradation monitor (independent of the LLM path).
+        self._start_degradation_monitor()
 
     async def _maybe_announce_restart_complete(self) -> None:
         state_path = self._restart_state_path()
@@ -831,6 +857,151 @@ class DiscordVTuberBot(discord.Client):
             logger.info("[alarm] proactive message posted to Discord.")
         except Exception as e:
             logger.warning(f"[alarm] failed to post proactive message: {e}")
+
+    # -- model-degradation monitor (standalone; no LLM involved) ------------
+    def _start_degradation_monitor(self) -> None:
+        """Spin up the background poll loop once, if configured. Isolated from the
+        LLM/bridge path entirely — it only reads public APIs and posts alerts."""
+        cfg = self._model_health_cfg
+        if self._monitor_started or cfg is None or not getattr(cfg, "monitor_enabled", False):
+            return
+        try:
+            from ..model_health.monitor import DegradationMonitor, MonitorConfig
+            from ..model_health.detector import DetectorParams
+        except Exception as e:
+            logger.warning(f"[model_health] monitor unavailable: {e}")
+            return
+        self._monitor_started = True
+        mon_cfg = MonitorConfig(
+            enabled=True,
+            watch=list(cfg.watch_models),
+            coding_models=list(cfg.coding_models),
+            poll_seconds=int(cfg.poll_seconds),
+            state_path=self._project_root / "cache" / "model_health_state.json",
+        )
+        params = DetectorParams(
+            floor=float(getattr(cfg, "score_floor", 60.0)),
+            cur_drop=float(getattr(cfg, "current_drop_warn", 8.0)),
+        )
+        # It polls once immediately on start (before the first sleep), so a model
+        # already degraded when the bot comes up alerts right away — no report if
+        # nothing changed.
+        monitor = DegradationMonitor(mon_cfg, params=params)
+
+        def _now() -> str:
+            return datetime.now(timezone.utc).isoformat()
+
+        asyncio.create_task(monitor.run(self._send_degradation_alert, _now))
+        logger.info("[model_health] degradation monitor task started.")
+
+    async def _resolve_alert_channel(self) -> Optional[discord.abc.Messageable]:
+        """Alert target: the configured alert_channel_id if set, else the same
+        chain proactive messages use (last-active → persisted → first configured),
+        so alerts land where あさひ actually looks."""
+        cfg = self._model_health_cfg
+        cid = int(getattr(cfg, "alert_channel_id", 0) or 0)
+        if not cid:
+            if self._last_channel is not None:
+                return self._last_channel
+            cid = (
+                self._proactive_channel_id
+                or self._load_proactive_channel_id()
+                or (int(self._channel_ids[0]) if self._channel_ids else 0)
+            )
+        if not cid:
+            return None
+        try:
+            return self.get_channel(cid) or await self.fetch_channel(cid)
+        except Exception as e:
+            logger.warning(f"[model_health] cannot resolve alert channel: {e}")
+            return None
+
+    async def _send_degradation_alert(self, view: dict) -> None:
+        """Post a render-ready alert view (from the monitor — model OR official
+        Anthropic status) as an embed, with an optional @mention so it pings even
+        when muted. Also logs a plain copy."""
+        logger.info(
+            f"[model_health] ALERT: {view.get('title')} — {view.get('description')}"
+        )
+        channel = await self._resolve_alert_channel()
+        if channel is None:
+            logger.warning("[model_health] no channel to post degradation alert.")
+            return
+        embed = discord.Embed(
+            title=view["title"],
+            description=view["description"],
+            color=view["color"],
+            url=view.get("url") or None,
+        )
+        for name, value in view["fields"]:
+            embed.add_field(name=name, value=value, inline=False)
+        if view.get("footer"):
+            embed.set_footer(text=view["footer"])
+        content = None
+        cfg = self._model_health_cfg
+        if getattr(cfg, "mention_admin_on_alert", False) and self._admin_user_id:
+            content = f"<@{self._admin_user_id}>"
+        try:
+            await channel.send(content=content, embed=embed)
+            logger.info("[model_health] degradation alert posted to Discord.")
+        except Exception as e:
+            logger.warning(f"[model_health] failed to post degradation alert: {e}")
+
+    async def _build_model_status_embed(self, model: Optional[str]) -> discord.Embed:
+        """Build the /model-status report embed: a per-model line (score/status/
+        trend/baseline/verdict) plus Anthropic's official status once. A manual
+        on-demand snapshot — always reports, regardless of alert state."""
+        from ..model_health.aistupidlevel_client import AiStupidLevelClient
+        from ..model_health.anthropic_status_client import AnthropicStatusClient
+        from ..model_health.report import (
+            build_assessment,
+            V_OFFICIAL, V_BENCH, V_DECLINING, V_NORMAL, V_UNKNOWN,
+        )
+
+        cfg = self._model_health_cfg
+        asl, sc = AiStupidLevelClient(), AnthropicStatusClient()
+        models = (
+            [model]
+            if model
+            else (list(getattr(cfg, "watch_models", []) or []) or ["claude-opus-4-6"])
+        )
+        coding = set(getattr(cfg, "coding_models", []) or [])
+        emoji = {V_OFFICIAL: "🔴", V_BENCH: "⚠️", V_DECLINING: "🟠", V_NORMAL: "✅", V_UNKNOWN: "❔"}
+        zh = {
+            V_OFFICIAL: "官方报告故障/降级", V_BENCH: "基准明显偏低（可能降智）",
+            V_DECLINING: "有下降趋势", V_NORMAL: "正常范围", V_UNKNOWN: "无计测数据",
+        }
+        embed = discord.Embed(title="🩺 模型状态自检", color=0x5865F2)
+        official_added = False
+        for name in models[:6]:
+            a = await build_assessment(asl, sc, name, want_coding=(name in coding))
+            sc_s = f"{a.current_score:.0f}" if a.current_score is not None else "?"
+            base = f" · 近7天~{a.baseline:.0f}" if a.baseline is not None else ""
+            cod = f" · 编程{a.coding_score:.0f}" if a.coding_score is not None else ""
+            embed.add_field(
+                name=name,
+                value=f"{emoji.get(a.verdict, '')} {sc_s}/100 "
+                f"({a.status or '?'}, {a.trend or '?'}){base}{cod}\n{zh.get(a.verdict, a.verdict)}",
+                inline=False,
+            )
+            if not official_added and a.official is not None:
+                off = a.official
+                if not off.ok:
+                    ov = "获取失败"
+                elif off.is_degraded:
+                    inc = off.unresolved_incidents[0].name if off.unresolved_incidents else ""
+                    ov = (
+                        f"⚠️ indicator={off.indicator} · Claude API={off.claude_api_status or '?'}"
+                        + (f" · 「{inc}」" if inc else "")
+                    )
+                else:
+                    ov = "✅ 全部正常"
+                embed.add_field(name="Anthropic 官方状态", value=ov, inline=False)
+                official_added = True
+        embed.set_footer(
+            text=f"aistupidlevel + status.anthropic.com · {datetime.now().strftime('%H:%M:%S')}"
+        )
+        return embed
 
     async def _maybe_send_face(
         self, channel: discord.abc.Messageable, face_index: Optional[int]

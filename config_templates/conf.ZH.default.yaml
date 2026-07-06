@@ -616,3 +616,33 @@ discord_config:
   # 获取方式：Discord 设置 → 高级 → 开启开发者模式，右键自己头像 → "复制用户 ID"。
   # 切勿提交真实 ID — 只在本地 conf.yaml 里填。
   admin_user_id: 0
+
+# 模型降智监控 + 角色自检工具。二者都从 aistupidlevel.info 与 Anthropic 官方
+# 状态页读取数据，完全独立于 LLM 聊天链路。
+model_health_config:
+  # 在 Discord bot 中启用后台监控：轮询 aistupidlevel，被监控模型降智/恢复时
+  # 向 Discord 推送独立告警。
+  monitor_enabled: false
+  # 要监控的模型名前缀（与 aistupidlevel 的 name 前缀匹配）。
+  watch_models:
+    - "claude-opus-4-8"
+    - "claude-fable-5"
+    - "claude-opus-4-6"
+  # watch_models 的子集，额外检查并展示其编程维度分数。
+  coding_models:
+    - "claude-opus-4-8"
+    - "claude-fable-5"
+  # 轮询间隔（秒）。站点数据小时级，1200（20 分钟）足够。
+  poll_seconds: 1200
+  # 绝对地板：综合分低于此值一律告警（不管站点 status）。默认 60。
+  score_floor: 60.0
+  # 综合分低于该模型真实的7天均值达到此分数就告警。越小越灵敏、越吵。
+  # （另外，7天趋势为「下降」且低于均值时也会告警。）默认 8。
+  current_drop_warn: 8.0
+  # 告警频道 ID。0 = 角色当前/最后活跃的频道，方便你在常看的地方看到
+  # （手机端没有侧边栏，频道小红点容易漏）。
+  alert_channel_id: 0
+  # 告警前带上 @discord_config.admin_user_id，即使频道静音也能提醒到你。
+  mention_admin_on_alert: true
+  # 给角色一个 check_model_status 工具，可查自己（或指定模型）的基准分 + 官方状态。
+  self_check_tool_enabled: true

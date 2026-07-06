@@ -476,6 +476,15 @@ class ServiceContext:
                     get_alarm_store(self.character_config.conf_uid)
                 )
 
+            # Enable the check_model_status self-check tool when configured.
+            mh_cfg = getattr(self.config, "model_health_config", None)
+            if (
+                mh_cfg
+                and getattr(mh_cfg, "self_check_tool_enabled", False)
+                and hasattr(self.agent_engine, "set_model_health_enabled")
+            ):
+                self.agent_engine.set_model_health_enabled(True)
+
             # Wire up persistent memory if enabled. Backfill is *not* scheduled
             # here because init_agent runs inside asyncio.run() during server
             # startup — any task created on that throwaway event loop would be

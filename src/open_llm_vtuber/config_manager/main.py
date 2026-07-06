@@ -6,6 +6,7 @@ from .system import SystemConfig
 from .character import CharacterConfig
 from .live import LiveConfig
 from .discord import DiscordConfig
+from .model_health import ModelHealthConfig
 from .i18n import I18nMixin, Description
 
 
@@ -20,6 +21,9 @@ class Config(I18nMixin, BaseModel):
     discord_config: DiscordConfig = Field(
         default=DiscordConfig(), alias="discord_config"
     )
+    model_health_config: ModelHealthConfig = Field(
+        default=ModelHealthConfig(), alias="model_health_config"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "system_config": Description(
@@ -33,5 +37,9 @@ class Config(I18nMixin, BaseModel):
         ),
         "discord_config": Description(
             en="Discord bridge configuration settings", zh="Discord 桥接配置"
+        ),
+        "model_health_config": Description(
+            en="Model-degradation monitor + self-check tool settings",
+            zh="模型降智监控 + 自检工具配置",
         ),
     }
