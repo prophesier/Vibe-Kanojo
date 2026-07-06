@@ -45,30 +45,42 @@ from ...mcpp.tool_executor import ToolExecutor
 # — the failure a "don't imitate" system note could not suppress. Live chat and
 # the stored history keep them; only the model's replay copy is cleaned.
 #
-# Each alternative is anchored to one marker's exact emoji + label on its OWN
-# line, so a URL/query inside a marker (which may contain '*') can't over- or
-# under-match — the trailing `.*\*` binds to the line's closing `*` — and the
-# character's own emoji use won't collide. Keep this in sync if a new marker is
-# added (currently: 🍔 Uber / 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set).
-_TOOL_MARKER_LINE_RE = re.compile(
-    r"^[ \t]*(?:"
+# The markers are EMITTED as "\n<glyph> *…*\n", but the sentence/TTS pipeline
+# collapses those newlines before the turn is persisted, so in stored history
+# they sit INLINE, glued to the reply text (e.g. "…では試す。🔍 *Web検索: …*[neutral]
+# ……"). So match/remove them as an inline substring — NOT line-anchored (an
+# earlier line-anchored version matched zero real markers and the model kept
+# imitating them).
+#
+# Each alternative is keyed to its exact glyph + label, and the variable
+# query/url is bound with [^*\n]* so removal stops at the marker's OWN closing
+# '*'. That is deliberately conservative: replies contain real markdown like
+# "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
+# query/url that itself contains '*' (rare) is left as-is rather than risk
+# eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
+# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set).
+_TOOL_MARKER_RE = re.compile(
+    r"[ \t]*(?:"
     r"🍔[ \t]*\*Uber Eats\*"
-    r"|🔍[ \t]*\*Web検索:.*\*"
-    r"|🔗[ \t]*\*Web取得:.*\*"
-    r"|⏰[ \t]*\*Alarm set:.*\*"
-    r")[ \t]*$"
+    r"|🔍[ \t]*\*Web検索:[^*\n]*\*"
+    r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
+    r"|⏰[ \t]*\*Alarm set:[^*\n]*\*"
+    r")"
 )
 
 
 def _strip_tool_markers(text: str) -> str:
-    """Remove tool-execution marker lines from an assistant turn before it is
-    replayed to the model. Operates line-wise (each marker occupies its own
-    line), so it can never eat adjacent reply text; leftover blank runs are
-    collapsed. See :data:`_TOOL_MARKER_LINE_RE`."""
+    """Remove tool-execution markers from an assistant turn before it is replayed
+    to the model (it imitates them — emits the marker and fabricates the tool's
+    result without calling it). Markers stay in stored history / live chat, so
+    they remain human-searchable; only the model's replay copy is cleaned.
+
+    Strips the marker wherever it sits inline (the TTS pipeline collapses the
+    newlines it was emitted with); the bounded variable part can't eat the
+    reply's own '**bold**'. See :data:`_TOOL_MARKER_RE`."""
     if "*" not in text:  # every marker contains '*' — cheap fast path
         return text
-    kept = [ln for ln in text.split("\n") if not _TOOL_MARKER_LINE_RE.match(ln)]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return re.sub(r"\n{3,}", "\n\n", _TOOL_MARKER_RE.sub("", text)).strip()
 
 
 class BasicMemoryAgent(AgentInterface):
