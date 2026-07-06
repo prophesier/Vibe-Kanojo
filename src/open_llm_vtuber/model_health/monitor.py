@@ -132,38 +132,70 @@ class DegradationMonitor:
 _EVENT_ZH = {"DEGRADED": "降智", "ESCALATED": "进一步降智", "RECOVERED": "已恢复"}
 _EVENT_EMOJI = {"DEGRADED": "⚠️", "ESCALATED": "🔴", "RECOVERED": "✅"}
 _COLOR = {"DEGRADED": 0xE67E22, "ESCALATED": 0xE74C3C, "RECOVERED": 0x2ECC71}
+# Site fields, translated for humans. status = the site's rating band for the
+# current score; trend = the site's 7-day SCORE trend (about the benchmark
+# score, NOT server uptime).
+STATUS_ZH = {"good": "良好", "warning": "警告", "critical": "危险", "": "未知"}
+TREND_ZH = {"up": "上升 ↑", "down": "下降 ↓", "stable": "平稳", "": "未知"}
+
+
+def humanize_reasons(reasons: List[str]) -> List[str]:
+    """Turn internal signal codes (A:/P:/T:) into plain Chinese, deduped."""
+    out: List[str] = []
+    for r in reasons:
+        if r.startswith("A:status"):
+            out.append("站点把当前分评为警告/危险")
+        elif r.startswith("A:coding"):
+            out.append("编程维度评级偏低")
+        elif r.startswith("A:"):
+            out.append("跌破绝对地板线")
+        elif r.startswith("P:"):
+            out.append("明显低于近7天平均分")
+        elif r.startswith("T:"):
+            out.append("近7天跑分走低、且低于平均")
+        else:
+            out.append(r)
+    seen: set = set()
+    return [x for x in out if not (x in seen or seen.add(x))]
 
 
 def format_alert_zh(e: DegradationEvent) -> dict:
     """Structured Chinese alert for the user. The bot turns this into an embed."""
     emoji = _EVENT_EMOJI.get(e.event, "•")
     color = _COLOR["ESCALATED"] if e.severity == "critical" else _COLOR.get(e.event, 0x95A5A6)
-    title = f"{emoji} 模型{_EVENT_ZH.get(e.event, e.event)}: {e.model}"
+    title = f"{emoji} 模型降智: {e.model}"
 
     def _f(v, suffix=""):
         return f"{v:.0f}{suffix}" if isinstance(v, (int, float)) else "?"
 
-    fields = [("综合分", f"{_f(e.current_score)}  (状态 {e.status or '?'}, 7天趋势 {e.trend or '?'})")]
+    fields = [
+        ("当前综合分", f"{_f(e.current_score)} / 100（越高越聪明）"),
+        ("站点评级", STATUS_ZH.get((e.status or "").lower(), e.status or "未知")),
+        ("近7天跑分走势", TREND_ZH.get((e.trend or "").lower(), e.trend or "未知")),
+    ]
     if e.baseline is not None:
-        # currentScore vs its real 7-day average. Only label a positive gap as low.
-        low = f"，低 {e.drop:.0f}" if isinstance(e.drop, (int, float)) and e.drop > 0 else ""
-        fields.append(("7天均值", f"~{_f(e.baseline)}，当前 {_f(e.current_score)}{low}"))
+        low = (
+            f"（当前低了 {e.drop:.0f} 分）"
+            if isinstance(e.drop, (int, float)) and e.drop > 0
+            else ""
+        )
+        fields.append(("近7天平均分", f"{_f(e.baseline)}{low}"))
     if e.coding_score is not None:
-        fields.append(("编程分", _f(e.coding_score)))
-    fields.append(("触发信号", "、".join(e.reasons) or "—"))
+        fields.append(("编程维度分", f"{_f(e.coding_score)} / 100"))
+    fields.append(("为什么报警", "；".join(humanize_reasons(e.reasons)) or "—"))
     if e.event == "RECOVERED":
-        desc = "已回到正常范围，可以考虑切回。"
+        desc = "跑分已回到正常范围，可以考虑切回。"
     elif e.severity == "critical":
-        desc = "跌破危险水位，建议尽快切换模型。"
+        desc = "跑分跌破危险线，建议尽快换模型。"
     else:
-        desc = "基准/官方检测到下降，注意观察，必要时切换模型。"
+        desc = "基准测试跑分在走低（指得分下降，不是服务器宕机）。注意，必要时换模型。"
     return {
         "title": title,
         "description": desc,
         "color": color,
         "fields": fields,
         "url": e.source_url,
-        "footer": f"severity={e.severity} · detected {e.detected_at}",
+        "footer": f"数据源 aistupidlevel · 严重度 {e.severity} · {e.detected_at}",
     }
 
 

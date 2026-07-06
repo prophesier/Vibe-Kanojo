@@ -964,6 +964,7 @@ class DiscordVTuberBot(discord.Client):
             build_assessment,
             V_OFFICIAL, V_BENCH, V_DECLINING, V_NORMAL, V_UNKNOWN,
         )
+        from ..model_health.monitor import STATUS_ZH, TREND_ZH
 
         cfg = self._model_health_cfg
         asl, sc = AiStupidLevelClient(), AnthropicStatusClient()
@@ -975,20 +976,27 @@ class DiscordVTuberBot(discord.Client):
         coding = set(getattr(cfg, "coding_models", []) or [])
         emoji = {V_OFFICIAL: "🔴", V_BENCH: "⚠️", V_DECLINING: "🟠", V_NORMAL: "✅", V_UNKNOWN: "❔"}
         zh = {
-            V_OFFICIAL: "官方报告故障/降级", V_BENCH: "基准明显偏低（可能降智）",
-            V_DECLINING: "有下降趋势", V_NORMAL: "正常范围", V_UNKNOWN: "无计测数据",
+            V_OFFICIAL: "官方报告故障/降级", V_BENCH: "跑分明显偏低（可能降智）",
+            V_DECLINING: "近7天跑分走低", V_NORMAL: "正常范围", V_UNKNOWN: "无计测数据",
         }
-        embed = discord.Embed(title="🩺 模型状态自检", color=0x5865F2)
+        embed = discord.Embed(
+            title="🩺 模型状态自检",
+            description="综合分越高越聪明（满分100）。"
+            "「近7天走势」指基准测试**跑分**趋势，不是服务器状态。",
+            color=0x5865F2,
+        )
         official_added = False
         for name in models[:6]:
             a = await build_assessment(asl, sc, name, want_coding=(name in coding))
             sc_s = f"{a.current_score:.0f}" if a.current_score is not None else "?"
-            base = f" · 近7天~{a.baseline:.0f}" if a.baseline is not None else ""
-            cod = f" · 编程{a.coding_score:.0f}" if a.coding_score is not None else ""
+            st = STATUS_ZH.get((a.status or "").lower(), a.status or "未知")
+            tr = TREND_ZH.get((a.trend or "").lower(), a.trend or "未知")
+            base = f" · 近7天均分 {a.baseline:.0f}" if a.baseline is not None else ""
+            cod = f" · 编程 {a.coding_score:.0f}" if a.coding_score is not None else ""
             embed.add_field(
                 name=name,
-                value=f"{emoji.get(a.verdict, '')} {sc_s}/100 "
-                f"({a.status or '?'}, {a.trend or '?'}){base}{cod}\n{zh.get(a.verdict, a.verdict)}",
+                value=f"{emoji.get(a.verdict, '')} 综合分 {sc_s}/100 · 评级 {st} · "
+                f"近7天{tr}{base}{cod}\n{zh.get(a.verdict, a.verdict)}",
                 inline=False,
             )
             if not official_added and a.official is not None:

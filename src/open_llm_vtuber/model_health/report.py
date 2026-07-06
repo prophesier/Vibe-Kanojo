@@ -185,17 +185,19 @@ def _render(a: Assessment, lang: str) -> str:
     L.append(bench)
     if a.found:
         sc = f"{a.current_score:.0f}" if a.current_score is not None else "?"
+        st = sd.get(a.status.lower(), a.status)
+        tr = td.get(a.trend.lower(), a.trend)
         if ja:
-            L.append(f"  総合スコア: {sc}/100 (状態: {sd.get(a.status.lower(),a.status)}, 傾向: {td.get(a.trend.lower(),a.trend)})")
+            L.append(f"  総合スコア: {sc}/100（高いほど賢い） 評価: {st} 直近7日の傾向: {tr}")
         else:
-            L.append(f"  综合分: {sc}/100 (状态: {sd.get(a.status.lower(),a.status)}, 趋势: {td.get(a.trend.lower(),a.trend)})")
+            L.append(f"  综合分: {sc}/100（越高越聪明） 评级: {st} 近7天跑分走势: {tr}")
         if a.baseline is not None:
-            base_lbl = "7日平均" if ja else "7天均值"
+            base_lbl = "直近7日の平均分" if ja else "近7天平均分"
             if a.stability is not None:
                 stab = f" · {'安定性' if ja else '稳定性'}{a.stability:.0f}"
             else:
                 stab = ""
-            L.append(f"  {base_lbl}: ~{a.baseline:.0f}{stab}")
+            L.append(f"  {base_lbl}: {a.baseline:.0f}{stab}")
         if a.coding_score is not None:
             clbl = "コーディング" if ja else "编程"
             L.append(f"  {clbl}: {a.coding_score:.0f} ({sd.get(a.coding_status.lower(),a.coding_status)})")
