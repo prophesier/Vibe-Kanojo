@@ -265,13 +265,19 @@ class DiscordVTuberBot(discord.Client):
             )
             await interaction.followup.send(embed=embed, ephemeral=True)
 
+        # Dropdown choices built from the configured watch list (no typing).
+        _mh = self._model_health_cfg
+        _watch = list(getattr(_mh, "watch_models", []) or []) if _mh else []
+        _model_choices = [
+            app_commands.Choice(name="全部（监控中的所有模型）", value="__all__")
+        ] + [app_commands.Choice(name=m, value=m) for m in _watch[:24]]
+
         @self._tree.command(
             name="model-status",
             description="模型降智自检：手动触发一次检查并打印报告（admin only）",
         )
-        @app_commands.describe(
-            model="可选：指定模型名前缀（如 claude-opus-4-8）。留空=所有监控中的模型"
-        )
+        @app_commands.describe(model="选择要查的模型（留空 = 全部监控中的模型）")
+        @app_commands.choices(model=_model_choices)
         async def model_status_cmd(
             interaction: discord.Interaction, model: Optional[str] = None
         ) -> None:
@@ -279,8 +285,9 @@ class DiscordVTuberBot(discord.Client):
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
             await interaction.response.defer()  # public: print the report to the channel
+            target = None if (not model or model == "__all__") else model
             try:
-                embed = await self._build_model_status_embed(model)
+                embed = await self._build_model_status_embed(target)
             except Exception as e:
                 logger.exception("model-status failed")
                 await interaction.followup.send(f"自检失败: {type(e).__name__}: {e}")
