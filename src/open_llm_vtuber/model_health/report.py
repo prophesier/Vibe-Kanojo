@@ -8,7 +8,7 @@ No LLM. Pure data + fixed reference standard + a rule-based verdict.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
@@ -42,12 +42,15 @@ class Assessment:
     baseline: Optional[float] = None  # real 7-day average (periodAvg)
     stability: Optional[float] = None
     data_points: Optional[int] = None
-    coding_score: Optional[float] = None
-    coding_status: str = ""
+    # axis -> {"score": float|None, "status": str, "trend": str}
+    axes: Dict[str, Any] = field(default_factory=dict)
     official: Optional[AnthropicStatus] = None
     bench_error: str = ""
     verdict: str = V_UNKNOWN
     params: DetectorParams = field(default_factory=DetectorParams)
+
+
+_AXES = ("combined", "reasoning", "coding", "tooling")
 
 
 async def build_assessment(
@@ -55,7 +58,7 @@ async def build_assessment(
     status_client: AnthropicStatusClient,
     model_name: str,
     params: Optional[DetectorParams] = None,
-    want_coding: bool = False,
+    want_coding: bool = True,  # kept for compat; all axes fetched regardless
 ) -> Assessment:
     params = params or DetectorParams()
     a = Assessment(model=model_name, found=False, params=params)
@@ -64,32 +67,36 @@ async def build_assessment(
     a.official = await status_client.fetch()
 
     try:
-        # period="7d" → real 7-day average + stability + 7-day trend (all real;
-        # the displayScore history is skipped — it's >half synthetic backfill).
-        m = AiStupidLevelClient.find(
-            await asl.fetch_scores("combined", period="7d"), model_name
-        )
-        if m:
-            a.found = True
-            a.current_score = m.current_score
-            a.status = m.status
-            a.trend = m.trend
-            a.baseline = m.period_avg
-            a.stability = m.stability
-            a.data_points = m.data_points
-            if want_coding:
-                try:
-                    cm = AiStupidLevelClient.find(
-                        await asl.fetch_scores("coding", period="7d"), model_name
-                    )
-                    if cm:
-                        a.coding_score = cm.current_score
-                        a.coding_status = cm.status
-                except AiStupidLevelUnavailable:
-                    pass
+        # period="7d" → real 7-day average + stability + 7-day trend, all axes.
+        for ax in _AXES:
+            try:
+                ms = AiStupidLevelClient.find(
+                    await asl.fetch_scores(ax, period="7d"), model_name
+                )
+            except AiStupidLevelUnavailable:
+                continue
+            if not ms:
+                continue
+            a.axes[ax] = {
+                "score": ms.current_score,
+                "status": ms.status,
+                "trend": ms.trend,
+            }
+            if ax == "combined":
+                a.found = True
+                a.current_score = ms.current_score
+                a.status = ms.status
+                a.trend = ms.trend
+                a.baseline = ms.period_avg
+                a.stability = ms.stability
+                a.data_points = ms.data_points
+        if not a.found:
+            # combined missing but scores fetched — treat as not found
+            raise AiStupidLevelUnavailable("combined axis not listed")
     except AiStupidLevelUnavailable as e:
-        a.bench_error = str(e)
-        logger.warning(f"[model_health] scores unavailable: {e}")
+        if not a.axes:
+            a.bench_error = str(e)
+            logger.warning(f"[model_health] scores unavailable: {e}")
 
     a.verdict = _verdict(a)
     return a
@@ -101,10 +108,15 @@ def _verdict(a: Assessment) -> str:
         return V_OFFICIAL
     if a.found:
         s = (a.status or "").lower()
-        cs = (a.coding_status or "").lower()
+        crit = a.params.critical_floor
+        axis_danger = any(
+            isinstance(v.get("score"), (int, float)) and v["score"] < crit
+            for ax, v in a.axes.items()
+            if ax != "combined"
+        )
         if (
             s in ("warning", "critical")
-            or cs in ("warning", "critical")
+            or axis_danger
             or (a.current_score is not None and a.current_score < a.params.floor)
         ):
             return V_BENCH
@@ -193,14 +205,29 @@ def _render(a: Assessment, lang: str) -> str:
             L.append(f"  综合分: {sc}/100（越高越聪明） 评级: {st} 近7天跑分走势: {tr}")
         if a.baseline is not None:
             base_lbl = "直近7日の平均分" if ja else "近7天平均分"
-            if a.stability is not None:
-                stab = f" · {'安定性' if ja else '稳定性'}{a.stability:.0f}"
+            L.append(f"  {base_lbl}: {a.baseline:.0f}")
+        # per-axis breakdown, each marked by the floor/danger standard
+        axis_lbl = {
+            "combined": "総合" if ja else "综合",
+            "reasoning": "推論" if ja else "逻辑推理",
+            "coding": "コード" if ja else "代码",
+            "tooling": "ツール" if ja else "工具使用",
+        }
+        for ax in ("combined", "reasoning", "coding", "tooling"):
+            info = a.axes.get(ax)
+            if not info:
+                continue
+            s = info.get("score")
+            if not isinstance(s, (int, float)):
+                mark = "❔"
+            elif s < a.params.critical_floor:
+                mark = "🔴"
+            elif s < a.params.floor:
+                mark = "⚠️"
             else:
-                stab = ""
-            L.append(f"  {base_lbl}: {a.baseline:.0f}{stab}")
-        if a.coding_score is not None:
-            clbl = "コーディング" if ja else "编程"
-            L.append(f"  {clbl}: {a.coding_score:.0f} ({sd.get(a.coding_status.lower(),a.coding_status)})")
+                mark = "✅"
+            sv = f"{s:.0f}" if isinstance(s, (int, float)) else "?"
+            L.append(f"  {axis_lbl[ax]}: {sv}/100 {mark}")
         ref = (
             f"  ※基準: {a.params.floor:.0f}未満=警告, {a.params.critical_floor:.0f}未満=危険"
             if ja

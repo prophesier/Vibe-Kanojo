@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import pathlib
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
@@ -39,10 +39,15 @@ from .anthropic_status_client import AnthropicStatus
 
 @dataclass
 class DetectorParams:
-    floor: float = 60.0            # A: currentScore below this = degraded (absolute)
-    critical_floor: float = 50.0   # severity=critical below this
-    # P: currentScore this far below its real 7-day average (periodAvg) = degraded.
-    cur_drop: float = 8.0
+    floor: float = 60.0            # warning floor (absolute)
+    critical_floor: float = 50.0   # danger floor
+    cur_drop: float = 8.0          # P: this far below our own mean = degraded
+    # We compute the mean/std OURSELVES from a rolling window of recorded
+    # currentScore samples — the site's standardError is unreliable and the
+    # chart's series isn't fetchable, so we record it each batch.
+    cur_window: int = 48           # samples for the self mean/std (~2 days hourly)
+    cur_min_samples: int = 5       # trust the self-stats only past this many
+    cur_series_cap: int = 240      # cap the persisted series length
     recover_streak: int = 2        # clean batches required to declare RECOVERED
     escalate_delta: float = 6.0    # further currentScore drop to re-alert
 
@@ -56,15 +61,21 @@ class DegradationEvent:
     current_score: Optional[float]
     status: str
     trend: str
-    baseline: Optional[float]
+    baseline: Optional[float]  # the mean we compare against (self mean, or periodAvg)
     latest_history: Optional[float]
-    drop: Optional[float]
+    drop: Optional[float]      # baseline - current
     coding_score: Optional[float]
     reasons: List[str]
     detected_at: str
     source_url: str
-    standard_error: Optional[float] = None  # site's spread measure, for the σ line
-    floor: Optional[float] = None           # the absolute floor used
+    standard_error: Optional[float] = None  # site's spread (fallback only)
+    floor: Optional[float] = None           # configured warning floor
+    critical_floor: Optional[float] = None  # configured danger floor
+    mean: Optional[float] = None      # self-computed mean of recorded currentScore
+    std: Optional[float] = None       # self-computed population std
+    n_samples: int = 0                # samples the self mean/std used
+    # axis -> {"score": float|None, "status": str, "trend": str}
+    axes: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -121,62 +132,97 @@ class Detector:
     # -- core ---------------------------------------------------------------
     def evaluate(
         self,
-        score: ModelScore,
+        scores_by_axis: Dict[str, ModelScore],
         now_iso: str,
-        coding: Optional[ModelScore] = None,
     ) -> Optional[DegradationEvent]:
-        """Feed one watched model's fresh snapshot — fetched with ``period="7d"``
-        so it carries the REAL 7-day average (``period_avg``) and 7-day trend.
-        Returns a DegradationEvent on a state transition, else None.
+        """Feed one watched model's fresh snapshot across ALL axes
+        (``{"combined","reasoning","coding","tooling": ModelScore}``, fetched with
+        period="7d"). Returns a DegradationEvent on a state transition, else None.
 
-        Detection is deliberately ABSOLUTE, not normalised to the model's own
-        volatility: these Anthropic models genuinely dip/degrade often, and each
-        real dip is exactly what we want flagged — not smoothed away as "noise".
-
-        ``coding`` is the same model's coding-axis card (warning/critical adds a
-        reason). ``now_iso`` is supplied by the caller for ``detected_at``.
+        We record the combined currentScore each batch and compute the mean/std
+        OURSELVES from that rolling window (the site's standardError is unreliable
+        and the chart's series isn't fetchable). Until the window warms up we fall
+        back to the site's 7-day average. Detection stays ABSOLUTE (floor/status),
+        plus a below-mean drop and a 7-day downtrend — dips aren't smoothed away.
         """
+        combined = scores_by_axis.get("combined")
+        if combined is None:
+            return None
         p = self._params
         st = self._state.setdefault(
-            score.name,
+            combined.name,
             {"state": "OK", "last_batch": "", "last_event_current": None,
-             "recover_streak": 0},
+             "recover_streak": 0, "cur_series": []},
         )
 
-        # Dedup: skip stale repeats and already-seen batches.
-        batch = score.last_updated or ""
-        if score.is_stale or (batch and batch == st.get("last_batch")):
+        # Dedup on the batch timestamp: process a batch once (even if the site
+        # flags it isStale — on startup we still haven't seen it, and a degraded
+        # model must alert). Re-alerting is prevented by the state machine, not
+        # by skipping. Same timestamp seen again → skip.
+        batch = combined.last_updated or ""
+        if batch and batch == st.get("last_batch"):
             return None
         st["last_batch"] = batch
 
-        cur = score.current_score
-        avg = score.period_avg           # real 7-day average currentScore
-        trend = (score.trend or "").lower()
-        reasons: List[str] = []
+        cur = combined.current_score
+        trend = (combined.trend or "").lower()
 
-        # A — status / absolute floor (combined + coding axes)
-        if score.status.lower() in ("warning", "critical"):
-            reasons.append(f"A:status={score.status}")
+        # Record this batch's combined score and compute our OWN mean/std from the
+        # window (excluding the point we just added, so "mean" is the prior level).
+        series = st.setdefault("cur_series", [])
+        if cur is not None:
+            series.append([batch, cur])
+            del series[: -p.cur_series_cap]
+        prior = [s for _, s in series[:-1] if s is not None][-p.cur_window:]
+        if len(prior) >= p.cur_min_samples:
+            my_mean = statistics.fmean(prior)
+            my_std = statistics.pstdev(prior) if len(prior) >= 2 else 0.0
+            n = len(prior)
+        else:
+            my_mean = combined.period_avg  # fallback until the window warms up
+            my_std = None
+            n = len(prior)
+        baseline = my_mean
+
+        reasons: List[str] = []
+        # A — status / absolute floor
+        if combined.status.lower() in ("warning", "critical"):
+            reasons.append(f"A:status={combined.status}")
         if cur is not None and cur < p.floor:
             reasons.append(f"A:{cur:.0f}<floor {p.floor:.0f}")
-        coding_score = coding.current_score if coding else None
-        if coding and coding.status.lower() in ("warning", "critical"):
-            reasons.append(f"A:coding={coding.status}")
 
-        # P — currentScore sits meaningfully below its own real 7-day average
-        drop = (avg - cur) if (cur is not None and avg is not None) else None
+        # Per-axis breakdown (all shown). A sub-axis only TRIGGERS when it hits
+        # the danger floor — reasoning etc. sit inherently low (~35-62) on these
+        # benchmarks, so firing on mere "warning" would flag every model always.
+        axes: Dict[str, Any] = {}
+        for ax, ms in scores_by_axis.items():
+            if ms is None:
+                continue
+            axes[ax] = {
+                "score": ms.current_score,
+                "status": ms.status,
+                "trend": ms.trend,
+            }
+            if (
+                ax != "combined"
+                and ms.current_score is not None
+                and ms.current_score < p.critical_floor
+            ):
+                reasons.append(f"A:{ax}<{p.critical_floor:.0f}")
+
+        # P — combined score sits meaningfully below our own recent mean
+        drop = (baseline - cur) if (cur is not None and baseline is not None) else None
         if drop is not None and drop >= p.cur_drop:
-            reasons.append(f"P:{cur:.0f} ≤ 7d avg {avg:.0f}−{p.cur_drop:.0f}")
+            reasons.append(f"P:{cur:.0f}≤mean {baseline:.0f}−{p.cur_drop:.0f}")
 
-        # T — the site's own 7-day trend is DOWN and we're below average. Catches
-        # a slow slide (opus-4-6 68 vs avg 73, trend down) the floor would miss.
-        if trend == "down" and cur is not None and avg is not None and cur < avg:
-            reasons.append(f"T:7d↓ {cur:.0f}<avg {avg:.0f}")
+        # T — site's 7-day trend is DOWN and we're below the mean
+        if trend == "down" and cur is not None and baseline is not None and cur < baseline:
+            reasons.append(f"T:7d↓ {cur:.0f}<mean {baseline:.0f}")
 
         degraded = bool(reasons)
         severity = (
             "critical"
-            if score.status.lower() == "critical"
+            if combined.status.lower() == "critical"
             or (cur is not None and cur < p.critical_floor)
             else "warning"
         )
@@ -186,22 +232,27 @@ class Detector:
         if event is None:
             return None
         return DegradationEvent(
-            model=score.name,
-            provider=score.provider,
+            model=combined.name,
+            provider=combined.provider,
             event=event,
             severity=severity,
             current_score=cur,
-            status=score.status,
-            trend=score.trend,
-            baseline=avg,
+            status=combined.status,
+            trend=combined.trend,
+            baseline=baseline,
             latest_history=None,
             drop=drop,
-            coding_score=coding_score,
+            coding_score=axes.get("coding", {}).get("score"),
             reasons=reasons,
             detected_at=now_iso,
-            standard_error=score.standard_error,
+            standard_error=combined.standard_error,
             floor=p.floor,
-            source_url=f"https://aistupidlevel.info/?model={score.name}",
+            critical_floor=p.critical_floor,
+            mean=my_mean,
+            std=my_std,
+            n_samples=n,
+            axes=axes,
+            source_url=f"https://aistupidlevel.info/?model={combined.name}",
         )
 
     def _transition(

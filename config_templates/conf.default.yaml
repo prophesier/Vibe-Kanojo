@@ -672,9 +672,12 @@ model_health_config:
     - "claude-fable-5"
   # Poll interval (seconds). Site data is hourly; 1200 (20 min) is plenty.
   poll_seconds: 1200
-  # Absolute floor: currentScore below this always alerts (regardless of the
-  # site's status). Default 60.
+  # Warning floor: currentScore below this always alerts (regardless of the
+  # site's status). Also the per-axis warning mark (⚠️). Default 60.
   score_floor: 60.0
+  # Danger floor: at/below this an alert is marked critical (red); a sub-axis
+  # (reasoning/coding/tooling) below this also triggers. Default 50.
+  critical_floor: 50.0
   # Alert when currentScore is at least this many points below the model's real
   # 7-day average. Lower = more sensitive/chattier. (A 7-day DOWN trend below the
   # average also alerts regardless of this value.) Default 8.

@@ -23,8 +23,9 @@ class ModelHealthConfig(I18nMixin):
         alias="coding_models",
     )
     poll_seconds: int = Field(1200, alias="poll_seconds")
-    # Detection sensitivity knobs (the two you'd actually tune).
-    score_floor: float = Field(60.0, alias="score_floor")
+    # Detection sensitivity knobs.
+    score_floor: float = Field(60.0, alias="score_floor")       # warning floor
+    critical_floor: float = Field(50.0, alias="critical_floor")  # danger floor
     current_drop_warn: float = Field(8.0, alias="current_drop_warn")
     alert_channel_id: int = Field(0, alias="alert_channel_id")
     mention_admin_on_alert: bool = Field(True, alias="mention_admin_on_alert")
@@ -51,9 +52,14 @@ class ModelHealthConfig(I18nMixin):
             zh="监控轮询间隔（秒）。站点数据小时级，1200（20分钟）足够，更快无意义。",
         ),
         "score_floor": Description(
-            en="Absolute floor: currentScore below this always alerts, "
-            "regardless of the site's status. Default 60.",
-            zh="绝对地板：综合分低于此值一律告警（不管站点 status）。默认 60。",
+            en="Warning floor: currentScore below this always alerts, regardless "
+            "of the site's status. Default 60.",
+            zh="警告地板：综合分低于此值一律告警（不管站点 status）。默认 60。",
+        ),
+        "critical_floor": Description(
+            en="Danger floor: at/below this the alert is marked critical (红色). "
+            "Default 50.",
+            zh="危险底线：达到/低于此值告警标记为「危险」（红色）。默认 50。",
         ),
         "current_drop_warn": Description(
             en="Alert when currentScore is at least this many points below the "
