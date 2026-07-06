@@ -870,36 +870,43 @@ class DiscordVTuberBot(discord.Client):
         """Spin up the background poll loop once, if configured. Isolated from the
         LLM/bridge path entirely — it only reads public APIs and posts alerts."""
         cfg = self._model_health_cfg
-        if self._monitor_started or cfg is None or not getattr(cfg, "monitor_enabled", False):
+        if self._monitor_started:
+            return
+        if cfg is None:
+            logger.info("[model_health] monitor NOT started: no model_health_config in conf.yaml")
+            return
+        if not getattr(cfg, "monitor_enabled", False):
+            logger.info("[model_health] monitor NOT started: monitor_enabled=false in conf.yaml")
             return
         try:
             from ..model_health.monitor import DegradationMonitor, MonitorConfig
             from ..model_health.detector import DetectorParams
+
+            self._monitor_started = True
+            mon_cfg = MonitorConfig(
+                enabled=True,
+                watch=list(cfg.watch_models),
+                poll_seconds=int(cfg.poll_seconds),
+                state_path=self._project_root / "cache" / "model_health_state.json",
+            )
+            params = DetectorParams(
+                floor=float(getattr(cfg, "score_floor", 60.0)),
+                cur_drop=float(getattr(cfg, "current_drop_warn", 8.0)),
+            )
+            # Polls once immediately on start, so an already-degraded model alerts
+            # right away (unless its state was already recorded this batch).
+            monitor = DegradationMonitor(mon_cfg, params=params)
+
+            def _now() -> str:
+                return datetime.now(timezone.utc).isoformat()
+
+            asyncio.create_task(monitor.run(self._send_degradation_alert, _now))
+            logger.info(
+                f"[model_health] degradation monitor STARTED: "
+                f"watch={list(cfg.watch_models)}, poll={cfg.poll_seconds}s"
+            )
         except Exception as e:
-            logger.warning(f"[model_health] monitor unavailable: {e}")
-            return
-        self._monitor_started = True
-        mon_cfg = MonitorConfig(
-            enabled=True,
-            watch=list(cfg.watch_models),
-            coding_models=list(cfg.coding_models),
-            poll_seconds=int(cfg.poll_seconds),
-            state_path=self._project_root / "cache" / "model_health_state.json",
-        )
-        params = DetectorParams(
-            floor=float(getattr(cfg, "score_floor", 60.0)),
-            cur_drop=float(getattr(cfg, "current_drop_warn", 8.0)),
-        )
-        # It polls once immediately on start (before the first sleep), so a model
-        # already degraded when the bot comes up alerts right away — no report if
-        # nothing changed.
-        monitor = DegradationMonitor(mon_cfg, params=params)
-
-        def _now() -> str:
-            return datetime.now(timezone.utc).isoformat()
-
-        asyncio.create_task(monitor.run(self._send_degradation_alert, _now))
-        logger.info("[model_health] degradation monitor task started.")
+            logger.exception(f"[model_health] monitor FAILED to start: {e}")
 
     async def _resolve_alert_channel(self) -> Optional[discord.abc.Messageable]:
         """Alert target: the configured alert_channel_id if set, else the same
@@ -960,64 +967,32 @@ class DiscordVTuberBot(discord.Client):
         on-demand snapshot — always reports, regardless of alert state."""
         from ..model_health.aistupidlevel_client import AiStupidLevelClient
         from ..model_health.anthropic_status_client import AnthropicStatusClient
-        from ..model_health.report import (
-            build_assessment,
-            V_OFFICIAL, V_BENCH, V_DECLINING, V_NORMAL, V_UNKNOWN,
-        )
-        from ..model_health.monitor import build_axis_lines
+        from ..model_health.report import build_assessment
+        from ..model_health.monitor import report_block
         from ..model_health.detector import DetectorParams
 
         cfg = self._model_health_cfg
         floor = float(getattr(cfg, "score_floor", 60.0))
-        params = DetectorParams(
-            floor=floor,
-            cur_drop=float(getattr(cfg, "current_drop_warn", 8.0)),
-        )
+        cur_drop = float(getattr(cfg, "current_drop_warn", 8.0))
+        params = DetectorParams(floor=floor, cur_drop=cur_drop)
         asl, sc = AiStupidLevelClient(), AnthropicStatusClient()
         models = (
             [model]
             if model
             else (list(getattr(cfg, "watch_models", []) or []) or ["claude-opus-4-6"])
         )
-        emoji = {V_OFFICIAL: "🔴", V_BENCH: "⚠️", V_DECLINING: "🟠", V_NORMAL: "✅", V_UNKNOWN: "❔"}
-        zh = {
-            V_OFFICIAL: "官方报告故障/降级", V_BENCH: "跑分明显偏低（可能降智）",
-            V_DECLINING: "近7天跑分走低", V_NORMAL: "正常范围", V_UNKNOWN: "无计测数据",
-        }
-        embed = discord.Embed(
-            title="🩺 模型状态自检",
-            description=f"分数越高越聪明（满分100，低于 {floor:.0f} 为警戒线）。"
-            "均值/σ 由我从时间线自算；「走势」是跑分趋势，不是服务器状态。",
-            color=0x5865F2,
-        )
-        official_added = False
+        embed = discord.Embed(title="🩺 模型状态自检", color=0x5865F2)
         for name in models[:6]:
             a = await build_assessment(asl, sc, name, params=params)
-            axis_lines = "\n".join(
-                f"{n}: {v}" for n, v in build_axis_lines(a.axes, floor)
-            )
+            if not a.axes:
+                embed.add_field(name=name, value="无计测数据", inline=False)
+                continue
             embed.add_field(
-                name=f"{emoji.get(a.verdict, '')} {name} — {zh.get(a.verdict, a.verdict)}",
-                value=axis_lines or "无计测数据",
+                name=name,
+                value=report_block(a.axes, a.status, a.official, floor, cur_drop),
                 inline=False,
             )
-            if not official_added and a.official is not None:
-                off = a.official
-                if not off.ok:
-                    ov = "获取失败"
-                elif off.is_degraded:
-                    inc = off.unresolved_incidents[0].name if off.unresolved_incidents else ""
-                    ov = (
-                        f"⚠️ indicator={off.indicator} · Claude API={off.claude_api_status or '?'}"
-                        + (f" · 「{inc}」" if inc else "")
-                    )
-                else:
-                    ov = "✅ 全部正常"
-                embed.add_field(name="Anthropic 官方状态", value=ov, inline=False)
-                official_added = True
-        embed.set_footer(
-            text=f"aistupidlevel + status.anthropic.com · {datetime.now().strftime('%H:%M:%S')}"
-        )
+        embed.set_footer(text=f"aistupidlevel + status.claude.com · {datetime.now().strftime('%H:%M:%S')}")
         return embed
 
     async def _maybe_send_face(

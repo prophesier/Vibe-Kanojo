@@ -189,7 +189,7 @@ def _render(a: Assessment, lang: str) -> str:
         st = sd.get(a.status.lower(), a.status)
         tr = td.get(a.trend.lower(), a.trend)
         L.append(
-            f"  {'評価' if ja else '评级'}: {st} · {'直近7日の傾向' if ja else '近7天跑分走势'}: {tr}"
+            f"  {'評価' if ja else '评级'}: {st} · {'直近7日の傾向' if ja else '近7天评分走势'}: {tr}"
         )
         floor = a.params.floor
         L.append(

@@ -28,10 +28,6 @@ class MonitorConfig:
     watch: List[str] = field(
         default_factory=lambda: ["claude-opus-4-8", "claude-fable-5", "claude-opus-4-6"]
     )
-    # subset of `watch` for which the coding axis is also checked/surfaced
-    coding_models: List[str] = field(
-        default_factory=lambda: ["claude-opus-4-8", "claude-fable-5"]
-    )
     poll_seconds: int = 1200  # 20 min; site data is hourly, faster is pointless
     state_path: Optional[pathlib.Path] = None
 
@@ -175,83 +171,97 @@ def _num(v, dash: str = "?") -> str:
     return f"{v:.0f}" if isinstance(v, (int, float)) else dash
 
 
-def build_axis_lines(axes: dict, floor: float) -> list:
-    """One line per axis: score（均值 M · σ S · 近7天走势）with a ⚠️/✅ mark (by the
-    single warning line). Shared by the alert and the /model-status embed."""
+_AXIS_LBL = {"combined": "综合分", "reasoning": "逻辑推理", "coding": "编程", "tooling": "工具使用"}
+
+
+def _g(s, k):
+    """Read a field from an AxisStat or a dict."""
+    return s.get(k) if isinstance(s, dict) else getattr(s, k, None)
+
+
+def score_lines(axes: dict) -> list:
+    """评分 block: one line per axis — score + 近7天平均分 + 近7天标准差."""
     out = []
     for ax in ("combined", "reasoning", "coding", "tooling"):
         s = axes.get(ax)
         if not s:
             continue
-        cur = getattr(s, "current", None) if not isinstance(s, dict) else s.get("current")
-        mean = getattr(s, "mean", None) if not isinstance(s, dict) else s.get("mean")
-        std = getattr(s, "std", None) if not isinstance(s, dict) else s.get("std")
-        trend = getattr(s, "trend", "") if not isinstance(s, dict) else s.get("trend", "")
-        mark = "⚠️" if isinstance(cur, (int, float)) and cur < floor else (
-            "✅" if isinstance(cur, (int, float)) else "❔")
-        parts = [f"{_num(cur)}/100"]
-        if isinstance(mean, (int, float)):
-            parts.append(f"均值{_num(mean)}")
-        if isinstance(std, (int, float)):
-            parts.append(f"σ{std:.1f}")
-        tr = TREND_ZH.get((trend or "").lower(), "")
-        if ax == "combined" and tr:
-            parts.append(f"近7天{tr}")
-        out.append((f"{_AXIS_ZH[ax]} {mark}", " · ".join(parts)))
+        std = _g(s, "std")
+        std_s = f"{std:.1f}" if isinstance(std, (int, float)) else "?"
+        out.append(
+            f"{_AXIS_LBL[ax]}: {_num(_g(s, 'current'))} / 100，"
+            f"近7天平均分: {_num(_g(s, 'mean'))}，近7天标准差: {std_s}"
+        )
     return out
 
 
-def _humanize_reasons(reasons: list) -> str:
-    m = {"A:status": "站点评级为警告/危险", "A:combined": "综合分低于警戒线",
-         "A:reasoning": "逻辑推理低于警戒线", "A:coding": "代码低于警戒线",
-         "A:tooling": "工具使用低于警戒线", "P:": "综合分明显低于自身均值",
-         "T:": "近7天走低且低于均值"}
-    seen, out = set(), []
-    for r in reasons:
-        txt = next((v for k, v in m.items() if r.startswith(k)), r)
-        if txt not in seen:
-            seen.add(txt)
-            out.append(txt)
-    return "；".join(out) or "—"
+def signal_lines(axes: dict, status: str, official, floor: float, cur_drop: float = 8.0) -> list:
+    """参考信号状态 block: A/B/C/D, each ending with its own ✅/⚠️ emoji."""
+    c = axes.get("combined")
+    cur, mean, std = _g(c, "current"), _g(c, "mean"), _g(c, "std")
+    trend = (_g(c, "trend") or "").lower()
+    out = []
+    # A — combined below its own mean (declining)
+    drop = (mean - cur) if isinstance(cur, (int, float)) and isinstance(mean, (int, float)) else None
+    if drop is not None and drop > 0 and (drop >= cur_drop or trend == "down"):
+        if isinstance(std, (int, float)) and std > 0:
+            k = drop / std
+            sig = f"（>{int(k)}个标准差）" if k >= 1 else f"（{k:.1f}个标准差）"
+        else:
+            sig = ""
+        out.append(f"A:综合评分正在走低且低于平均分{drop:.0f}分{sig}。⚠️")
+    else:
+        out.append("A:综合评分未见明显走低。✅")
+    # B — site rating
+    st = (status or "").lower()
+    out.append(
+        f"B:stupidmeter站点评级: {STATUS_ZH.get(st, status or '未知')}"
+        f"{'⚠️' if st in ('warning', 'critical') else '✅'}"
+    )
+    # C — Anthropic official
+    if official is None or not getattr(official, "ok", False):
+        c_l = "未知❔"
+    elif official.is_degraded:
+        c_l = "异常⚠️"
+    else:
+        c_l = "良好✅"
+    out.append(f"C:status.claude状态：{c_l}")
+    # D — danger floor
+    below = isinstance(cur, (int, float)) and cur < floor
+    out.append(
+        f"D:当前评分{'已' if below else '未'}低于危险底线{floor:.0f}分{'⚠️' if below else '✅'}"
+    )
+    return out
+
+
+def report_block(axes: dict, status: str, official, floor: float, cur_drop: float = 8.0) -> str:
+    """Full body: 当前模型评分 block + 参考信号状态 block. Shared by the alert and
+    /model-status."""
+    return "\n".join(
+        ["当前模型评分："]
+        + score_lines(axes)
+        + ["参考信号状态："]
+        + signal_lines(axes, status, official, floor, cur_drop)
+    )
 
 
 def format_alert_zh(e: DegradationEvent, official: Optional[AnthropicStatus] = None) -> dict:
-    """Alert panel: one line per axis (score · self-computed 均值/σ · trend · mark),
-    then why-it-fired and the Anthropic official status. ``official`` is the shared
-    snapshot fetched once per poll (it has its own alert too)."""
+    """Degradation alert — exactly あさひ's template: title, 评分 block (per axis
+    score / 平均分 / 标准差), 信号 block (A/B/C/D with a trailing emoji). No legend,
+    no reasons line — the emoji carry the state."""
     color = _COLOR["ESCALATED"] if e.severity == "critical" else _COLOR.get(e.event, 0x95A5A6)
     floor = e.floor if e.floor is not None else 60.0
     if e.event == "RECOVERED":
         return {
-            "title": f"✅ {e.model}: 跑分已恢复",
-            "description": "综合分回到正常范围，可以考虑切回。",
-            "color": _COLOR["RECOVERED"], "fields": [], "url": e.source_url,
-            "footer": f"数据源 aistupidlevel · {e.detected_at}",
+            "title": f"✅{e.model} : 评分已恢复",
+            "description": "综合评分回到正常范围，可以考虑切回。",
+            "color": _COLOR["RECOVERED"], "fields": [], "url": e.source_url, "footer": "",
         }
     emoji = "🔴" if e.event == "ESCALATED" or e.severity == "critical" else "⚠️"
-    fields = build_axis_lines(e.axes, floor)
-    fields.append(("为什么报警", _humanize_reasons(e.reasons)))
-
-    if official is None or not official.ok:
-        c_line = "❔ 未知"
-    elif official.is_degraded:
-        inc = official.unresolved_incidents[0].name if official.unresolved_incidents else ""
-        c_line = (
-            f"⚠️ {official.claude_api_status or official.indicator or '异常'}"
-            + (f"（{inc}）" if inc else "")
-        )
-    else:
-        c_line = "✅ 正常"
-    fields.append(("Claude 官方状态", c_line))
-
     return {
-        "title": f"{emoji} {e.model}: 模型有降智风险",
-        "description": f"分数越高越聪明（满分100，低于 {floor:.0f} 为警戒线）。"
-        "均值/σ 由我从时间线数据自算；「走势」指跑分趋势，不是服务器状态。",
-        "color": color,
-        "fields": fields,
-        "url": e.source_url,
-        "footer": f"数据源 aistupidlevel + status.claude.com · {e.detected_at}",
+        "title": f"{emoji}{e.model} : 模型有降智风险",
+        "description": report_block(e.axes, e.status, official, floor),
+        "color": color, "fields": [], "url": e.source_url, "footer": "",
     }
 
 
