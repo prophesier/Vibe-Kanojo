@@ -13,7 +13,7 @@ from typing import Awaitable, Callable, List, Optional
 from loguru import logger
 
 from .aistupidlevel_client import AiStupidLevelClient, AiStupidLevelUnavailable
-from .anthropic_status_client import AnthropicStatusClient
+from .anthropic_status_client import AnthropicStatus, AnthropicStatusClient
 from .detector import (
     DegradationEvent,
     Detector,
@@ -49,17 +49,6 @@ class DegradationMonitor:
         state = config.state_path or pathlib.Path("cache/model_health_state.json")
         self._detector = Detector(state, params)
 
-    async def check_official(self, now_iso: str) -> Optional[OfficialStatusEvent]:
-        """Fetch Anthropic's official status and return a transition event
-        (degraded/recovered) or None. Never raises."""
-        status = await self._status.fetch()  # ok=False on failure, never raises
-        if status.is_degraded:
-            logger.info(
-                f"[model_health] Anthropic official degraded: "
-                f"indicator={status.indicator} api={status.claude_api_status} "
-                f"incidents={[i.name for i in status.unresolved_incidents]}"
-            )
-        return self._detector.evaluate_official(status, now_iso)
 
     async def poll_once(self, now_iso: str) -> List[DegradationEvent]:
         """One polling pass. Returns state-transition events (usually empty).
@@ -114,8 +103,19 @@ class DegradationMonitor:
         while True:
             try:
                 now = now_fn()
-                views: List[dict] = [format_alert_zh(ev) for ev in await self.poll_once(now)]
-                oev = await self.check_official(now)
+                model_events = await self.poll_once(now)
+                # Fetch the official status ONCE and reuse it: for the per-model
+                # panel's "C" line AND for its own state-machine alert.
+                official = await self._status.fetch()
+                if official.is_degraded:
+                    logger.info(
+                        f"[model_health] Anthropic official degraded: "
+                        f"indicator={official.indicator} api={official.claude_api_status}"
+                    )
+                views: List[dict] = [
+                    format_alert_zh(ev, official) for ev in model_events
+                ]
+                oev = self._detector.evaluate_official(official, now)
                 if oev is not None:
                     views.append(format_official_alert_zh(oev))
                 for view in views:
@@ -139,63 +139,86 @@ STATUS_ZH = {"good": "良好", "warning": "警告", "critical": "危险", "": "�
 TREND_ZH = {"up": "上升 ↑", "down": "下降 ↓", "stable": "平稳", "": "未知"}
 
 
-def humanize_reasons(reasons: List[str]) -> List[str]:
-    """Turn internal signal codes (A:/P:/T:) into plain Chinese, deduped."""
-    out: List[str] = []
-    for r in reasons:
-        if r.startswith("A:status"):
-            out.append("站点把当前分评为警告/危险")
-        elif r.startswith("A:coding"):
-            out.append("编程维度评级偏低")
-        elif r.startswith("A:"):
-            out.append("跌破绝对地板线")
-        elif r.startswith("P:"):
-            out.append("明显低于近7天平均分")
-        elif r.startswith("T:"):
-            out.append("近7天跑分走低、且低于平均")
-        else:
-            out.append(r)
-    seen: set = set()
-    return [x for x in out if not (x in seen or seen.add(x))]
+def _num(v, dash: str = "?") -> str:
+    return f"{v:.0f}" if isinstance(v, (int, float)) else dash
 
 
-def format_alert_zh(e: DegradationEvent) -> dict:
-    """Structured Chinese alert for the user. The bot turns this into an embed."""
-    emoji = _EVENT_EMOJI.get(e.event, "•")
+def format_alert_zh(e: DegradationEvent, official: Optional[AnthropicStatus] = None) -> dict:
+    """Signal-panel alert (A/B/C/D), each line ✅ (fine) or ⚠️ (triggered). The
+    alert fired because ≥1 of A/B/D triggered; C (official status) is shown for
+    context and has its own dedicated alert. ``official`` is the shared status
+    snapshot fetched once per poll."""
     color = _COLOR["ESCALATED"] if e.severity == "critical" else _COLOR.get(e.event, 0x95A5A6)
-    title = f"{emoji} 模型降智: {e.model}"
-
-    def _f(v, suffix=""):
-        return f"{v:.0f}{suffix}" if isinstance(v, (int, float)) else "?"
-
-    fields = [
-        ("当前综合分", f"{_f(e.current_score)} / 100（越高越聪明）"),
-        ("站点评级", STATUS_ZH.get((e.status or "").lower(), e.status or "未知")),
-        ("近7天跑分走势", TREND_ZH.get((e.trend or "").lower(), e.trend or "未知")),
-    ]
-    if e.baseline is not None:
-        low = (
-            f"（当前低了 {e.drop:.0f} 分）"
-            if isinstance(e.drop, (int, float)) and e.drop > 0
-            else ""
-        )
-        fields.append(("近7天平均分", f"{_f(e.baseline)}{low}"))
-    if e.coding_score is not None:
-        fields.append(("编程维度分", f"{_f(e.coding_score)} / 100"))
-    fields.append(("为什么报警", "；".join(humanize_reasons(e.reasons)) or "—"))
     if e.event == "RECOVERED":
-        desc = "跑分已回到正常范围，可以考虑切回。"
-    elif e.severity == "critical":
-        desc = "跑分跌破危险线，建议尽快换模型。"
+        return {
+            "title": f"✅ {e.model}: 跑分已恢复",
+            "description": "近7天跑分回到正常范围，可以考虑切回。",
+            "color": _COLOR["RECOVERED"],
+            "fields": [],
+            "url": e.source_url,
+            "footer": f"数据源 aistupidlevel · {e.detected_at}",
+        }
+    emoji = "🔴" if e.event == "ESCALATED" or e.severity == "critical" else "⚠️"
+    title = f"{emoji} {e.model}: 模型有降智风险"
+
+    cur, avg, se = e.current_score, e.baseline, e.standard_error
+    header = [f"当前综合分: {_num(cur)} / 100"]
+    if avg is not None:
+        header.append(f"近7天平均分: {_num(avg)}")
+    if se:
+        header.append(f"波动 σ≈{se:.1f}")
+
+    # A — score deviation / 7-day trend
+    a_hit = any(r.startswith(("P:", "T:")) for r in e.reasons)
+    gap = e.drop if isinstance(e.drop, (int, float)) and e.drop > 0 else None
+    sigma = f"，{gap / se:.1f}σ" if (gap and se) else ""
+    trend_zh = TREND_ZH.get((e.trend or "").lower(), e.trend or "?")
+    a_line = (
+        f"⚠️ 近7天{trend_zh}" + (f"，低于平均 {gap:.0f} 分{sigma}" if gap else "")
+        if a_hit
+        else f"✅ 近7天{trend_zh}" + (f"，低于平均 {gap:.0f} 分{sigma}" if gap else "，在平均附近")
+    )
+
+    # B — aistupidlevel rating (incl. coding axis)
+    b_hit = any(r.startswith("A:status") or r.startswith("A:coding") for r in e.reasons)
+    b_rating = STATUS_ZH.get((e.status or "").lower(), e.status or "?")
+    b_line = f"{'⚠️' if b_hit else '✅'} stupidmeter 评级: {b_rating}"
+    if e.coding_score is not None:
+        b_line += f"（编程 {_num(e.coding_score)}）"
+
+    # C — Anthropic official status (context; has its own alert)
+    if official is None or not official.ok:
+        c_line = "❔ Claude 官方状态: 未知"
+    elif official.is_degraded:
+        inc = official.unresolved_incidents[0].name if official.unresolved_incidents else ""
+        c_line = (
+            f"⚠️ Claude 官方状态: {official.claude_api_status or official.indicator or '异常'}"
+            + (f"（{inc}）" if inc else "")
+        )
     else:
-        desc = "基准测试跑分在走低（指得分下降，不是服务器宕机）。注意，必要时换模型。"
+        c_line = "✅ Claude 官方状态: 正常"
+
+    # D — absolute danger floor
+    floor = e.floor if e.floor is not None else 60.0
+    d_hit = cur is not None and cur < floor
+    d_line = (
+        f"⚠️ 跌破危险底线 {floor:.0f} 分（当前 {_num(cur)}）"
+        if d_hit
+        else f"✅ 未跌破危险底线 {floor:.0f} 分（当前 {_num(cur)}）"
+    )
+
     return {
         "title": title,
-        "description": desc,
+        "description": "，".join(header),
         "color": color,
-        "fields": fields,
+        "fields": [
+            ("A 跑分偏离", a_line),
+            ("B 站点评级", b_line),
+            ("C 官方状态", c_line),
+            ("D 危险底线", d_line),
+        ],
         "url": e.source_url,
-        "footer": f"数据源 aistupidlevel · 严重度 {e.severity} · {e.detected_at}",
+        "footer": f"数据源 aistupidlevel + status.claude.com · {e.detected_at}",
     }
 
 

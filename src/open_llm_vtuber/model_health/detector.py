@@ -63,6 +63,8 @@ class DegradationEvent:
     reasons: List[str]
     detected_at: str
     source_url: str
+    standard_error: Optional[float] = None  # site's spread measure, for the σ line
+    floor: Optional[float] = None           # the absolute floor used
 
 
 @dataclass
@@ -197,6 +199,8 @@ class Detector:
             coding_score=coding_score,
             reasons=reasons,
             detected_at=now_iso,
+            standard_error=score.standard_error,
+            floor=p.floor,
             source_url=f"https://aistupidlevel.info/?model={score.name}",
         )
 
