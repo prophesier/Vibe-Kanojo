@@ -888,7 +888,6 @@ class DiscordVTuberBot(discord.Client):
         )
         params = DetectorParams(
             floor=float(getattr(cfg, "score_floor", 60.0)),
-            critical_floor=float(getattr(cfg, "critical_floor", 50.0)),
             cur_drop=float(getattr(cfg, "current_drop_warn", 8.0)),
         )
         # It polls once immediately on start (before the first sleep), so a model
@@ -965,14 +964,13 @@ class DiscordVTuberBot(discord.Client):
             build_assessment,
             V_OFFICIAL, V_BENCH, V_DECLINING, V_NORMAL, V_UNKNOWN,
         )
-        from ..model_health.monitor import STATUS_ZH, TREND_ZH
+        from ..model_health.monitor import build_axis_lines
         from ..model_health.detector import DetectorParams
 
         cfg = self._model_health_cfg
         floor = float(getattr(cfg, "score_floor", 60.0))
-        crit = float(getattr(cfg, "critical_floor", 50.0))
         params = DetectorParams(
-            floor=floor, critical_floor=crit,
+            floor=floor,
             cur_drop=float(getattr(cfg, "current_drop_warn", 8.0)),
         )
         asl, sc = AiStupidLevelClient(), AnthropicStatusClient()
@@ -986,34 +984,21 @@ class DiscordVTuberBot(discord.Client):
             V_OFFICIAL: "官方报告故障/降级", V_BENCH: "跑分明显偏低（可能降智）",
             V_DECLINING: "近7天跑分走低", V_NORMAL: "正常范围", V_UNKNOWN: "无计测数据",
         }
-        _axis_zh = {"combined": "综合", "reasoning": "逻辑推理", "coding": "代码", "tooling": "工具"}
-
-        def _mark(s):
-            if not isinstance(s, (int, float)):
-                return "❔"
-            return "🔴" if s < crit else ("⚠️" if s < floor else "✅")
-
         embed = discord.Embed(
             title="🩺 模型状态自检",
-            description=f"分数越高越聪明（满分100，各维度 <{floor:.0f}=⚠️ <{crit:.0f}=🔴）。"
-            "「走势」是基准测试**跑分**趋势，不是服务器状态。",
+            description=f"分数越高越聪明（满分100，低于 {floor:.0f} 为警戒线）。"
+            "均值/σ 由我从时间线自算；「走势」是跑分趋势，不是服务器状态。",
             color=0x5865F2,
         )
         official_added = False
         for name in models[:6]:
             a = await build_assessment(asl, sc, name, params=params)
-            st = STATUS_ZH.get((a.status or "").lower(), a.status or "未知")
-            tr = TREND_ZH.get((a.trend or "").lower(), a.trend or "未知")
-            base = f" · 近7天均分 {a.baseline:.0f}" if a.baseline is not None else ""
-            axis_lines = "  ".join(
-                f"{_axis_zh[ax]} {a.axes[ax]['score']:.0f}{_mark(a.axes[ax]['score'])}"
-                for ax in ("combined", "reasoning", "coding", "tooling")
-                if a.axes.get(ax) and isinstance(a.axes[ax].get("score"), (int, float))
+            axis_lines = "\n".join(
+                f"{n}: {v}" for n, v in build_axis_lines(a.axes, floor)
             )
             embed.add_field(
-                name=name,
-                value=f"{emoji.get(a.verdict, '')} 评级 {st} · 近7天{tr}{base}\n"
-                f"{axis_lines}\n{zh.get(a.verdict, a.verdict)}",
+                name=f"{emoji.get(a.verdict, '')} {name} — {zh.get(a.verdict, a.verdict)}",
+                value=axis_lines or "无计测数据",
                 inline=False,
             )
             if not official_added and a.official is not None:

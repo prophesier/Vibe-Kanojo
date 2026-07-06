@@ -164,6 +164,40 @@ class AiStupidLevelClient:
         out.sort(key=lambda p: p.timestamp)
         return out
 
+    async def fetch_series(self, sort_by: str = "combined") -> Dict[str, List[float]]:
+        """The real per-model score TIMELINE the dashboard chart plots, keyed by
+        model id. Lives in ``/dashboard/cached`` → ``data.historyMap`` (the plain
+        ``/history`` endpoint is >½ synthetic and diverges). ``sortBy`` selects
+        the axis. Each point has a ``suite`` — we keep the ``hourly`` suite (what
+        the COMBINED/CODING chart shows) when present, else all points (reasoning
+        uses ``deep``, tooling uses ``tooling``). Returns ``{model_id: [scores]}``.
+        """
+        data = await self._get(
+            f"dashboard/cached?period=latest&sortBy={sort_by}&analyticsPeriod=latest"
+        )
+        history_map = ((data or {}).get("data") or {}).get("historyMap") or {}
+        out: Dict[str, List[float]] = {}
+        for mid, pts in history_map.items():
+            if not isinstance(pts, list):
+                continue
+
+            def _scores(points, only_hourly):
+                vals = []
+                for p in points:
+                    if not isinstance(p, dict):
+                        continue
+                    if only_hourly and p.get("suite") != "hourly":
+                        continue
+                    s = p.get("score")
+                    if isinstance(s, (int, float)):
+                        vals.append(float(s))
+                return vals
+
+            series = _scores(pts, True) or _scores(pts, False)
+            if series:
+                out[str(mid)] = series
+        return out
+
     async def fetch_batch_status(self) -> Dict[str, Any]:
         data = await self._get("dashboard/batch-status")
         return (data or {}).get("data") or {}

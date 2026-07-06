@@ -1,26 +1,19 @@
 """Degradation detector + state machine.
 
-Per the handoff spec, the site's own alert feed under-reports, so we compute the
-verdict ourselves from three signals and keep a per-model state machine so each
-transition alerts exactly once (no bombing):
+Fed one model's snapshot across all 4 axes (combined/reasoning/coding/tooling),
+each with its CURRENT value + the scraped timeline series. We compute the
+mean/std OURSELVES per axis from the series (the dashboard chart's real points
+via /dashboard/cached), so the σ is honest and no from-startup accumulation is
+needed. One warning line (``floor``). Signals (any → degraded):
 
-- **A — status / floor** (fast, site-authoritative): the ``/dashboard/scores``
-  ``status`` is ``warning``/``critical``, or ``currentScore`` < ``floor``.
-- **B — baseline deviation** (history-internal): the latest history point sits
-  ``max(drop_abs, z·noise)`` below the recent-history median. Catches cliffs.
-- **C — sustained decline** (the class the site MISSES — implemented on purpose):
-  the last ``n_trend`` history points fall monotonically, or a linear fit over
-  the last ``m_reg`` points has slope < ``-slope_min`` with total drop > noise.
-
-Signals A vs B/C use different metrics on purpose: ``currentScore`` (a blended
-estimate that drives ``status``) is on a different scale than the raw hourly
-``displayScore`` history, so B/C stay entirely within the history series to
-avoid a scale-mismatch false positive, while A trusts the site's own flag.
+- **A**: the site ``status`` is warning/critical, or ANY axis current < ``floor``.
+- **P**: the combined current sits ``cur_drop`` below its own (self-computed) mean.
+- **T**: the site 7-day trend is down AND combined is below its mean.
 
 State per model: ``OK`` → ``DEGRADED`` (alert) → ``ESCALATED`` (alert again only
-after a further ``escalate_delta`` drop) → ``RECOVERED`` (alert once, after
-``recover_streak`` clean batches) → ``OK``. Deduped on the batch timestamp so
-re-polling the same batch never re-fires.
+after a further ``escalate_delta`` drop) → ``RECOVERED`` (after ``recover_streak``
+clean batches) → ``OK``. Deduped on the batch timestamp so re-polling never
+re-fires. A separate OK↔DEGRADED machine tracks Anthropic's official status.
 """
 
 from __future__ import annotations
@@ -33,23 +26,28 @@ from typing import Any, Dict, List, Optional
 
 from loguru import logger
 
-from .aistupidlevel_client import ModelScore
 from .anthropic_status_client import AnthropicStatus
 
 
 @dataclass
 class DetectorParams:
-    floor: float = 60.0            # warning floor (absolute)
-    critical_floor: float = 50.0   # danger floor
-    cur_drop: float = 8.0          # P: this far below our own mean = degraded
-    # We compute the mean/std OURSELVES from a rolling window of recorded
-    # currentScore samples — the site's standardError is unreliable and the
-    # chart's series isn't fetchable, so we record it each batch.
-    cur_window: int = 48           # samples for the self mean/std (~2 days hourly)
-    cur_min_samples: int = 5       # trust the self-stats only past this many
-    cur_series_cap: int = 240      # cap the persisted series length
-    recover_streak: int = 2        # clean batches required to declare RECOVERED
-    escalate_delta: float = 6.0    # further currentScore drop to re-alert
+    floor: float = 60.0    # the single warning line (a score below this is flagged)
+    cur_drop: float = 8.0  # P: this far below the axis's own mean = degraded
+    recover_streak: int = 2
+    escalate_delta: float = 6.0    # further combined-score drop to re-alert
+
+
+@dataclass
+class AxisStat:
+    """One axis's current value + the mean/std WE compute from the scraped
+    timeline series (the dashboard chart's points)."""
+
+    current: Optional[float] = None
+    status: str = ""
+    trend: str = ""
+    mean: Optional[float] = None
+    std: Optional[float] = None
+    n: int = 0  # points the mean/std used
 
 
 @dataclass
@@ -58,24 +56,17 @@ class DegradationEvent:
     provider: str
     event: str        # DEGRADED | ESCALATED | RECOVERED
     severity: str     # warning | critical
-    current_score: Optional[float]
+    current_score: Optional[float]  # combined
     status: str
     trend: str
-    baseline: Optional[float]  # the mean we compare against (self mean, or periodAvg)
-    latest_history: Optional[float]
+    baseline: Optional[float]  # combined mean (computed from the scraped series)
     drop: Optional[float]      # baseline - current
-    coding_score: Optional[float]
     reasons: List[str]
     detected_at: str
     source_url: str
-    standard_error: Optional[float] = None  # site's spread (fallback only)
-    floor: Optional[float] = None           # configured warning floor
-    critical_floor: Optional[float] = None  # configured danger floor
-    mean: Optional[float] = None      # self-computed mean of recorded currentScore
-    std: Optional[float] = None       # self-computed population std
-    n_samples: int = 0                # samples the self mean/std used
-    # axis -> {"score": float|None, "status": str, "trend": str}
-    axes: Dict[str, Any] = field(default_factory=dict)
+    floor: Optional[float] = None
+    # axis name -> AxisStat (combined/reasoning/coding/tooling)
+    axes: Dict[str, AxisStat] = field(default_factory=dict)
 
 
 @dataclass
@@ -129,130 +120,103 @@ class Detector:
         except Exception as e:
             logger.warning(f"[model_health] could not persist detector state: {e}")
 
+    @staticmethod
+    def axis_stats(current, status, trend, series: List[float]) -> AxisStat:
+        """Build an AxisStat: current + mean/std computed from the scraped series."""
+        vals = [s for s in (series or []) if isinstance(s, (int, float))]
+        mean = statistics.fmean(vals) if vals else None
+        std = statistics.pstdev(vals) if len(vals) >= 2 else (0.0 if vals else None)
+        return AxisStat(
+            current=current, status=status or "", trend=trend or "",
+            mean=mean, std=std, n=len(vals),
+        )
+
     # -- core ---------------------------------------------------------------
     def evaluate(
         self,
-        scores_by_axis: Dict[str, ModelScore],
+        model: Dict[str, Any],
         now_iso: str,
     ) -> Optional[DegradationEvent]:
-        """Feed one watched model's fresh snapshot across ALL axes
-        (``{"combined","reasoning","coding","tooling": ModelScore}``, fetched with
-        period="7d"). Returns a DegradationEvent on a state transition, else None.
+        """Feed one watched model's snapshot across all 4 axes, each with its
+        CURRENT value + the scraped timeline series:
 
-        We record the combined currentScore each batch and compute the mean/std
-        OURSELVES from that rolling window (the site's standardError is unreliable
-        and the chart's series isn't fetchable). Until the window warms up we fall
-        back to the site's 7-day average. Detection stays ABSOLUTE (floor/status),
-        plus a below-mean drop and a 7-day downtrend — dips aren't smoothed away.
+            {"name","provider","axes": {"combined": {"current","status","trend",
+             "period_avg","series":[...],"last_updated"}, "reasoning": {...}, ...}}
+
+        We compute the mean/std OURSELVES per axis from the series (the dashboard
+        chart's real points), so the σ is honest and no from-startup accumulation
+        is needed. One warning line (``floor``). Returns a DegradationEvent on a
+        state transition, else None.
         """
-        combined = scores_by_axis.get("combined")
-        if combined is None:
+        name = model.get("name") or ""
+        raw = model.get("axes") or {}
+        combined = raw.get("combined")
+        if not name or not combined:
             return None
         p = self._params
         st = self._state.setdefault(
-            combined.name,
-            {"state": "OK", "last_batch": "", "last_event_current": None,
-             "recover_streak": 0, "cur_series": []},
+            name, {"state": "OK", "last_batch": "", "last_event_current": None,
+                   "recover_streak": 0},
         )
-
-        # Dedup on the batch timestamp: process a batch once (even if the site
-        # flags it isStale — on startup we still haven't seen it, and a degraded
-        # model must alert). Re-alerting is prevented by the state machine, not
-        # by skipping. Same timestamp seen again → skip.
-        batch = combined.last_updated or ""
+        # Dedup once per batch timestamp; the state machine prevents re-alerting.
+        batch = combined.get("last_updated") or ""
         if batch and batch == st.get("last_batch"):
             return None
         st["last_batch"] = batch
 
-        cur = combined.current_score
-        trend = (combined.trend or "").lower()
-
-        # Record this batch's combined score and compute our OWN mean/std from the
-        # window (excluding the point we just added, so "mean" is the prior level).
-        series = st.setdefault("cur_series", [])
-        if cur is not None:
-            series.append([batch, cur])
-            del series[: -p.cur_series_cap]
-        prior = [s for _, s in series[:-1] if s is not None][-p.cur_window:]
-        if len(prior) >= p.cur_min_samples:
-            my_mean = statistics.fmean(prior)
-            my_std = statistics.pstdev(prior) if len(prior) >= 2 else 0.0
-            n = len(prior)
-        else:
-            my_mean = combined.period_avg  # fallback until the window warms up
-            my_std = None
-            n = len(prior)
-        baseline = my_mean
-
-        reasons: List[str] = []
-        # A — status / absolute floor
-        if combined.status.lower() in ("warning", "critical"):
-            reasons.append(f"A:status={combined.status}")
-        if cur is not None and cur < p.floor:
-            reasons.append(f"A:{cur:.0f}<floor {p.floor:.0f}")
-
-        # Per-axis breakdown (all shown). A sub-axis only TRIGGERS when it hits
-        # the danger floor — reasoning etc. sit inherently low (~35-62) on these
-        # benchmarks, so firing on mere "warning" would flag every model always.
-        axes: Dict[str, Any] = {}
-        for ax, ms in scores_by_axis.items():
-            if ms is None:
+        # Per-axis current + self-computed mean/std.
+        axes: Dict[str, AxisStat] = {}
+        for ax in ("combined", "reasoning", "coding", "tooling"):
+            d = raw.get(ax)
+            if not d:
                 continue
-            axes[ax] = {
-                "score": ms.current_score,
-                "status": ms.status,
-                "trend": ms.trend,
-            }
-            if (
-                ax != "combined"
-                and ms.current_score is not None
-                and ms.current_score < p.critical_floor
-            ):
-                reasons.append(f"A:{ax}<{p.critical_floor:.0f}")
+            axes[ax] = self.axis_stats(
+                d.get("current"), d.get("status"), d.get("trend"), d.get("series") or []
+            )
 
-        # P — combined score sits meaningfully below our own recent mean
-        drop = (baseline - cur) if (cur is not None and baseline is not None) else None
+        c = axes["combined"]
+        cur, mean = c.current, c.mean
+        trend = (c.trend or "").lower()
+        reasons: List[str] = []
+
+        # A — site status / warning line (combined + any sub-axis below the line)
+        if (c.status or "").lower() in ("warning", "critical"):
+            reasons.append(f"A:status={c.status}")
+        for ax, s in axes.items():
+            if s.current is not None and s.current < p.floor:
+                reasons.append(f"A:{ax} {s.current:.0f}<{p.floor:.0f}")
+
+        # P — combined below its own mean by cur_drop
+        drop = (mean - cur) if (cur is not None and mean is not None) else None
         if drop is not None and drop >= p.cur_drop:
-            reasons.append(f"P:{cur:.0f}≤mean {baseline:.0f}−{p.cur_drop:.0f}")
+            reasons.append(f"P:{cur:.0f}≤mean {mean:.0f}−{p.cur_drop:.0f}")
 
-        # T — site's 7-day trend is DOWN and we're below the mean
-        if trend == "down" and cur is not None and baseline is not None and cur < baseline:
-            reasons.append(f"T:7d↓ {cur:.0f}<mean {baseline:.0f}")
+        # T — 7-day trend down and below mean
+        if trend == "down" and cur is not None and mean is not None and cur < mean:
+            reasons.append(f"T:↓ {cur:.0f}<mean {mean:.0f}")
 
         degraded = bool(reasons)
-        severity = (
-            "critical"
-            if combined.status.lower() == "critical"
-            or (cur is not None and cur < p.critical_floor)
-            else "warning"
-        )
+        severity = "critical" if (c.status or "").lower() == "critical" else "warning"
 
         event = self._transition(st, degraded, cur, severity, p)
         self._save()
         if event is None:
             return None
         return DegradationEvent(
-            model=combined.name,
-            provider=combined.provider,
+            model=name,
+            provider=model.get("provider") or "",
             event=event,
             severity=severity,
             current_score=cur,
-            status=combined.status,
-            trend=combined.trend,
-            baseline=baseline,
-            latest_history=None,
+            status=c.status,
+            trend=c.trend,
+            baseline=mean,
             drop=drop,
-            coding_score=axes.get("coding", {}).get("score"),
             reasons=reasons,
             detected_at=now_iso,
-            standard_error=combined.standard_error,
             floor=p.floor,
-            critical_floor=p.critical_floor,
-            mean=my_mean,
-            std=my_std,
-            n_samples=n,
             axes=axes,
-            source_url=f"https://aistupidlevel.info/?model={combined.name}",
+            source_url=f"https://aistupidlevel.info/?model={name}",
         )
 
     def _transition(

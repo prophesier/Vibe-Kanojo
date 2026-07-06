@@ -18,14 +18,9 @@ class ModelHealthConfig(I18nMixin):
         ],
         alias="watch_models",
     )
-    coding_models: List[str] = Field(
-        default_factory=lambda: ["claude-opus-4-8", "claude-fable-5"],
-        alias="coding_models",
-    )
     poll_seconds: int = Field(1200, alias="poll_seconds")
     # Detection sensitivity knobs.
-    score_floor: float = Field(60.0, alias="score_floor")       # warning floor
-    critical_floor: float = Field(50.0, alias="critical_floor")  # danger floor
+    score_floor: float = Field(60.0, alias="score_floor")  # warning line
     current_drop_warn: float = Field(8.0, alias="current_drop_warn")
     alert_channel_id: int = Field(0, alias="alert_channel_id")
     mention_admin_on_alert: bool = Field(True, alias="mention_admin_on_alert")
@@ -41,25 +36,16 @@ class ModelHealthConfig(I18nMixin):
             en="Model name prefixes to monitor (matched against aistupidlevel names).",
             zh="要监控的模型名前缀（与 aistupidlevel 的 name 前缀匹配）。",
         ),
-        "coding_models": Description(
-            en="Subset of watch_models whose coding-axis score is also checked "
-            "and shown (these matter for the user's coding work).",
-            zh="watch_models 的子集，额外检查并展示其编程维度分数（关系到写代码）。",
-        ),
         "poll_seconds": Description(
             en="Monitor poll interval in seconds. Site data is hourly, so 1200 "
             "(20 min) is plenty; faster is pointless.",
             zh="监控轮询间隔（秒）。站点数据小时级，1200（20分钟）足够，更快无意义。",
         ),
         "score_floor": Description(
-            en="Warning floor: currentScore below this always alerts, regardless "
-            "of the site's status. Default 60.",
-            zh="警告地板：综合分低于此值一律告警（不管站点 status）。默认 60。",
-        ),
-        "critical_floor": Description(
-            en="Danger floor: at/below this the alert is marked critical (红色). "
-            "Default 50.",
-            zh="危险底线：达到/低于此值告警标记为「危险」（红色）。默认 50。",
+            en="Warning line: a score (combined or any axis) below this is flagged "
+            "and always alerts, regardless of the site's status. Default 60.",
+            zh="警戒线：分数（综合或任一维度）低于此值就标记并一律告警"
+            "（不管站点 status）。默认 60。",
         ),
         "current_drop_warn": Description(
             en="Alert when currentScore is at least this many points below the "

@@ -8,7 +8,7 @@ No LLM. Pure data + fixed reference standard + a rule-based verdict.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 from loguru import logger
 
@@ -17,7 +17,7 @@ from .aistupidlevel_client import (
     AiStupidLevelUnavailable,
 )
 from .anthropic_status_client import AnthropicStatus, AnthropicStatusClient
-from .detector import DetectorParams
+from .detector import AxisStat, Detector, DetectorParams
 
 # Verdicts, ordered most→least serious.
 V_OFFICIAL = "OFFICIAL_INCIDENT"
@@ -42,8 +42,8 @@ class Assessment:
     baseline: Optional[float] = None  # real 7-day average (periodAvg)
     stability: Optional[float] = None
     data_points: Optional[int] = None
-    # axis -> {"score": float|None, "status": str, "trend": str}
-    axes: Dict[str, Any] = field(default_factory=dict)
+    # axis -> AxisStat (current + self-computed mean/std)
+    axes: Dict[str, AxisStat] = field(default_factory=dict)
     official: Optional[AnthropicStatus] = None
     bench_error: str = ""
     verdict: str = V_UNKNOWN
@@ -67,31 +67,26 @@ async def build_assessment(
     a.official = await status_client.fetch()
 
     try:
-        # period="7d" → real 7-day average + stability + 7-day trend, all axes.
         for ax in _AXES:
             try:
-                ms = AiStupidLevelClient.find(
+                card = AiStupidLevelClient.find(
                     await asl.fetch_scores(ax, period="7d"), model_name
                 )
+                series = (await asl.fetch_series(ax)).get(card.id, []) if card else []
             except AiStupidLevelUnavailable:
                 continue
-            if not ms:
+            if not card:
                 continue
-            a.axes[ax] = {
-                "score": ms.current_score,
-                "status": ms.status,
-                "trend": ms.trend,
-            }
+            a.axes[ax] = Detector.axis_stats(
+                card.current_score, card.status, card.trend, series
+            )
             if ax == "combined":
                 a.found = True
-                a.current_score = ms.current_score
-                a.status = ms.status
-                a.trend = ms.trend
-                a.baseline = ms.period_avg
-                a.stability = ms.stability
-                a.data_points = ms.data_points
+                a.current_score = card.current_score
+                a.status = card.status
+                a.trend = card.trend
+                a.baseline = a.axes[ax].mean  # self-computed mean
         if not a.found:
-            # combined missing but scores fetched — treat as not found
             raise AiStupidLevelUnavailable("combined axis not listed")
     except AiStupidLevelUnavailable as e:
         if not a.axes:
@@ -108,17 +103,12 @@ def _verdict(a: Assessment) -> str:
         return V_OFFICIAL
     if a.found:
         s = (a.status or "").lower()
-        crit = a.params.critical_floor
-        axis_danger = any(
-            isinstance(v.get("score"), (int, float)) and v["score"] < crit
-            for ax, v in a.axes.items()
-            if ax != "combined"
+        floor = a.params.floor
+        axis_below = any(
+            isinstance(v.current, (int, float)) and v.current < floor
+            for v in a.axes.values()
         )
-        if (
-            s in ("warning", "critical")
-            or axis_danger
-            or (a.current_score is not None and a.current_score < a.params.floor)
-        ):
+        if s in ("warning", "critical") or axis_below:
             return V_BENCH
         below = (
             a.baseline is not None
@@ -196,17 +186,16 @@ def _render(a: Assessment, lang: str) -> str:
     bench = "■ AIStupidLevel ベンチ" if ja else "■ AIStupidLevel 基准"
     L.append(bench)
     if a.found:
-        sc = f"{a.current_score:.0f}" if a.current_score is not None else "?"
         st = sd.get(a.status.lower(), a.status)
         tr = td.get(a.trend.lower(), a.trend)
-        if ja:
-            L.append(f"  総合スコア: {sc}/100（高いほど賢い） 評価: {st} 直近7日の傾向: {tr}")
-        else:
-            L.append(f"  综合分: {sc}/100（越高越聪明） 评级: {st} 近7天跑分走势: {tr}")
-        if a.baseline is not None:
-            base_lbl = "直近7日の平均分" if ja else "近7天平均分"
-            L.append(f"  {base_lbl}: {a.baseline:.0f}")
-        # per-axis breakdown, each marked by the floor/danger standard
+        L.append(
+            f"  {'評価' if ja else '评级'}: {st} · {'直近7日の傾向' if ja else '近7天跑分走势'}: {tr}"
+        )
+        floor = a.params.floor
+        L.append(
+            (f"  ※各項目: {floor:.0f}未満は警戒（平均/σは時系列から自算）"
+             if ja else f"  ※各维度低于{floor:.0f}=警戒；均值/σ由时间线自算")
+        )
         axis_lbl = {
             "combined": "総合" if ja else "综合",
             "reasoning": "推論" if ja else "逻辑推理",
@@ -214,26 +203,19 @@ def _render(a: Assessment, lang: str) -> str:
             "tooling": "ツール" if ja else "工具使用",
         }
         for ax in ("combined", "reasoning", "coding", "tooling"):
-            info = a.axes.get(ax)
-            if not info:
+            s = a.axes.get(ax)
+            if not s:
                 continue
-            s = info.get("score")
-            if not isinstance(s, (int, float)):
-                mark = "❔"
-            elif s < a.params.critical_floor:
-                mark = "🔴"
-            elif s < a.params.floor:
-                mark = "⚠️"
-            else:
-                mark = "✅"
-            sv = f"{s:.0f}" if isinstance(s, (int, float)) else "?"
-            L.append(f"  {axis_lbl[ax]}: {sv}/100 {mark}")
-        ref = (
-            f"  ※基準: {a.params.floor:.0f}未満=警告, {a.params.critical_floor:.0f}未満=危険"
-            if ja
-            else f"  ※参照标准: 低于{a.params.floor:.0f}=警告, 低于{a.params.critical_floor:.0f}=危险"
-        )
-        L.append(ref)
+            cur = s.current
+            mark = "⚠️" if isinstance(cur, (int, float)) and cur < floor else (
+                "✅" if isinstance(cur, (int, float)) else "❔")
+            extra = ""
+            if isinstance(s.mean, (int, float)):
+                extra += f" {'平均' if ja else '均值'}{s.mean:.0f}"
+            if isinstance(s.std, (int, float)):
+                extra += f" σ{s.std:.1f}"
+            sv = f"{cur:.0f}" if isinstance(cur, (int, float)) else "?"
+            L.append(f"  {axis_lbl[ax]}: {sv}/100 {mark}{extra}")
     else:
         L.append("  （データなし / no data）" + (f" [{a.bench_error}]" if a.bench_error else ""))
     L.append("■ Anthropic " + ("公式ステータス" if ja else "官方状态"))
