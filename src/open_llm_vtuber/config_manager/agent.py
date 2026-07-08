@@ -49,6 +49,11 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     # fires later (even across restarts) as a proactive message.
     enable_alarms: Optional[bool] = Field(True, alias="enable_alarms")
 
+    # Self-service memory tools: the character can search its facts/diaries
+    # and add/update facts; deleting a fact requires the user's in-chat
+    # approval (verified mechanically). Needs persistent memory enabled.
+    enable_memory_tools: Optional[bool] = Field(True, alias="enable_memory_tools")
+
     # Claude-only prompt-cache keepalive: when the conversation has been idle
     # for ~this many minutes (Anthropic's cache TTL is 1h), nudge the character
     # to say something so the cache is refreshed instead of expiring.
@@ -122,6 +127,19 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
             zh=(
                 "允许角色给自己设定闹钟提醒，到点后以主动消息触发。存本地文件，"
                 "重启后仍有效。（默认：True）"
+            ),
+        ),
+        "enable_memory_tools": Description(
+            en=(
+                "Let the character search its own facts/diaries and add/update "
+                "facts (memory_search/add/update/delete). Deleting a fact "
+                "requires the user's in-chat approval, verified mechanically. "
+                "Requires persistent memory. (default: True)"
+            ),
+            zh=(
+                "允许角色检索自己的 facts/日记并增改 facts（memory_* 工具）。"
+                "删除必须经用户在聊天中明确同意（机械校验）。"
+                "需要已启用持久记忆。（默认：True）"
             ),
         ),
         "claude_cache_keepalive_minutes": Description(

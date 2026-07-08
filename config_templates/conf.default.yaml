@@ -159,6 +159,12 @@ character_config:
         # proactive message. Stored in a local file; survives restarts. A fired
         # alarm is routed to the end you were last using (else Discord, else web).
         enable_alarms: true
+        # Let the character search its own facts/diaries (memory_search) and
+        # add/update facts (memory_add/update). Deleting a fact requires your
+        # in-chat approval: the request is staged and only executes after your
+        # next message contains an explicit consent phrase. Needs persistent
+        # memory enabled.
+        enable_memory_tools: true
         # Claude only: when the chat has been idle this many minutes (Anthropic's
         # prompt-cache TTL is 1h), nudge the character to say something so the
         # cache is refreshed instead of expiring. 0 disables. Any real user

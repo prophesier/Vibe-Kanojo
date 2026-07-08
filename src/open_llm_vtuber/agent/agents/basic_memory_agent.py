@@ -61,7 +61,7 @@ from ...mcpp.tool_executor import ToolExecutor
 # "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
 # query/url that itself contains '*' (rare) is left as-is rather than risk
 # eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
-# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam).
+# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam / 📝 記憶).
 _TOOL_MARKER_RE = re.compile(
     r"[ \t]*(?:"
     r"🍔[ \t]*\*Uber Eats\*"
@@ -70,6 +70,7 @@ _TOOL_MARKER_RE = re.compile(
     r"|⏰[ \t]*\*Alarm set:[^*\n]*\*"
     r"|🧠[ \t]*\*自己診断\*"
     r"|🎮[ \t]*\*Steam\*"
+    r"|📝[ \t]*\*記憶\*"
     r")"
 )
 
@@ -152,6 +153,15 @@ class BasicMemoryAgent(AgentInterface):
         # RAG blocks (stored == sent, never assistant-role), so results stay
         # visible across turns without teaching the model to imitate them.
         self._steam_pending_blocks: List[str] = []
+
+        # Character self-service memory tools (memory_* CRUD on facts + search
+        # over facts/diaries). Gated on config (set_memory_tools_enabled) AND
+        # a wired memory manager. Deletions are two-phase: staged here first,
+        # executed only after the user's approval is verified in their actual
+        # next message (the model cannot fake that — the handler reads it from
+        # _memory, not from the tool arguments).
+        self._memory_tools_enabled = False  # set via set_memory_tools_enabled()
+        self._pending_memory_deletes: Dict[str, Dict[str, Any]] = {}
 
         # Diary RAG (long-tail recall). The in-context list is ephemeral: it
         # holds retrieved diaries with a per-turn TTL and is injected only into
@@ -329,6 +339,15 @@ class BasicMemoryAgent(AgentInterface):
             f"digest={len(self._steam_digest)} chars)."
         )
 
+    def set_memory_tools_enabled(self, enabled: bool) -> None:
+        """Turn the character's memory_* self-service tools on/off (config).
+        They additionally require a wired memory manager to actually run."""
+        self._memory_tools_enabled = bool(enabled)
+
+    @property
+    def _memory_tools_active(self) -> bool:
+        return self._memory_tools_enabled and self._memory_manager is not None
+
     @staticmethod
     def _format_timestamp(ts: str) -> str:
         """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS Weekday]'."""
@@ -447,6 +466,32 @@ class BasicMemoryAgent(AgentInterface):
         "なお、ツールの結果は次のユーザーメッセージの冒頭に『【Steamデータ】』"
         "ブロックとして参照用に残ることがある。これはユーザーの発言ではなく、"
         "あなたが取得したデータの控えである。"
+    )
+
+    # Capability note for the character's self-service memory tools. The
+    # danger modes are (a) fabricating memories instead of searching, and
+    # (b) deleting without consent — the note states the rules, and the
+    # delete handler enforces consent mechanically regardless.
+    _MEMORY_CAPABILITY_NOTE = (
+        "【自分の記憶の管理について】\n"
+        "あなたは自分の長期記憶を自分で調べ、手入れできる：\n"
+        "- memory_search：過去の事実(facts)と日記を意味検索する。自動想起(RAG)とは"
+        "別に、必要な時に自分から過去を調べられる。結果のidは編集・削除に使う\n"
+        "- memory_add：新しい事実を保存する（importance=llm は重要・次回起動から"
+        "常駐、low は通常・検索で想起）\n"
+        "- memory_update：既存の事実を書き直す（会話で判明した訂正が主な用途）\n"
+        "- memory_delete：事実を削除する\n"
+        "【厳守】\n"
+        "- 削除には本人の同意が必須：まず confirmed 無しで申請し、本人にその記憶を"
+        "削除してよいか自分の言葉で確認する。同意の返事をもらった直後のターンで "
+        "confirmed=true で呼び直す。同意なしの削除はシステムが機械的に拒否する。"
+        "勝手に「同意済み」とみなしてはならない。\n"
+        "- user印の記憶は本人が手で管理しているもの。変更・削除はできない"
+        "（追加時に user を名乗ることもできない）。\n"
+        "- 追加・修正は検索には即時反映されるが、system promptの常駐リストへの"
+        "反映は次回起動から。\n"
+        "- 記憶の書き換えは慎重に：本人の依頼、または会話ではっきり判明した"
+        "事実の訂正・追記だけにすること。"
     )
 
     # Trailing system block placed right before the message history.
@@ -753,6 +798,7 @@ class BasicMemoryAgent(AgentInterface):
         self._session_injected_fact_ids = set()
         self._pending_facts_block = ""
         self._steam_pending_blocks = []
+        self._pending_memory_deletes = {}
         # Reset banner state; will be set True below if the current
         # session already has messages here, or later by _add_message
         # when the first user message of a fresh session comes in.
@@ -1239,6 +1285,8 @@ class BasicMemoryAgent(AgentInterface):
                     inproc_names.add(self._MODEL_HEALTH_TOOL_NAME)
                 if self._steam_enabled:
                     inproc_names.update(self._STEAM_TOOL_NAMES)
+                if self._memory_tools_active:
+                    inproc_names.update(self._MEMORY_TOOL_NAMES)
                 inproc_calls = [
                     c for c in pending_tool_calls if c.get("name") in inproc_names
                 ]
@@ -1256,6 +1304,10 @@ class BasicMemoryAgent(AgentInterface):
                         )
                     elif cname in self._STEAM_TOOL_NAMES:
                         marker, result = await self._run_steam_tool(
+                            cname, c.get("input") or {}
+                        )
+                    elif cname in self._MEMORY_TOOL_NAMES:
+                        marker, result = await self._run_memory_tool(
                             cname, c.get("input") or {}
                         )
                     else:
@@ -1582,6 +1634,8 @@ class BasicMemoryAgent(AgentInterface):
                     claude_tools.extend(self._build_model_health_tools_claude())
                 if self._steam_enabled:
                     claude_tools.extend(self._build_steam_tools_claude())
+                if self._memory_tools_active:
+                    claude_tools.extend(self._build_memory_tools_claude())
                 if claude_tools:
                     logger.debug(
                         f"Starting Claude tool loop with {len(claude_tools)} tools."
@@ -1672,6 +1726,8 @@ class BasicMemoryAgent(AgentInterface):
             notes.append(self._MODEL_HEALTH_CAPABILITY_NOTE)
         if self._steam_enabled:
             notes.append(self._STEAM_CAPABILITY_NOTE)
+        if self._memory_tools_active:
+            notes.append(self._MEMORY_CAPABILITY_NOTE)
         return notes
 
     def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:
@@ -1688,6 +1744,8 @@ class BasicMemoryAgent(AgentInterface):
             tools.extend(self._build_model_health_tools_openai())
         if self._steam_enabled:
             tools.extend(self._build_steam_tools_openai())
+        if self._memory_tools_active:
+            tools.extend(self._build_memory_tools_openai())
         return tools
 
     def _builtin_tool_names(self) -> set:
@@ -2058,6 +2116,135 @@ class BasicMemoryAgent(AgentInterface):
     def _build_steam_tools_claude(self) -> List[Dict[str, Any]]:
         return self._to_claude_schema(self._build_steam_tools_openai())
 
+    @staticmethod
+    def _build_memory_tools_openai() -> List[Dict[str, Any]]:
+        """OpenAI schemas for the character's self-service memory tools."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_search",
+                    "description": (
+                        "自分の長期記憶（事実facts・過去の日記）を意味検索する。"
+                        "自動想起とは別に、必要な時に自分から過去を調べる入口。"
+                        "結果の事実には id が付き、memory_update / memory_delete "
+                        "で使う。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "検索したい内容（自然文でよい）。",
+                            },
+                            "target": {
+                                "type": "string",
+                                "enum": ["facts", "diaries", "both"],
+                                "description": "検索対象。既定 both。",
+                            },
+                            "n": {
+                                "type": "integer",
+                                "description": "対象ごとの最大件数。既定5。",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_add",
+                    "description": (
+                        "新しい事実を長期記憶(facts)に保存する。会話ではっきり"
+                        "判明したこと・本人に頼まれたことだけを保存すること。"
+                        "検索には即時反映、常駐リストへは次回起動から。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact": {
+                                "type": "string",
+                                "description": (
+                                    "保存する事実の本文（1件1文、簡潔・自立した文で）。"
+                                ),
+                            },
+                            "importance": {
+                                "type": "string",
+                                "enum": ["llm", "low"],
+                                "description": (
+                                    "llm=重要（次回起動からsystem prompt常駐）/ "
+                                    "low=通常（検索・RAGで想起）。既定 low。"
+                                ),
+                            },
+                        },
+                        "required": ["fact"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_update",
+                    "description": (
+                        "既存の事実を書き直す（訂正・追記）。対象の id は "
+                        "memory_search で確認してから使うこと。user印の記憶は"
+                        "本人管理のため書き換え不可。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact_id": {
+                                "type": "string",
+                                "description": "書き直す事実の id（memory_searchの結果から）。",
+                            },
+                            "new_fact": {
+                                "type": "string",
+                                "description": "新しい本文（全文置き換え）。",
+                            },
+                        },
+                        "required": ["fact_id", "new_fact"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_delete",
+                    "description": (
+                        "事実を1件削除する。二段階制：まず confirmed 無しで呼ぶと"
+                        "削除申請になるので、本人にその記憶を削除してよいか確認する。"
+                        "同意の返事をもらった直後のターンで、同じ fact_id と "
+                        "confirmed=true で呼び直すと実行される。同意なしでは"
+                        "システムが拒否する。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact_id": {
+                                "type": "string",
+                                "description": "削除する事実の id（memory_searchの結果から）。",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "削除したい理由（本人への説明に使う）。",
+                            },
+                            "confirmed": {
+                                "type": "boolean",
+                                "description": (
+                                    "本人の同意を得た後の実行呼び出しでのみ true。"
+                                ),
+                            },
+                        },
+                        "required": ["fact_id"],
+                    },
+                },
+            },
+        ]
+
+    def _build_memory_tools_claude(self) -> List[Dict[str, Any]]:
+        return self._to_claude_schema(self._build_memory_tools_openai())
+
     async def _run_model_health_tool(self, args: Dict[str, Any]) -> tuple:
         """Run check_model_status. Returns (marker, result_dict). The JA report is
         the tool result the character relays; a ZH copy is logged so あさひ can see
@@ -2153,6 +2340,10 @@ class BasicMemoryAgent(AgentInterface):
             marker, result = await self._run_steam_tool(name, args)
             if marker:
                 yield {"type": "tool_marker", "text": marker}
+        elif name in self._MEMORY_TOOL_NAMES:
+            marker, result = await self._run_memory_tool(name, args)
+            if marker:
+                yield {"type": "tool_marker", "text": marker}
         else:
             result = {"error": f"unknown builtin tool {name!r}"}
 
@@ -2184,6 +2375,22 @@ class BasicMemoryAgent(AgentInterface):
         "top_rated": {"sort_by": "Reviews_DESC"},
         "new_releases": {"sort_by": "Released_DESC"},
     }
+    _MEMORY_TOOL_NAMES = (
+        "memory_search",
+        "memory_add",
+        "memory_update",
+        "memory_delete",
+    )
+    _MEMORY_MARKER = "\n📝 *記憶*\n"
+    # Approval phrases あさひ might actually type (JA/ZH/EN). Matched against
+    # the TAIL of his latest real message — the second factor behind the
+    # model's confirmed=true claim. Staged deletions expire after 15 min.
+    _MEMORY_APPROVE_RE = re.compile(
+        r"(同意|承認|許可|いいよ|いいです|ええよ|構わない|かまわない|どうぞ|"
+        r"消していい|消しちゃっていい|削除していい|削除して構わない|オーケー|"
+        r"删吧|删了吧|删掉|可以删|同意删除|はい|OK|ok|Ok)"
+    )
+    _MEMORY_DELETE_TTL_S = 900.0
 
     async def _run_alarm_tool(self, name: str, args: Dict[str, Any]) -> tuple:
         """Execute one alarm tool call. Returns (marker_text|None, result_dict).
@@ -2740,6 +2947,154 @@ class BasicMemoryAgent(AgentInterface):
                 self._steam_pending_blocks = self._steam_pending_blocks[-6:]
         except Exception as e:
             logger.warning(f"[steam] failed to stage cross-turn block: {e}")
+
+    # ------------------------------------------------------------------
+    # Memory self-service tools (in-process, provider-agnostic)
+    # ------------------------------------------------------------------
+
+    def _latest_user_text(self) -> str:
+        """The most recent user message text from _memory (empty if none).
+
+        Used to verify deletion approval: the model can claim consent in its
+        tool arguments, but this text comes from the actual websocket input
+        path — the model cannot write it.
+        """
+        for m in reversed(self._memory):
+            if m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(
+                    str(p.get("text", ""))
+                    for p in c
+                    if isinstance(p, dict) and p.get("type") == "text"
+                )
+            return ""
+        return ""
+
+    async def _run_memory_tool(self, name: str, args: Dict[str, Any]) -> tuple:
+        """Execute one memory_* tool call. Returns (marker|None, result_dict).
+
+        Never raises. CRUD goes through PersistentMemoryManager (disk = live
+        truth, index synced immediately; the frozen header block catches up on
+        restart). memory_delete is two-phase: stage → the character asks あさひ
+        → confirmed=true is honored only when the latest REAL user message
+        (read from _memory, not from the model) contains an approval phrase.
+        """
+        if not self._memory_tools_active:
+            return None, {
+                "status": "error",
+                "message": "記憶ツールは現在利用できない（メモリ機能未接続）。",
+            }
+        mgr = self._memory_manager
+        args = args or {}
+        try:
+            if name == "memory_search":
+                result = await mgr.search_memory_tool(
+                    str(args.get("query", "")),
+                    target=str(args.get("target", "both") or "both"),
+                    n=args.get("n", 5),
+                )
+            elif name == "memory_add":
+                result = await mgr.add_fact_manual(
+                    str(args.get("fact", "")),
+                    importance=str(args.get("importance", "low") or "low"),
+                )
+            elif name == "memory_update":
+                result = await mgr.update_fact_manual(
+                    str(args.get("fact_id", "")).strip(),
+                    str(args.get("new_fact", "")),
+                )
+            elif name == "memory_delete":
+                result = await self._memory_delete_flow(args)
+            else:
+                return None, {
+                    "status": "error",
+                    "message": f"不明な記憶ツール: {name!r}",
+                }
+        except Exception:
+            logger.exception(f"[memory_tool] {name} failed unexpectedly")
+            return None, {
+                "status": "error",
+                "message": "記憶の処理中に内部エラーが起きた。再試行してよい。",
+            }
+        return self._MEMORY_MARKER, result
+
+    async def _memory_delete_flow(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Two-phase deletion with mechanically-verified user approval."""
+        mgr = self._memory_manager
+        fact_id = str(args.get("fact_id", "")).strip()
+        if not fact_id:
+            return {"status": "error", "message": "fact_id が必要。"}
+        # Expire stale requests up front.
+        now = time.monotonic()
+        self._pending_memory_deletes = {
+            k: v
+            for k, v in self._pending_memory_deletes.items()
+            if now - v.get("staged_at", 0.0) < self._MEMORY_DELETE_TTL_S
+        }
+
+        if not args.get("confirmed"):
+            fact = mgr.find_fact(fact_id)
+            if fact is None:
+                return {
+                    "status": "error",
+                    "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
+                }
+            if (fact.get("importance") or "low") == "user":
+                return {
+                    "status": "error",
+                    "message": "userレベルの記憶は本人管理のため削除できない。",
+                }
+            self._pending_memory_deletes[fact_id] = {
+                "fact": fact.get("fact", ""),
+                "staged_at": now,
+            }
+            # Keep the staging dict tiny — one conversation won't legitimately
+            # stage many deletions at once.
+            if len(self._pending_memory_deletes) > 5:
+                oldest = min(
+                    self._pending_memory_deletes,
+                    key=lambda k: self._pending_memory_deletes[k]["staged_at"],
+                )
+                self._pending_memory_deletes.pop(oldest, None)
+            logger.info(
+                f"[memory_tool] delete STAGED ({fact_id}): {fact.get('fact', '')[:80]}"
+            )
+            return {
+                "status": "pending_approval",
+                "id": fact_id,
+                "fact": fact.get("fact", ""),
+                "message": (
+                    "削除には本人の同意が必要。この記憶を削除してよいか、"
+                    "内容を示して本人に確認すること。同意の返事をもらった"
+                    "直後のターンで、同じ fact_id と confirmed=true で"
+                    "呼び直すと実行される。"
+                ),
+            }
+
+        pending = self._pending_memory_deletes.get(fact_id)
+        if pending is None:
+            return {
+                "status": "error",
+                "message": (
+                    "この id の削除申請が無い（未申請か期限切れ）。"
+                    "先に confirmed 無しで申請し、本人の同意を得ること。"
+                ),
+            }
+        tail = self._latest_user_text()[-200:]
+        if not self._MEMORY_APPROVE_RE.search(tail):
+            return {
+                "status": "error",
+                "message": (
+                    "直近のユーザー発話に同意が確認できないため削除しない。"
+                    "本人がはっきり同意してから呼び直すこと。"
+                ),
+            }
+        self._pending_memory_deletes.pop(fact_id, None)
+        return await mgr.delete_fact_manual(fact_id)
 
     async def chat(
         self,

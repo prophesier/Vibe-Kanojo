@@ -40,9 +40,11 @@ def _split_sentences(text: str) -> List[str]:
         sents = [text]
     return [s.strip() for s in sents if s and s.strip()]
 
-# Matches timestamp tags injected by _to_text_prompt: "[YYYY-MM-DD HH:MM:SS Weekday]"
-_TIMESTAMP_RE = re.compile(r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE)
 
+# Matches timestamp tags injected by _to_text_prompt: "[YYYY-MM-DD HH:MM:SS Weekday]"
+_TIMESTAMP_RE = re.compile(
+    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE
+)
 
 
 _FACT_EXTRACT_SYSTEM = (
@@ -90,22 +92,22 @@ _FACT_EXTRACT_SYSTEM = (
     "- 既存の事実には先頭に `[importance]`（現在の重要度）が付いている。"
     "新しい事実の重要度を判定する際の一貫性の参考にしてよい。\n\n"
     "【重要度の判定（importance）】\n"
-    "抽出する各事実に importance を付ける。値は \"llm\" か \"low\" のどちらか。\n"
-    "（\"user\" は使わない——それは人間が手動で指定する専用の値で、あなたが付けてはいけない。）\n"
-    "- \"llm\" = ユーザー像を定義する中核的な事実で、常にキャラクターの念頭にあるべきもの:\n"
+    '抽出する各事実に importance を付ける。値は "llm" か "low" のどちらか。\n'
+    '（"user" は使わない——それは人間が手動で指定する専用の値で、あなたが付けてはいけない。）\n'
+    '- "llm" = ユーザー像を定義する中核的な事実で、常にキャラクターの念頭にあるべきもの:\n'
     "  学歴・専攻・資格、職業・専門スキル、出身地、年齢層、家族・重要な人間関係、\n"
     "  価値観・信念・性格特性、長期的な目標や進行中の重要プロジェクト、\n"
     "  重要な約束・合意、人生の節目・転機・トラウマ。\n"
-    "- \"low\" = 覚えておく価値はあるが、関連する話題のときに思い出せれば十分な事実:\n"
+    '- "low" = 覚えておく価値はあるが、関連する話題のときに思い出せれば十分な事実:\n'
     "  具体的な好みの細部、個別のエピソード、特定の物事（食べた物・買った物・観た作品など）、\n"
     "  中核とまでは言えない習慣や傾向。\n"
-    "迷ったら \"low\"。\"llm\" は本当に常時参照する価値があるものだけに厳選する。\n\n"
+    '迷ったら "low"。"llm" は本当に常時参照する価値があるものだけに厳選する。\n\n'
     "**出力形式（厳守）**：\n"
     '[{"fact": "ユーザーは物理学部出身で物理学を専攻していた", "importance": "llm"}, '
     '{"fact": "ユーザーは白黒のポテトチップスが好き", "importance": "low"}]\n'
     "本当に新しい事実が1件もない場合のみ、空の配列のみを出力する: []\n"
-    "繰り返す：JSON配列のみ。各要素は必ず \"fact\" と \"importance\" を持つ。"
-    "\"importance\" は \"llm\" か \"low\"。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。"
+    '繰り返す：JSON配列のみ。各要素は必ず "fact" と "importance" を持つ。'
+    '"importance" は "llm" か "low"。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。'
 )
 
 _CONSOLIDATE_SYSTEM = (
@@ -331,7 +333,9 @@ class PersistentMemoryManager:
                     os.path.join(self._base_dir, "diaries.embeddings.json"),
                     api_key=embed_api_key,
                     base_url=embed_base_url,
-                    model=getattr(diary_rag_config, "embedding_model", "text-embedding-3-small"),
+                    model=getattr(
+                        diary_rag_config, "embedding_model", "text-embedding-3-small"
+                    ),
                 )
                 logger.info("[memory] Diary RAG enabled.")
             else:
@@ -353,7 +357,9 @@ class PersistentMemoryManager:
 
             model = getattr(diary_rag_config, "rerank_model", "gpt-4o-mini")
             self._diary_reranker = MemoryReranker(
-                api_key=embed_api_key, base_url=embed_base_url, model=model,
+                api_key=embed_api_key,
+                base_url=embed_base_url,
+                model=model,
                 item_label="日記",
             )
             logger.info(f"[memory] Diary RAG reranker enabled ({model}).")
@@ -370,7 +376,9 @@ class PersistentMemoryManager:
                     os.path.join(self._base_dir, "facts.embeddings.json"),
                     api_key=embed_api_key,
                     base_url=embed_base_url,
-                    model=getattr(diary_rag_config, "embedding_model", "text-embedding-3-small"),
+                    model=getattr(
+                        diary_rag_config, "embedding_model", "text-embedding-3-small"
+                    ),
                 )
                 logger.info("[memory] Facts RAG enabled.")
                 # One-time: tag existing facts so they can be re-tiered by hand.
@@ -380,7 +388,9 @@ class PersistentMemoryManager:
 
                     fmodel = getattr(facts_rag_config, "rerank_model", "gpt-4o-mini")
                     self._facts_reranker = MemoryReranker(
-                        api_key=embed_api_key, base_url=embed_base_url, model=fmodel,
+                        api_key=embed_api_key,
+                        base_url=embed_base_url,
+                        model=fmodel,
                         item_label="事実",
                     )
                     logger.info(f"[memory] Facts RAG reranker enabled ({fmodel}).")
@@ -396,6 +406,12 @@ class PersistentMemoryManager:
         # The session that is currently being written to (i.e. in progress).
         # Backfill skips this UID so it doesn't summarise an unfinished session.
         self._current_session_uid: str = ""
+        # Frozen header-facts snapshot (captured on first prompt build, reset
+        # only when backfill settles). The system-prompt facts block must stay
+        # byte-stable within a session or every facts.json write (extraction,
+        # the character's own memory_* edits, hand edits) busts the prompt
+        # cache. Disk stays the live truth for writes and RAG retrieval.
+        self._header_snapshot: Optional[List[Dict[str, Any]]] = None
         os.makedirs(self._diaries_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -429,8 +445,11 @@ class PersistentMemoryManager:
 
         When facts RAG is active only the header-tier facts (user/llm) go here;
         ``low`` facts are recalled on demand. With RAG off, all facts go here.
+
+        Uses the FROZEN snapshot — the block is byte-stable for the whole
+        session (cache safety); facts.json changes land here on next restart.
         """
-        facts = self._header_facts()
+        facts = self._header_facts_frozen()
         if not facts:
             return ""
         lines = []
@@ -490,9 +509,7 @@ class PersistentMemoryManager:
         The agent unions these into the retrieval exclude set so RAG never
         surfaces a diary the model already has verbatim in its prompt.
         """
-        return {
-            d.get("history_uid", "") for d in self._load_recent_diaries()
-        } - {""}
+        return {d.get("history_uid", "") for d in self._load_recent_diaries()} - {""}
 
     # ------------------------------------------------------------------
     # Facts RAG (low-importance fact recall) — sibling of diary RAG
@@ -532,13 +549,39 @@ class PersistentMemoryManager:
             return facts
         return [f for f in facts if (f.get("importance") or "low") in ("user", "llm")]
 
+    def _header_facts_frozen(self) -> List[Dict[str, Any]]:
+        """Header facts, captured once and reused for the whole session.
+
+        Frozen so the system-prompt facts block never changes mid-session —
+        previously facts were re-read from disk every turn, so ANY facts.json
+        write (fact extraction, hand edit, and now the character's own
+        memory_* tools) rewrote the prompt and busted the prefix cache
+        (observed 90%→17%). New/edited facts remain immediately reachable
+        through facts RAG and memory_search; the header catches up on the
+        next restart. Backfill resets the snapshot when it settles (before
+        the first turn), so startup-extracted facts still make it in.
+        """
+        if self._header_snapshot is None:
+            self._header_snapshot = [dict(f) for f in self._header_facts()]
+            logger.info(
+                f"[memory] facts header frozen for this session "
+                f"({len(self._header_snapshot)} fact(s))."
+            )
+        return self._header_snapshot
+
     def injected_fact_ids(self) -> Set[str]:
         """Fingerprints of the facts already in the header (user/llm tier).
 
         The agent unions these into the fact-retrieval exclude set so RAG never
-        surfaces a fact the model already has verbatim in its prompt.
+        surfaces a fact the model already has verbatim in its prompt. Uses the
+        same frozen snapshot as the header block so the two stay consistent
+        (a fact added mid-session is absent from both → RAG may surface it).
         """
-        return {self._fact_id(f["fact"]) for f in self._header_facts() if f.get("fact")}
+        return {
+            self._fact_id(f["fact"])
+            for f in self._header_facts_frozen()
+            if f.get("fact")
+        }
 
     def _facts_items_for_index(self) -> List[Dict[str, Any]]:
         """Every fact as ``{id, text, meta}`` for the fact vector index.
@@ -575,7 +618,9 @@ class PersistentMemoryManager:
         try:
             if os.path.exists(self._facts_path) and not os.path.exists(backup):
                 shutil.copy2(self._facts_path, backup)
-                logger.info(f"[memory] Backed up facts.json → {backup} before importance migration.")
+                logger.info(
+                    f"[memory] Backed up facts.json → {backup} before importance migration."
+                )
         except Exception as e:
             logger.warning(f"[memory] facts importance backup failed: {e}")
         for f in facts:
@@ -656,13 +701,215 @@ class PersistentMemoryManager:
             {
                 "id": j["id"],
                 "fact": j["content"],
-                "date": j.get("date", "") or str(by_id.get(j["id"], {}).get("updated", ""))[:10],
+                "date": j.get("date", "")
+                or str(by_id.get(j["id"], {}).get("updated", ""))[:10],
                 "score": 0.0,
                 "reason": j.get("reason", ""),
             }
             for j in judged[:max_n]
         ]
         return out, candidates, keywords
+
+    # ------------------------------------------------------------------
+    # Character self-service memory (memory_* in-process tools)
+    # ------------------------------------------------------------------
+    # CRUD is facts-only; search covers facts AND diaries. All writes go
+    # through _save_facts (disk = live truth) + an immediate index sync, so
+    # changes are RAG-searchable at once; the frozen header block catches up
+    # on the next restart. The ``user`` importance tier is manual-only: the
+    # character may neither create (clamped) nor modify nor delete it.
+
+    def find_fact(self, fact_id: str) -> Optional[Dict[str, Any]]:
+        """Fact dict by content-fingerprint id, or None."""
+        for f in self._load_facts():
+            if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
+                return f
+        return None
+
+    async def _sync_facts_index(self) -> None:
+        """Re-sync the fact vector index after a manual mutation (no-op when
+        facts RAG is off; never raises)."""
+        if self._facts_index is None:
+            return
+        try:
+            await self._facts_index.ensure_indexed(self._facts_items_for_index())
+        except Exception as e:
+            logger.warning(f"[memory_tool] facts index sync failed: {e}")
+
+    async def add_fact_manual(
+        self, text: str, importance: str = "low"
+    ) -> Dict[str, Any]:
+        """Append a fact on the character's behalf (memory_add).
+
+        ``importance`` is clamped to llm/low — ``user`` is manual-only and an
+        LLM must never assign it. Duplicate content (same fingerprint) is
+        rejected instead of silently re-added.
+        """
+        text = " ".join((text or "").split())
+        if not text:
+            return {"status": "error", "message": "fact本文が空。"}
+        importance = importance if importance in ("llm", "low") else "low"
+        facts = self._load_facts()
+        fid = self._fact_id(text)
+        if any(self._fact_id(f["fact"]) == fid for f in facts if f.get("fact")):
+            return {"status": "error", "message": "同内容の記憶が既にある。", "id": fid}
+        facts.append(
+            {
+                "fact": text,
+                "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "importance": importance,
+            }
+        )
+        self._save_facts(facts)
+        await self._sync_facts_index()
+        logger.info(f"[memory_tool] fact ADDED ({importance}, {fid}): {text[:80]}")
+        return {
+            "status": "ok",
+            "id": fid,
+            "importance": importance,
+            "note": "保存した。検索には即時反映、常駐の事実リストへは次回起動から。",
+        }
+
+    async def update_fact_manual(self, fact_id: str, new_text: str) -> Dict[str, Any]:
+        """Rewrite one fact's text (memory_update). ``user``-tier is blocked."""
+        new_text = " ".join((new_text or "").split())
+        if not new_text:
+            return {"status": "error", "message": "新しい本文が空。"}
+        facts = self._load_facts()
+        for f in facts:
+            if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
+                if (f.get("importance") or "low") == "user":
+                    return {
+                        "status": "error",
+                        "message": "userレベルの記憶は本人管理のため書き換え不可。",
+                    }
+                old = f["fact"]
+                f["fact"] = new_text
+                f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._save_facts(facts)
+                await self._sync_facts_index()
+                new_id = self._fact_id(new_text)
+                logger.info(
+                    f"[memory_tool] fact UPDATED {fact_id}→{new_id}: "
+                    f"{old[:60]!r} → {new_text[:60]!r}"
+                )
+                return {
+                    "status": "ok",
+                    "id": new_id,
+                    "note": "更新した（idは内容ハッシュのため変わった）。"
+                    "常駐リストへの反映は次回起動から。",
+                }
+        return {
+            "status": "error",
+            "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
+        }
+
+    async def delete_fact_manual(self, fact_id: str) -> Dict[str, Any]:
+        """Remove one fact (memory_delete). The caller (agent) is responsible
+        for having completed the user-approval flow BEFORE calling this.
+        ``user``-tier facts cannot be deleted by the character at all."""
+        facts = self._load_facts()
+        for i, f in enumerate(facts):
+            if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
+                if (f.get("importance") or "low") == "user":
+                    return {
+                        "status": "error",
+                        "message": "userレベルの記憶は本人管理のため削除不可。",
+                    }
+                removed = facts.pop(i)
+                self._save_facts(facts)
+                await self._sync_facts_index()
+                logger.info(
+                    f"[memory_tool] fact DELETED ({fact_id}): "
+                    f"{removed.get('fact', '')[:80]}"
+                )
+                return {"status": "ok", "deleted": removed.get("fact", "")}
+        return {"status": "error", "message": f"id {fact_id} の記憶が見つからない。"}
+
+    async def search_memory_tool(
+        self, query: str, target: str = "both", n: int = 5
+    ) -> Dict[str, Any]:
+        """Explicit memory search for the memory_search tool.
+
+        Unlike the auto-injection RAG path this skips the LLM judge and the
+        tuned thresholds (thresholds -1 → always return the top-n): an
+        explicit lookup wants recall, and the character judges relevance
+        itself. Fact hits carry the id used by memory_update/memory_delete.
+        """
+        query = (query or "").strip()
+        if not query:
+            return {"status": "error", "message": "queryが空。"}
+        try:
+            n = max(1, min(int(n or 5), 10))
+        except (TypeError, ValueError):
+            n = 5
+        keywords = extract_keywords(query)
+        embed_q = " ".join(keywords) if keywords else query
+        out: Dict[str, Any] = {"status": "ok", "query": query}
+
+        if target in ("facts", "both"):
+            if self._facts_index is None:
+                out["facts"] = []
+                out["facts_note"] = "facts RAGが無効のため検索不可。"
+            else:
+                by_id = {
+                    self._fact_id(f["fact"]): f
+                    for f in self._load_facts()
+                    if f.get("fact")
+                }
+                hits, _ = await self._facts_index.retrieve(
+                    embed_q,
+                    exclude_ids=set(),
+                    similarity_threshold=-1.0,
+                    topn_threshold=-1.0,
+                    max_retrievals=n,
+                    debug_k=n,
+                    lexical_weight=getattr(self._facts_rag_cfg, "lexical_weight", 0.5),
+                    keywords=keywords,
+                )
+                out["facts"] = [
+                    {
+                        "id": h["id"],
+                        "fact": by_id[h["id"]].get("fact", ""),
+                        "date": str(by_id[h["id"]].get("updated", ""))[:10],
+                        "importance": by_id[h["id"]].get("importance", "low"),
+                        "score": round(float(h.get("score", 0.0)), 3),
+                    }
+                    for h in hits
+                    if h["id"] in by_id
+                ]
+
+        if target in ("diaries", "both"):
+            if self._diary_index is None:
+                out["diaries"] = []
+                out["diaries_note"] = "diary RAGが無効のため検索不可。"
+            else:
+                chunk_map = {c["id"]: c for c in self._all_diary_chunks_for_index()}
+                hits, _ = await self._diary_index.retrieve(
+                    embed_q,
+                    exclude_ids=set(),
+                    similarity_threshold=-1.0,
+                    topn_threshold=-1.0,
+                    max_retrievals=n,
+                    debug_k=n,
+                    lexical_weight=getattr(self._rag_cfg, "lexical_weight", 0.5),
+                    keywords=keywords,
+                )
+                diaries = []
+                for h in hits:
+                    c = chunk_map.get(h["id"])
+                    if not c:
+                        continue
+                    meta = c.get("meta") or {}
+                    diaries.append(
+                        {
+                            "date": meta.get("date", ""),
+                            "text": c.get("text", ""),
+                            "score": round(float(h.get("score", 0.0)), 3),
+                        }
+                    )
+                out["diaries"] = diaries
+        return out
 
     async def retrieve_diary_context(
         self, query: str, exclude_uids: Set[str], context: str = ""
@@ -729,7 +976,11 @@ class PersistentMemoryManager:
             entry = self._read_diary(uid)
             if entry and entry.get("content"):
                 shortlist.append(
-                    {"id": uid, "date": entry.get("date", date), "content": entry["content"]}
+                    {
+                        "id": uid,
+                        "date": entry.get("date", date),
+                        "content": entry["content"],
+                    }
                 )
         judged = await self._diary_reranker.rerank(query, shortlist, context=context)
         if judged is None:  # judge errored → fall back to top-N by hybrid
@@ -814,10 +1065,20 @@ class PersistentMemoryManager:
         no extra config. The framework's ``"default_api_key"`` placeholder is
         treated as absent.
         """
-        key = (getattr(diary_rag_config, "openai_api_key", "") or "") if diary_rag_config else ""
-        base = (getattr(diary_rag_config, "base_url", "") or "") if diary_rag_config else ""
+        key = (
+            (getattr(diary_rag_config, "openai_api_key", "") or "")
+            if diary_rag_config
+            else ""
+        )
+        base = (
+            (getattr(diary_rag_config, "base_url", "") or "")
+            if diary_rag_config
+            else ""
+        )
         if not key and agent_config is not None:
-            openai_cfg = getattr(getattr(agent_config, "llm_configs", None), "openai_llm", None)
+            openai_cfg = getattr(
+                getattr(agent_config, "llm_configs", None), "openai_llm", None
+            )
             if openai_cfg is not None:
                 key = getattr(openai_cfg, "llm_api_key", "") or ""
                 base = base or (getattr(openai_cfg, "base_url", "") or "")
@@ -847,18 +1108,24 @@ class PersistentMemoryManager:
             # facts consistently with the established tiering (it must still
             # never output "user" — see _FACT_EXTRACT_SYSTEM).
             existing_text = (
-                "\n".join(f"- [{f.get('importance', 'low')}] {f['fact']}" for f in existing)
+                "\n".join(
+                    f"- [{f.get('importance', 'low')}] {f['fact']}" for f in existing
+                )
                 if existing
                 else "(まだありません)"
             )
             conv_text = self._format_messages(recent_messages)
             if not conv_text.strip() and not diary_context.strip():
-                logger.info(f"[memory] Fact extraction skipped: empty input ({len(recent_messages)} raw msgs)")
+                logger.info(
+                    f"[memory] Fact extraction skipped: empty input ({len(recent_messages)} raw msgs)"
+                )
                 return
 
             prompt_parts = [f"既存の事実リスト（繰り返さないこと）:\n{existing_text}"]
             if diary_context.strip():
-                prompt_parts.append(f"以前のセッションのまとめ（参考）:\n{diary_context}")
+                prompt_parts.append(
+                    f"以前のセッションのまとめ（参考）:\n{diary_context}"
+                )
             if conv_text.strip():
                 prompt_parts.append(f"分析する会話:\n{conv_text}")
             prompt = "\n\n".join(prompt_parts)
@@ -866,7 +1133,9 @@ class PersistentMemoryManager:
                 f"[memory] Extracting facts from {len(recent_messages)} messages "
                 f"({len(conv_text)} chars conversation, {len(diary_context)} chars diary context)"
             )
-            logger.debug(f"[memory] Fact extraction conversation preview: {conv_text[:400]!r}")
+            logger.debug(
+                f"[memory] Fact extraction conversation preview: {conv_text[:400]!r}"
+            )
             # NOTE: fact extraction deliberately does NOT prepend persona.
             # Persona context was tried but conflicts directly with the
             # "no roleplay / no [tag] markers / raw JSON only" instructions
@@ -916,9 +1185,7 @@ class PersistentMemoryManager:
             final_text = {m["fact"] for m in merged}
             new_kept = [t for t in tagged if t["fact"] in final_text]
             new_dropped = [t for t in tagged if t["fact"] not in final_text]
-            existing_dropped = [
-                e for e in existing if e["fact"] not in final_text
-            ]
+            existing_dropped = [e for e in existing if e["fact"] not in final_text]
             self._log_fact_update(
                 added=new_kept,
                 discarded_new=new_dropped,
@@ -951,15 +1218,22 @@ class PersistentMemoryManager:
             session_date = self._session_date_from_uid(history_uid)
             end_hm = self._session_end_hm_from_messages(history_messages)
             start_hm = session_date[11:16] if len(session_date) > 10 else ""
-            time_range = f"{start_hm}〜{end_hm}" if start_hm and end_hm else start_hm or end_hm
-            nth = self._count_same_day_diaries(session_date[:10], exclude_uid=history_uid) + 1
+            time_range = (
+                f"{start_hm}〜{end_hm}" if start_hm and end_hm else start_hm or end_hm
+            )
+            nth = (
+                self._count_same_day_diaries(session_date[:10], exclude_uid=history_uid)
+                + 1
+            )
             header_parts = []
             if time_range:
                 header_parts.append(f"セッション時間: {time_range}")
             if nth > 1:
                 header_parts.append(f"この日の{nth}回目の会話セッション")
             if header_parts:
-                conv_text = "[セッション情報]\n" + "\n".join(header_parts) + "\n\n" + conv_text
+                conv_text = (
+                    "[セッション情報]\n" + "\n".join(header_parts) + "\n\n" + conv_text
+                )
 
             # Inject the always-on facts (user/llm tier when facts RAG is on,
             # else all facts — exactly what the chat model keeps in its header)
@@ -1018,7 +1292,9 @@ class PersistentMemoryManager:
         Runs as a fire-and-forget background task.
         """
         await asyncio.gather(
-            self.create_diary_async(history_messages, history_uid, llm, persona=persona),
+            self.create_diary_async(
+                history_messages, history_uid, llm, persona=persona
+            ),
             self.extract_facts_async(history_messages, llm, persona=persona),
             return_exceptions=True,
         )
@@ -1076,7 +1352,9 @@ class PersistentMemoryManager:
                 for uid in missing_diaries:
                     messages = get_history(conf_uid, uid)
                     if messages:
-                        await self.create_diary_async(messages, uid, llm, persona=persona)
+                        await self.create_diary_async(
+                            messages, uid, llm, persona=persona
+                        )
                 logger.info("[memory] Diary backfill complete.")
 
             # --- Fact backfill: sessions whose diary lacks facts_extracted=True ---
@@ -1126,7 +1404,9 @@ class PersistentMemoryManager:
                         with open(path, "r", encoding="utf-8") as f:
                             d = json.load(f)
                         if "content" in d:
-                            older_parts.append(f"[{d.get('date', uid)}]\n{d['content']}")
+                            older_parts.append(
+                                f"[{d.get('date', uid)}]\n{d['content']}"
+                            )
                     except Exception:
                         continue
                 diary_context = "\n\n".join(older_parts)
@@ -1158,7 +1438,9 @@ class PersistentMemoryManager:
             # them all; later runs only the freshly backfilled ones). Prunes
             # vectors whose diary was deleted.
             if self._diary_index is not None:
-                await self._diary_index.ensure_indexed(self._all_diary_chunks_for_index())
+                await self._diary_index.ensure_indexed(
+                    self._all_diary_chunks_for_index()
+                )
             # Same for facts: embed new/edited facts, prune vectors of facts that
             # were consolidated or pruned away (id = content fingerprint, so an
             # edited fact is a new id + an orphaned old one).
@@ -1168,6 +1450,10 @@ class PersistentMemoryManager:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
             PersistentMemoryManager._backfill_in_progress.discard(conf_uid)
+            # Re-freeze the header snapshot now that startup extraction has
+            # settled (the user waits for backfill before talking, so this
+            # lands before the first turn — no mid-session prompt change).
+            self._header_snapshot = None
         # Reached only by the call that actually ran (the early-return above
         # exits first). True even if the work errored — facts are in their
         # final state for this startup either way, so the prompt is settled.
@@ -1466,7 +1752,9 @@ class PersistentMemoryManager:
                 return result
             proposals = self._parse_json_list(raw)
         except Exception as e:
-            logger.warning(f"[memory] Consolidation LLM call failed: {e}", exc_info=True)
+            logger.warning(
+                f"[memory] Consolidation LLM call failed: {e}", exc_info=True
+            )
             result["message"] = f"LLM call failed: {e}"
             return result
 
@@ -1482,7 +1770,8 @@ class PersistentMemoryManager:
             if not isinstance(raw_indices, list):
                 continue
             indices = [
-                i for i in raw_indices
+                i
+                for i in raw_indices
                 if isinstance(i, int) and 0 <= i < len(facts) and i not in used_indices
             ]
             if len(indices) < 2:
@@ -1500,18 +1789,16 @@ class PersistentMemoryManager:
         # per valid merge with `updated` set to the newest date among the
         # source facts (no new fact was created, just reorganised).
         merged_text_set = used_indices
-        survivors = [
-            f for i, f in enumerate(facts) if i not in merged_text_set
-        ]
+        survivors = [f for i, f in enumerate(facts) if i not in merged_text_set]
         _tier_rank = {"user": 2, "llm": 1, "low": 0}
         new_merged: List[Dict[str, Any]] = []
         for m in valid:
-            source_dates = [
-                str(facts[i].get("updated", "")) for i in m["merge"]
-            ]
+            source_dates = [str(facts[i].get("updated", "")) for i in m["merge"]]
             source_dates = [d for d in source_dates if d]
-            newest = max(source_dates) if source_dates else (
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            newest = (
+                max(source_dates)
+                if source_dates
+                else (datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
             )
             # Keep the highest tier among the merged sources so consolidation
             # never silently demotes a hand-set `user` (or `llm`) fact.
@@ -1603,9 +1890,7 @@ class PersistentMemoryManager:
             )
             return True
         except Exception as e:
-            logger.warning(
-                f"[memory] Failed to promote staged consolidated facts: {e}"
-            )
+            logger.warning(f"[memory] Failed to promote staged consolidated facts: {e}")
             return False
 
     async def _enforce_fact_limit_async(self, llm: Any, persona: str = "") -> None:
@@ -1727,7 +2012,7 @@ class PersistentMemoryManager:
             if re.search(r"\[\s*\]", text):
                 return []
             return []
-        candidate = text[m.start():]
+        candidate = text[m.start() :]
         parsed = PersistentMemoryManager._try_parse_fact_array(candidate)
         return parsed if parsed is not None else []
 

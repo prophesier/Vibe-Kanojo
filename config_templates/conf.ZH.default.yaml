@@ -132,6 +132,10 @@ character_config:
         # 允许角色给自己设定闹钟提醒，到点后以主动消息触发。存本地文件，重启后仍有效。
         # 触发时投递到你最近使用的那一端（否则 Discord，再否则前端）。
         enable_alarms: true
+        # 允许角色检索自己的 facts/日记（memory_search）并增改 facts（memory_add/update）。
+        # 删除必须经你同意：先挂起申请，你在下一条消息里明确表示同意后才会真正执行。
+        # 需要已启用持久记忆。
+        enable_memory_tools: true
         # 仅 Claude：会话空闲达到该分钟数时（Anthropic 提示缓存有效期 1 小时），
         # 提示角色随便说一句以刷新缓存、避免过期。0 关闭。任意端的真实用户消息和
         # 闹钟回复都会重置计时。

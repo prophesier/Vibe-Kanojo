@@ -588,6 +588,16 @@ class ServiceContext:
                     get_alarm_store(self.character_config.conf_uid)
                 )
 
+            # Enable the character's self-service memory tools (memory_*).
+            # They also require a wired memory manager; the agent checks that
+            # at call time, so order here doesn't matter.
+            if (
+                bma_cfg
+                and getattr(bma_cfg, "enable_memory_tools", True)
+                and hasattr(self.agent_engine, "set_memory_tools_enabled")
+            ):
+                self.agent_engine.set_memory_tools_enabled(True)
+
             # Enable the check_model_status self-check tool when configured.
             mh_cfg = getattr(self.config, "model_health_config", None)
             if (
