@@ -300,42 +300,61 @@ class SteamClient:
 
     async def app_details(self, appid: int) -> Optional[dict]:
         """Normalized appdetails for ONE appid (multi-appid is unreliable).
-        Returns None when Steam reports ``success: false`` (unknown appid,
-        region-locked, delisted). Rate limit ~200 req / 5 min per IP."""
-        data = await self._get_store_json(
-            f"{_STORE}/api/appdetails",
-            {"appids": appid, "cc": self._cc, "l": self._lang},
-        )
-        entry = (data or {}).get(str(appid)) or {}
-        if not entry.get("success"):
-            return None
-        d = entry.get("data") or {}
-        po = d.get("price_overview") or {}
-        rd = d.get("release_date") or {}
-        is_free = bool(d.get("is_free"))
-        price_yen = _yen_from_minor(po.get("final"))
-        if price_yen is None and is_free:
-            price_yen = 0
-        return {
-            "appid": int(d.get("steam_appid", appid)),
-            "name": str(d.get("name", "")),
-            "short_description": str(d.get("short_description", "")),
-            "genres": [
-                str(g.get("description", ""))
-                for g in d.get("genres") or []
-                if isinstance(g, dict)
-            ],
-            "price_yen": price_yen,
-            "final_formatted": str(po.get("final_formatted", "")),
-            "discount_percent": int(po.get("discount_percent") or 0),
-            "is_free": is_free,
-            "release_date": str(rd.get("date", "")),
-            "coming_soon": bool(rd.get("coming_soon")),
-            "metacritic": (d.get("metacritic") or {}).get("score"),
-            "developers": d.get("developers") or [],
-            "publishers": d.get("publishers") or [],
-            "header_image": str(d.get("header_image", "")),
-        }
+
+        When the home store (``cc``) doesn't carry the title (region-locked /
+        not sold in JP — e.g. CERO-refused games), falls back to the US store:
+        the result then carries ``region``/``region_note``, keeps the JP-
+        localized text (``l`` is independent of ``cc``), and ``price_yen`` is
+        None because the price isn't JPY (``final_formatted`` still shows it,
+        e.g. "$59.99"). Returns None when no region works (unknown appid,
+        fully delisted). Rate limit ~200 req / 5 min per IP."""
+        for cc in dict.fromkeys((self._cc, "us")):
+            data = await self._get_store_json(
+                f"{_STORE}/api/appdetails",
+                {"appids": appid, "cc": cc, "l": self._lang},
+            )
+            entry = (data or {}).get(str(appid)) or {}
+            if not entry.get("success"):
+                continue
+            d = entry.get("data") or {}
+            po = d.get("price_overview") or {}
+            rd = d.get("release_date") or {}
+            is_free = bool(d.get("is_free"))
+            currency = str(po.get("currency", ""))
+            price_yen = (
+                _yen_from_minor(po.get("final")) if currency in ("", "JPY") else None
+            )
+            if price_yen is None and is_free:
+                price_yen = 0
+            out = {
+                "appid": int(d.get("steam_appid", appid)),
+                "name": str(d.get("name", "")),
+                "short_description": str(d.get("short_description", "")),
+                "genres": [
+                    str(g.get("description", ""))
+                    for g in d.get("genres") or []
+                    if isinstance(g, dict)
+                ],
+                "price_yen": price_yen,
+                "currency": currency,
+                "final_formatted": str(po.get("final_formatted", "")),
+                "discount_percent": int(po.get("discount_percent") or 0),
+                "is_free": is_free,
+                "release_date": str(rd.get("date", "")),
+                "coming_soon": bool(rd.get("coming_soon")),
+                "metacritic": (d.get("metacritic") or {}).get("score"),
+                "developers": d.get("developers") or [],
+                "publishers": d.get("publishers") or [],
+                "header_image": str(d.get("header_image", "")),
+            }
+            if cc != self._cc:
+                out["region"] = cc
+                out["region_note"] = (
+                    "日本ストア未掲載のため他リージョンの情報"
+                    "（価格は円ではない・購入不可の可能性）。"
+                )
+            return out
+        return None
 
     async def app_reviews_summary(
         self, appid: int, language: str = "japanese"
@@ -561,22 +580,32 @@ class SteamClient:
         "name":"\\u30bd\\u30a6\\u30eb\\u30e9\\u30a4\\u30af",...},...],`` via a
         raw JSON decode starting at the array's ``[``. Age-gate cookies are
         pre-set on the shared client for mature-gated pages."""
-        try:
-            html = await self._get_store_text(
-                f"{_STORE}/app/{appid}/", {"cc": self._cc, "l": self._lang}
-            )
-            marker = html.find(_APP_TAG_MODAL_MARKER)
-            if marker < 0:
-                logger.debug(f"store_page_tags({appid}): InitAppTagModal not found")
-                return []
-            bracket = html.find("[", marker)
-            if bracket < 0:
-                return []
-            tags, _ = json.JSONDecoder().raw_decode(html, bracket)
-            return [str(t["name"]) for t in tags if isinstance(t, dict) and "name" in t]
-        except Exception as e:
-            logger.debug(f"store_page_tags({appid}) failed: {self._scrub(str(e))}")
-            return []
+        for cc in dict.fromkeys((self._cc, "us")):
+            try:
+                html = await self._get_store_text(
+                    f"{_STORE}/app/{appid}/", {"cc": cc, "l": self._lang}
+                )
+                marker = html.find(_APP_TAG_MODAL_MARKER)
+                if marker < 0:
+                    # Region-locked pages redirect to the store front — retry
+                    # once via the US store (tags are community-global; names
+                    # still follow ``l``).
+                    logger.debug(
+                        f"store_page_tags({appid}, cc={cc}): InitAppTagModal not found"
+                    )
+                    continue
+                bracket = html.find("[", marker)
+                if bracket < 0:
+                    continue
+                tags, _ = json.JSONDecoder().raw_decode(html, bracket)
+                return [
+                    str(t["name"]) for t in tags if isinstance(t, dict) and "name" in t
+                ]
+            except Exception as e:
+                logger.debug(
+                    f"store_page_tags({appid}, cc={cc}) failed: {self._scrub(str(e))}"
+                )
+        return []
 
     # -------------------------------------------------------- web api (keyed)
 

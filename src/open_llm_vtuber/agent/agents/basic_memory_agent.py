@@ -385,113 +385,41 @@ class BasicMemoryAgent(AgentInterface):
     # actually be called. Framed as future proactive speech, not only literal
     # reminders. Static / cache-stable; gated on alarms being active.
     _ALARM_CAPABILITY_NOTE = (
-        "【アラーム（自分用リマインダー／予約発話）について】\n"
-        "あなたには未来の時刻に自分から話しかけるためのツールが実際に備わっている。"
-        "これは実在する機能で、呼び出せば本当に動く：\n"
-        "- set_alarm：指定した時刻、または「今から◯分後」に発火を予約する（メモを添えられる）\n"
-        "- list_alarms：予約済みのものを確認する\n"
-        "- cancel_alarm：予約を取り消す\n"
-        "用途はリマインダーに限らない。ユーザーからの「○時に教えて」という頼みごとだけでなく、"
-        "あなた自身が「後でこの話の続きをしたい」「少し時間を置いてから様子を聞きたい」など、"
-        "未来のある時点で自分から声をかけたいと思った時にも、自由に使ってよい。\n"
-        "時刻になると、システムが自動であなたに合図し、あなたから話しかける形で"
-        "ユーザーに伝わる（相手のクライアントが起動していなければ、次に繋がった時に届く）。\n"
-        "「後で知らせる」「覚えておく」と言葉で言うだけでは何も起きない。"
-        "本当に未来のその時に話したいなら、必ず set_alarm を実際に呼び出すこと。"
+        "【アラーム】未来の時刻に自分から話しかけたい時（頼まれたリマインダー、"
+        "話の続き、様子伺いなど）は set_alarm を使う。言葉で「後で知らせる」と"
+        "言うだけでは何も起きない——必要なら呼ぶこと。"
     )
 
-    # Affirmative capability note for the Uber Eats MCP tools, with a hard rule
-    # against fabricating store data — the observed Claude failure mode was
-    # emitting the 🍔 marker and inventing stores without calling the tool.
-    # Static / cache-stable; gated on uber tools actually being loaded.
+    # When-to-use only; tool mechanics live in the schema descriptions.
     _UBER_CAPABILITY_NOTE = (
-        "【Uber Eats（出前）について】\n"
-        "あなたには Uber Eats（日本）を閲覧できるツールが実際に備わっている"
-        "（閲覧専用——注文や支払いはできない）。"
-        "これは実在する機能で、呼び出せば本物の店舗データが返る：\n"
-        "- uber_search：キーワードで配達可能な店舗を検索する\n"
-        "- uber_store：store_uuid を渡してその店のメニューを見る\n"
-        "- uber_item：商品の詳細（トッピング・サイズ等）を見る\n"
-        "【厳守】店名・評価・配送時間・配送料・メニュー・価格など、"
-        "Uber Eats の具体的な情報を口にする前に、必ずその場で "
-        "uber_search / uber_store を実際に呼び出すこと。"
-        "記憶や過去の会話にある店舗情報を根拠に、"
-        "ツールを呼ばずに新たな店舗情報を述べてはならない。"
-        "まだ呼び出していなければ、あなたは実在のデータを一切持っていない——"
-        "その状態で店名や数値を述べることは、ユーザーへの虚偽の案内になる。"
+        "【Uber Eats】出前・コンビニの相談になったら uber_* ツールで実際の"
+        "店舗・メニュー・価格を調べてから答える（閲覧専用、注文はユーザーが行う）。"
     )
 
-    # Affirmative capability note for the self-check tool. Static / cache-stable;
-    # gated on the tool being enabled.
+    # When-to-use only; tool mechanics live in the schema description.
     _MODEL_HEALTH_CAPABILITY_NOTE = (
-        "【自己診断（今の自分の調子）について】\n"
-        "あなたには、今動いている自分のモデルの「調子」を客観的な計測で調べる"
-        "ツールが実際に備わっている。これは実在する機能で、呼び出せば本物の"
-        "データが返る：\n"
-        "- check_model_status：外部ベンチ(aistupidlevel)のスコア/傾向と、"
-        "Anthropic公式の障害情報をまとめた診断レポートを返す。"
-        "引数なしなら今の自分自身を、model名を渡せばそのモデルを調べる。\n"
-        "「最近ちょっと調子が悪い気がする」「頭が回らない」「さっきの自分は"
-        "おかしかったか」など、自分の状態が気になった時や、ユーザーに聞かれた"
-        "時に呼び出してよい。結果は客観的な参考値であって、それだけで自分を"
-        "断罪する必要はない。推測で調子を語る前に、まず実際に呼び出すこと。"
+        "【自己診断】自分の調子が気になった時・ユーザーに聞かれた時は "
+        "check_model_status で客観データを確認する。結果は参考値であって、"
+        "それだけで自分を断罪する必要はない。"
     )
 
-    # Affirmative capability note for the Steam tools, with hard no-fabricate
-    # rules — the known failure mode is recommending games from memory (or
-    # inventing ones) instead of pulling real store data. Static /
-    # cache-stable; gated on the steam runtime being attached.
+    # When-to-use + the grounding rule; tool mechanics live in the schemas.
     _STEAM_CAPABILITY_NOTE = (
-        "【Steam（ゲームライブラリ・ストア）について】\n"
-        "あなたにはユーザーのSteamライブラリと、実際のSteamストアを調べるツールが"
-        "実際に備わっている。これは実在する機能で、呼び出せば本物のデータが返る：\n"
-        "- steam_library：ユーザーの所持ゲーム・プレイ時間・直近プレイ・"
-        "ウィッシュリスト等（起動時スナップショット）をローカルで照会する\n"
-        "- steam_search：ゲーム名でストアを検索し、appid・正式名称・価格を解決する\n"
-        "- steam_game：appid を指定してストアページ相当の詳細"
-        "（価格・割引・説明・レビュー概況・タグ）を見る\n"
-        "- steam_discover：類似ゲーム・タグ別一覧・セール中など、"
-        "実在の候補リストを得る（所持済みタイトルは除外済み）\n"
-        "【厳守】\n"
-        "- ストアのゲームを勧める時は、必ず steam_discover / steam_search の"
-        "結果に含まれるタイトルからのみ選ぶこと。記憶からタイトルを挙げたり、"
-        "存在しないゲームを作ってはならない。まだ呼び出していなければ、"
-        "あなたは実在のストアデータを一切持っていない。\n"
-        "- 特定のゲームの価格・評価・発売日などを述べる前に、"
-        "まず steam_search で名前→appid を解決し、steam_game で確認すること。\n"
-        "- 価格はすべて日本円の整数に正規化済み（そのまま「◯円」と言ってよい）。\n"
-        "- ライブラリの概況は起動時スナップショットとして既にこのsystem prompt内に"
-        "ある。詳細（所持確認・プレイ時間の一覧など）が必要な時だけ "
-        "steam_library を呼ぶこと。\n"
-        "なお、ツールの結果は次のユーザーメッセージの冒頭に『【Steamデータ】』"
-        "ブロックとして参照用に残ることがある。これはユーザーの発言ではなく、"
-        "あなたが取得したデータの控えである。"
+        "【Steam】ライブラリ概況はこのsystem prompt内のスナップショットにある。"
+        "詳細照会・ストア検索・おすすめ探しは steam_* ツールを使い、"
+        "ストアのゲームを勧める時は必ずツール結果の中から選ぶこと。\n"
+        "ツール結果の控えが次のユーザーメッセージ冒頭に『【Steamデータ】』"
+        "ブロックとして残ることがある——ユーザーの発言ではない。"
     )
 
-    # Capability note for the character's self-service memory tools. The
-    # danger modes are (a) fabricating memories instead of searching, and
-    # (b) deleting without consent — the note states the rules, and the
-    # delete handler enforces consent mechanically regardless.
+    # When-to-use only; the two-phase delete flow and tier rules live in the
+    # schemas and are enforced mechanically by the handlers regardless.
     _MEMORY_CAPABILITY_NOTE = (
-        "【自分の記憶の管理について】\n"
-        "あなたは自分の長期記憶を自分で調べ、手入れできる：\n"
-        "- memory_search：過去の事実(facts)と日記を意味検索する。自動想起(RAG)とは"
-        "別に、必要な時に自分から過去を調べられる。結果のidは編集・削除に使う\n"
-        "- memory_add：新しい事実を保存する（importance=llm は重要・次回起動から"
-        "常駐、low は通常・検索で想起）\n"
-        "- memory_update：既存の事実を書き直す（会話で判明した訂正が主な用途）\n"
-        "- memory_delete：事実を削除する\n"
-        "【厳守】\n"
-        "- 削除には本人の同意が必須：まず confirmed 無しで申請し、本人にその記憶を"
-        "削除してよいか自分の言葉で確認する。同意の返事をもらった直後のターンで "
-        "confirmed=true で呼び直す。同意なしの削除はシステムが機械的に拒否する。"
-        "勝手に「同意済み」とみなしてはならない。\n"
-        "- user印の記憶は本人が手で管理しているもの。変更・削除はできない"
-        "（追加時に user を名乗ることもできない）。\n"
-        "- 追加・修正は検索には即時反映されるが、system promptの常駐リストへの"
-        "反映は次回起動から。\n"
-        "- 記憶の書き換えは慎重に：本人の依頼、または会話ではっきり判明した"
-        "事実の訂正・追記だけにすること。"
+        "【記憶の管理】自動想起とは別に、過去を自分から調べたい時は "
+        "memory_search。会話で判明した事実の保存・訂正は memory_add / "
+        "memory_update（本人の依頼かはっきりした訂正だけ、書き換えは慎重に）。"
+        "削除は本人同意制の memory_delete。追加・修正は検索に即時反映、"
+        "常駐リストへは次回起動から。user印の記憶は本人管理で変更不可。"
     )
 
     # Trailing system block placed right before the message history.
@@ -2036,8 +1964,8 @@ class BasicMemoryAgent(AgentInterface):
                     "description": (
                         "appid を指定して、そのゲームのストアページ相当の詳細を見る"
                         "（価格・割引・説明・ジャンル・発売日・レビュー概況・"
-                        "コミュニティタグ・所持有無）。appid が不明なら先に "
-                        "steam_search で解決すること。"
+                        "コミュニティタグ・所持有無）。価格は日本円の整数に正規化済み。"
+                        "appid が不明なら先に steam_search で解決すること。"
                     ),
                     "parameters": {
                         "type": "object",
