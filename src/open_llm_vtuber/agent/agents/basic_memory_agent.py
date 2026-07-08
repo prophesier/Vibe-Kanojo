@@ -69,7 +69,7 @@ _TOOL_MARKER_RE = re.compile(
     r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
     r"|⏰[ \t]*\*Alarm set:[^*\n]*\*"
     r"|🧠[ \t]*\*自己診断\*"
-    r"|🎮[ \t]*\*Steam\*"
+    r"|🎮[ \t]*\*Steam[^*\n]*\*"
     r"|📝[ \t]*\*記憶[^*\n]*\*"
     r")"
 )
@@ -1158,7 +1158,13 @@ class BasicMemoryAgent(AgentInterface):
                 elif event["type"] == "tool_use_complete":
                     tool_call_data = event["data"]
                     logger.info(
-                        f"Tool request: {tool_call_data['name']} (ID: {tool_call_data['id']})"
+                        "Tool request: {} (ID: {}) args={}".format(
+                            tool_call_data["name"],
+                            tool_call_data["id"],
+                            json.dumps(
+                                tool_call_data.get("input") or {}, ensure_ascii=False
+                            )[:600],
+                        )
                     )
                     pending_tool_calls.append(tool_call_data)
                     current_assistant_message_content.append(
@@ -2297,6 +2303,9 @@ class BasicMemoryAgent(AgentInterface):
             args = json.loads(tc.function.arguments or "{}")
         except json.JSONDecodeError:
             args = {}
+        logger.info(
+            f"Tool request: {name} args={json.dumps(args, ensure_ascii=False)[:600]}"
+        )
 
         result: Any
         if name == "web_search":
@@ -2366,7 +2375,8 @@ class BasicMemoryAgent(AgentInterface):
         "steam_game",
         "steam_discover",
     )
-    _STEAM_MARKER = "\n🎮 *Steam*\n"
+    # Per-operation marker text is built by _steam_marker (🎮 *Steam◯◯: …*);
+    # display/history only — stripped from the AI replay like all markers.
     # steam_discover section → search/results parameters (verified live for the
     # filter= variants; the sort_by variants are the same endpoint family).
     _STEAM_SECTION_MAP = {
@@ -2539,7 +2549,58 @@ class BasicMemoryAgent(AgentInterface):
             }
         if result.get("status") == "ok":
             self._stage_steam_block(name, args, result)
-        return self._STEAM_MARKER, result
+        return self._steam_marker(name, args, result), result
+
+    @staticmethod
+    def _clip_marker(t: Any, n: int = 24) -> str:
+        """Clip text for a tool marker; '*' would break the strip regex."""
+        s = " ".join(str(t or "").split()).replace("*", "＊")
+        return s[:n] + ("…" if len(s) > n else "")
+
+    @staticmethod
+    def _steam_marker(
+        name: str, args: Dict[str, Any], result: Dict[str, Any]
+    ) -> Optional[str]:
+        """Human-facing marker describing WHAT the Steam op did — shown in
+        chat / kept in stored history, stripped from the AI replay. No marker
+        for failed ops."""
+        if result.get("status") not in ("ok", "need_clarification"):
+            return None
+        clip = BasicMemoryAgent._clip_marker
+        if name == "steam_library":
+            action = str(args.get("action", ""))
+            if action == "check":
+                label = f"Steam所持確認: {clip(args.get('name') or args.get('appid'))}"
+            else:
+                lbl = {
+                    "overview": "ライブラリ概況",
+                    "top_played": "プレイ時間上位",
+                    "recent": "直近プレイ",
+                    "wishlist": "ウィッシュリスト",
+                    "followed": "フォロー中",
+                }.get(action, action)
+                label = f"Steamライブラリ: {clip(lbl)}"
+        elif name == "steam_search":
+            qs = args.get("queries")
+            first = qs[0] if isinstance(qs, list) and qs else (qs or "")
+            more = f" 他{len(qs) - 1}" if isinstance(qs, list) and len(qs) > 1 else ""
+            label = f"Steam検索: {clip(first)}{more}"
+        elif name == "steam_game":
+            label = f"Steamストア: {clip(result.get('name') or args.get('appid'))}"
+        else:  # steam_discover
+            mode = str(args.get("mode", ""))
+            if mode == "similar":
+                label = (
+                    f"Steam類似検索: "
+                    f"{clip(result.get('anchor_name') or args.get('anchor'))}"
+                )
+            elif mode == "tag":
+                tag = result.get("tag")
+                tag_name = tag.get("name") if isinstance(tag, dict) else None
+                label = f"Steamタグ候補: {clip(tag_name or args.get('tag'))}"
+            else:
+                label = "Steamセール確認"
+        return f"\n🎮 *{label}*\n"
 
     def _steam_snapshot(self) -> Optional[Dict[str, Any]]:
         """Current snapshot dict, reloaded from disk at most every 30s so the
@@ -3059,11 +3120,7 @@ class BasicMemoryAgent(AgentInterface):
         for failed ops (nothing happened)."""
         if result.get("status") not in ("ok", "pending_approval"):
             return None
-
-        def _clip(t: Any, n: int = 24) -> str:
-            s = " ".join(str(t or "").split()).replace("*", "＊")
-            return s[:n] + ("…" if len(s) > n else "")
-
+        _clip = BasicMemoryAgent._clip_marker
         if name == "memory_search":
             label = f"記憶検索: {_clip(args.get('query'))}"
         elif name == "memory_add":
