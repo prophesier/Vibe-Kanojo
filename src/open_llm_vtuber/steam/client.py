@@ -356,6 +356,25 @@ class SteamClient:
             return out
         return None
 
+    async def app_name_localized(self, appid: int, lang: str) -> Optional[str]:
+        """Localized display name for one appid (slim appdetails call with
+        ``filters=basic``; same cc→us region fallback as :meth:`app_details`).
+        Returns None on any failure — used by snapshot enrichment to build the
+        multilingual local name index (she may ask in ja/zh/en)."""
+        for cc in dict.fromkeys((self._cc, "us")):
+            try:
+                data = await self._get_store_json(
+                    f"{_STORE}/api/appdetails",
+                    {"appids": appid, "cc": cc, "l": lang, "filters": "basic"},
+                )
+            except SteamUnavailable:
+                return None
+            entry = (data or {}).get(str(appid)) or {}
+            if entry.get("success"):
+                name = str((entry.get("data") or {}).get("name") or "").strip()
+                return name or None
+        return None
+
     async def app_reviews_summary(
         self, appid: int, language: str = "japanese"
     ) -> Optional[dict]:

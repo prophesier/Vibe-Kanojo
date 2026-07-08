@@ -287,13 +287,7 @@ def format_official_alert_zh(e: OfficialStatusEvent) -> dict:
         fields.append(("事故", "、".join(f"「{n}」" for n in e.incidents)))
     if e.latest_body:
         fields.append(("最新", e.latest_body[:300]))
-    # degraded_performance is the priority case あさひ flagged — call it out.
-    dp = any("degraded_performance" in c for c in e.degraded_components)
-    desc = (
-        "Anthropic 官方报告性能下降（degraded_performance）——比整站挂更隐蔽，重点注意。"
-        if dp
-        else "Anthropic 官方报告故障/异常。"
-    )
+    desc = "Anthropic 官方报告故障/异常。"
     return {
         "title": title,
         "description": desc,

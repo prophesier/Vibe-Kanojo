@@ -104,11 +104,13 @@ def _verdict(a: Assessment) -> str:
     if a.found:
         s = (a.status or "").lower()
         floor = a.params.floor
-        axis_below = any(
-            isinstance(v.current, (int, float)) and v.current < floor
-            for v in a.axes.values()
+        combined = a.axes.get("combined")
+        combined_below = (
+            combined is not None
+            and isinstance(combined.current, (int, float))
+            and combined.current < floor
         )
-        if s in ("warning", "critical") or axis_below:
+        if s in ("warning", "critical") or combined_below:
             return V_BENCH
         below = (
             a.baseline is not None
@@ -162,7 +164,7 @@ def _official_line(off: Optional[AnthropicStatus], lang: str) -> List[str]:
 
 _VERDICT_JA = {
     V_OFFICIAL: "Anthropicが公式に障害/性能低下を報告中。これはモデル側の問題で、私のせいではない。",
-    V_BENCH: "ベンチマーク上、明確に低下している（公式はまだ正常）。モデルが降智している可能性が高い。",
+    V_BENCH: "ベンチマーク上、明確に低下している（公式はまだ正常）。モデル側の性能が落ちている可能性が高い。",
     V_DECLINING: "低下傾向がはっきり出ている（7日平均を下回っている）。モデル側が落ちている可能性——切り替えを検討する価値あり。",
     V_NORMAL: "ベンチ・公式ともに正常範囲。少なくとも計測上は問題ない。",
     V_UNKNOWN: "このモデルの計測データが見つからない。判断できない。",
@@ -192,10 +194,6 @@ def _render(a: Assessment, lang: str) -> str:
             f"  {'評価' if ja else '评级'}: {st} · {'直近7日の傾向' if ja else '近7天评分走势'}: {tr}"
         )
         floor = a.params.floor
-        L.append(
-            (f"  ※各項目: {floor:.0f}未満は警戒（平均/σは時系列から自算）"
-             if ja else f"  ※各维度低于{floor:.0f}=警戒；均值/σ由时间线自算")
-        )
         axis_lbl = {
             "combined": "総合" if ja else "综合",
             "reasoning": "推論" if ja else "逻辑推理",
@@ -206,16 +204,29 @@ def _render(a: Assessment, lang: str) -> str:
             s = a.axes.get(ax)
             if not s:
                 continue
-            cur = s.current
-            mark = "⚠️" if isinstance(cur, (int, float)) and cur < floor else (
-                "✅" if isinstance(cur, (int, float)) else "❔")
+            cur, mean, std = s.current, s.mean, s.std
+            numeric = isinstance(cur, (int, float))
+            # 総合のみ絶対ライン(floor)。他の軸は自軸平均からの下振れが
+            # 1σを超えた時だけ ⚠️（<1σ / <2σ を注記）。
+            if ax == "combined":
+                mark = "⚠️" if numeric and cur < floor else ("✅" if numeric else "❔")
+            else:
+                mark = ""
+                if (
+                    numeric
+                    and isinstance(mean, (int, float))
+                    and isinstance(std, (int, float))
+                    and std > 0
+                    and cur < mean - std
+                ):
+                    mark = "⚠️（<2σ）" if cur < mean - 2 * std else "⚠️（<1σ）"
             extra = ""
-            if isinstance(s.mean, (int, float)):
-                extra += f" {'平均' if ja else '均值'}{s.mean:.0f}"
-            if isinstance(s.std, (int, float)):
-                extra += f" σ{s.std:.1f}"
-            sv = f"{cur:.0f}" if isinstance(cur, (int, float)) else "?"
-            L.append(f"  {axis_lbl[ax]}: {sv}/100 {mark}{extra}")
+            if isinstance(mean, (int, float)):
+                extra += f" {'平均' if ja else '均值'}{mean:.0f}"
+            if isinstance(std, (int, float)):
+                extra += f" σ{std:.1f}"
+            sv = f"{cur:.0f}" if numeric else "?"
+            L.append(f"  {axis_lbl[ax]}: {sv}/100 {mark}{extra}".rstrip())
     else:
         L.append("  （データなし / no data）" + (f" [{a.bench_error}]" if a.bench_error else ""))
     L.append("■ Anthropic " + ("公式ステータス" if ja else "官方状态"))
@@ -223,11 +234,6 @@ def _render(a: Assessment, lang: str) -> str:
     verdict_head = "■ 総合評価" if ja else "■ 综合评价"
     L.append(verdict_head)
     L.append("  " + (_VERDICT_JA if ja else _VERDICT_ZH).get(a.verdict, ""))
-    L.append(
-        "  出典: aistupidlevel.info / status.anthropic.com"
-        if ja
-        else "  数据源: aistupidlevel.info / status.anthropic.com"
-    )
     return "\n".join(L)
 
 

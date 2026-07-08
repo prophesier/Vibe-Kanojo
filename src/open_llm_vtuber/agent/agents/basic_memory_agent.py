@@ -162,6 +162,10 @@ class BasicMemoryAgent(AgentInterface):
         # _memory, not from the tool arguments).
         self._memory_tools_enabled = False  # set via set_memory_tools_enabled()
         self._pending_memory_deletes: Dict[str, Dict[str, Any]] = {}
+        # Memory blocks pinned via memory_inject — folded into the NEXT
+        # outgoing user message exactly like the RAG/steam blocks
+        # (persist-not-ephemeral), so they stay visible across turns.
+        self._memory_pending_blocks: List[str] = []
 
         # Diary RAG (long-tail recall). The in-context list is ephemeral: it
         # holds retrieved diaries with a per-turn TTL and is injected only into
@@ -416,7 +420,9 @@ class BasicMemoryAgent(AgentInterface):
     # schemas and are enforced mechanically by the handlers regardless.
     _MEMORY_CAPABILITY_NOTE = (
         "【記憶の管理】自動想起とは別に、過去を自分から調べたい時は "
-        "memory_search。会話で判明した事実の保存・訂正は memory_add / "
+        "memory_search（日記全文は memory_read_diary）。検索結果はその"
+        "ターン限りで消える——続けて参照したい分は memory_inject で文脈に"
+        "固定する。会話で判明した事実の保存・訂正は memory_add / "
         "memory_update（本人の依頼かはっきりした訂正だけ、書き換えは慎重に）。"
         "削除は本人同意制の memory_delete。追加・修正は検索に即時反映、"
         "常駐リストへは次回起動から。user印の記憶は本人管理"
@@ -448,7 +454,7 @@ class BasicMemoryAgent(AgentInterface):
         "**あらゆる発言**を行う前に、必ず関連するタイムスタンプタグを参照すること。"
         "ユーザーの質問に答える時だけでなく、以下のすべての場合に適用される：\n"
         "- 自分から時刻・日付・経過時間・最近性に言及する時"
-        "（「さっき」「先日」「今日は」「久しぶり」など）\n"
+        "（「さっき」「昨日」「今日は」「久しぶり」など）\n"
         "- 時刻に応じた挨拶をする時（おはよう・こんばんは等）\n"
         "- ユーザーに対して時間関連の質問・確認をする時"
         "（「今は何時頃？」「あれから〇日経った？」など）\n"
@@ -728,6 +734,7 @@ class BasicMemoryAgent(AgentInterface):
         self._pending_facts_block = ""
         self._steam_pending_blocks = []
         self._pending_memory_deletes = {}
+        self._memory_pending_blocks = []
         # Reset banner state; will be set True below if the current
         # session already has messages here, or later by _add_message
         # when the first user message of a fresh session comes in.
@@ -857,10 +864,13 @@ class BasicMemoryAgent(AgentInterface):
         # outgoing payload — which is then stored verbatim (stored == sent).
         steam_blocks = self._steam_pending_blocks
         self._steam_pending_blocks = []
+        memory_blocks = self._memory_pending_blocks
+        self._memory_pending_blocks = []
         rag_block = "\n\n".join(
             b
             for b in (self._pending_rag_block, self._pending_facts_block)
             + tuple(steam_blocks)
+            + tuple(memory_blocks)
             if b
         )
         self._pending_rag_block = ""
@@ -1913,8 +1923,17 @@ class BasicMemoryAgent(AgentInterface):
                             "name": {
                                 "type": "string",
                                 "description": (
-                                    "action=check のときのゲーム名。"
-                                    "ローカルスナップショットにあいまい一致される。"
+                                    "action=check のときのゲーム名。ローカル"
+                                    "スナップショットにあいまい一致される"
+                                    "（日英+上位ゲームは中国語名も対応）。"
+                                ),
+                            },
+                            "appid": {
+                                "type": "integer",
+                                "description": (
+                                    "action=check を appid で正確に引く場合。"
+                                    "名前でヒットしない時は steam_search で "
+                                    "appid を解決してこちらに渡す。"
                                 ),
                             },
                             "n": {
@@ -2056,10 +2075,13 @@ class BasicMemoryAgent(AgentInterface):
                     "description": (
                         "自分の長期記憶（事実facts・過去の日記）を意味検索する。"
                         "自動想起とは別に、必要な時に自分から過去を調べる入口。"
-                        "結果の事実には id が付き、memory_update / memory_delete "
-                        "で使う。importance の意味：user=本人が手動管理（毎セッション"
-                        "常駐）/ llm=重要（毎セッション常駐）/ low=検索・想起された"
-                        "時だけ文脈に入る。"
+                        "結果の事実には id が付き、memory_update / memory_delete / "
+                        "memory_inject で使う。日記ヒットには diary_uid が付き、"
+                        "memory_read_diary で全文を読める。注意：この結果はこの"
+                        "ターン限りで消える——以後も参照したい記憶は memory_inject "
+                        "で文脈に固定すること。importance の意味：user=本人が手動"
+                        "管理（毎セッション常駐）/ high=重要（毎セッション常駐）/ "
+                        "low=検索・想起された時だけ文脈に入る。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -2102,9 +2124,9 @@ class BasicMemoryAgent(AgentInterface):
                             },
                             "importance": {
                                 "type": "string",
-                                "enum": ["llm", "low"],
+                                "enum": ["high", "low"],
                                 "description": (
-                                    "llm=重要（次回起動からsystem prompt常駐）/ "
+                                    "high=重要（次回起動からsystem prompt常駐）/ "
                                     "low=通常（検索・RAGで想起）。既定 low。"
                                 ),
                             },
@@ -2168,6 +2190,55 @@ class BasicMemoryAgent(AgentInterface):
                             },
                         },
                         "required": ["fact_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_read_diary",
+                    "description": (
+                        "日記1件の全文を読む（memory_search の日記ヒットは文単位"
+                        "なので、前後の文脈が要る時に）。結果はこのターン限り——"
+                        "以後も参照したいなら memory_inject で文脈に固定する。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "diary_uid": {
+                                "type": "string",
+                                "description": "memory_searchの日記ヒットに付く diary_uid。",
+                            }
+                        },
+                        "required": ["diary_uid"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_inject",
+                    "description": (
+                        "指定した事実・日記を会話の文脈に固定する（自動想起RAGと"
+                        "同じ仕組みで次のユーザーメッセージ以降ずっと見える）。"
+                        "memory_search / memory_read_diary の結果はそのターン限りで"
+                        "消えるため、続けて使いたい記憶はこれで注入する。注入済みの"
+                        "内容は自動想起でも重複表示されない。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "固定したい事実の id（最大10件）。",
+                            },
+                            "diary_uids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "固定したい日記の diary_uid（最大3件、全文が入る）。",
+                            },
+                        },
                     },
                 },
             },
@@ -2311,6 +2382,8 @@ class BasicMemoryAgent(AgentInterface):
         "memory_add",
         "memory_update",
         "memory_delete",
+        "memory_read_diary",
+        "memory_inject",
     )
     # Per-operation marker text is built by _memory_marker (📝 *記憶◯◯: …*);
     # display/history only — stripped from the AI replay like all markers.
@@ -2576,12 +2649,31 @@ class BasicMemoryAgent(AgentInterface):
             }
         if action == "check":
             query = str(args.get("name", "")).strip()
-            if not query:
+            appid_arg = args.get("appid")
+            if appid_arg is not None:
+                try:
+                    target = int(appid_arg)
+                except (TypeError, ValueError):
+                    return {"status": "error", "message": "appid は整数で。"}
+                matches = [
+                    {
+                        "appid": target,
+                        "name": g.get("name"),
+                        "where": where,
+                        "playtime_forever": g.get("playtime_forever", 0),
+                    }
+                    for where in ("owned", "wishlist", "followed")
+                    for g in snapshot.get(where) or []
+                    if int(g.get("appid") or 0) == target
+                ]
+                query = query or str(target)
+            elif query:
+                matches = mgr.find_game(snapshot, query)
+            else:
                 return {
                     "status": "error",
-                    "message": "action=check には name（ゲーム名）が必要。",
+                    "message": "action=check には name か appid が必要。",
                 }
-            matches = mgr.find_game(snapshot, query)
             if not matches:
                 return {
                     "status": "ok",
@@ -2941,6 +3033,10 @@ class BasicMemoryAgent(AgentInterface):
                 )
             elif name == "memory_delete":
                 result = await self._memory_delete_flow(args)
+            elif name == "memory_read_diary":
+                result = self._memory_read_diary_query(args)
+            elif name == "memory_inject":
+                result = self._memory_inject_query(args)
             else:
                 return None, {
                     "status": "error",
@@ -2974,11 +3070,95 @@ class BasicMemoryAgent(AgentInterface):
             label = f"記憶追加: {_clip(args.get('fact'))}"
         elif name == "memory_update":
             label = f"記憶更新: {_clip(args.get('new_fact'))}"
+        elif name == "memory_read_diary":
+            label = f"日記閲覧: {_clip(result.get('date') or args.get('diary_uid'))}"
+        elif name == "memory_inject":
+            n = int(result.get("injected_facts", 0)) + int(
+                result.get("injected_diaries", 0)
+            )
+            label = f"記憶注入: {n}件"
         elif result.get("status") == "pending_approval":
             label = f"記憶削除申請: {_clip(result.get('fact'))}"
         else:
             label = f"記憶削除: {_clip(result.get('deleted'))}"
         return f"\n📝 *{label}*\n"
+
+    def _memory_read_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Full diary view — read-only, this-turn-only (pin via memory_inject)."""
+        uid = str(args.get("diary_uid", "")).strip()
+        if not uid:
+            return {
+                "status": "error",
+                "message": "diary_uid が必要（memory_searchの日記ヒットに付いている）。",
+            }
+        entry = self._memory_manager.read_diary_full(uid)
+        if not entry:
+            return {"status": "error", "message": f"日記 {uid} が見つからない。"}
+        return {
+            "status": "ok",
+            "diary_uid": uid,
+            **entry,
+            "note": "この結果はこのターン限り。以後も参照するなら memory_inject で固定。",
+        }
+
+    def _memory_inject_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Pin facts/diaries into the conversation context, RAG-style.
+
+        Builds a block folded into the NEXT outgoing user message (persist-
+        not-ephemeral, same seam as the RAG blocks) and marks the ids as
+        session-injected so auto-RAG never re-surfaces them."""
+        mgr = self._memory_manager
+        fact_ids = [
+            str(x).strip() for x in (args.get("fact_ids") or []) if str(x).strip()
+        ][:10]
+        diary_uids = [
+            str(x).strip() for x in (args.get("diary_uids") or []) if str(x).strip()
+        ][:3]
+        if not fact_ids and not diary_uids:
+            return {
+                "status": "error",
+                "message": "fact_ids か diary_uids のどちらかが必要。",
+            }
+        lines: List[str] = []
+        injected_facts: List[str] = []
+        injected_diaries: List[str] = []
+        missing: List[str] = []
+        for fid in fact_ids:
+            f = mgr.find_fact(fid)
+            if not f:
+                missing.append(fid)
+                continue
+            date = str(f.get("updated", ""))[:10]
+            lines.append(f"- [{date}] {f.get('fact', '')}")
+            injected_facts.append(fid)
+        for uid in diary_uids:
+            e = mgr.read_diary_full(uid)
+            if not e:
+                missing.append(uid)
+                continue
+            lines.append(f"[日記 {e.get('date') or uid}]\n{e.get('content', '')}")
+            injected_diaries.append(uid)
+        if not lines:
+            return {
+                "status": "error",
+                "message": "指定のidが1件も見つからない。",
+                "missing": missing,
+            }
+        self._memory_pending_blocks.append(
+            "【記憶（自分で呼び出して文脈に固定した分）】\n" + "\n".join(lines)
+        )
+        # Auto-RAG must not re-surface what is now pinned in context.
+        self._session_injected_fact_ids.update(injected_facts)
+        self._session_injected_uids.update(injected_diaries)
+        result: Dict[str, Any] = {
+            "status": "ok",
+            "injected_facts": len(injected_facts),
+            "injected_diaries": len(injected_diaries),
+            "note": "次のユーザーメッセージから文脈に残り続ける。自動想起はこれらを重複表示しない。",
+        }
+        if missing:
+            result["missing"] = missing
+        return result
 
     async def _memory_delete_flow(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Two-phase deletion with mechanically-verified user approval."""

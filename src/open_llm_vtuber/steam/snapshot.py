@@ -44,6 +44,10 @@ from .client import SteamClient, SteamUnavailable
 # are rate limited to roughly 200 requests / 5 min per IP).
 _ENRICH_SLEEP_S = 0.5
 
+# Extra display-name languages fetched during enrichment (English comes from
+# the Web API itself). Keys are the alt_names dict keys, values Steam `l=`.
+_ALT_NAME_LANGS = {"ja": "japanese", "zh": "schinese"}
+
 # steamid64 for individual accounts always starts with 7656 (17 digits).
 _VDF_USER_BLOCK = re.compile(r'"(7656\d{13})"\s*\{([^}]*)\}')
 _VDF_MOST_RECENT = re.compile(r'"MostRecent"\s+"1"', re.IGNORECASE)
@@ -213,6 +217,7 @@ class SnapshotManager:
             # preserved enrichment (string-keyed appid maps)
             "game_tags": prior.get("game_tags") or {},
             "achievements": prior.get("achievements") or {},
+            "alt_names": prior.get("alt_names") or {},
             "enriched_at": prior.get("enriched_at"),
         }
         self._save(snapshot)
@@ -245,6 +250,7 @@ class SnapshotManager:
             )
             achievements: dict[str, Any] = dict(snapshot.get("achievements") or {})
             game_tags: dict[str, list[str]] = dict(snapshot.get("game_tags") or {})
+            alt_names: dict[str, Any] = dict(snapshot.get("alt_names") or {})
 
             ach_targets = [
                 g
@@ -254,7 +260,14 @@ class SnapshotManager:
             tag_targets = [
                 g for g in top[: self._tags_top_n] if str(g["appid"]) not in game_tags
             ]
-            if not ach_targets and not tag_targets:
+            # Localized (ja/zh) display names for the same top slice, so the
+            # local library check works whatever language she asks in (the
+            # Web API only gives English names). Presence of the appid key
+            # marks "tried" — a null value is negative-cached.
+            name_targets = [
+                g for g in top[: self._tags_top_n] if str(g["appid"]) not in alt_names
+            ]
+            if not ach_targets and not tag_targets and not name_targets:
                 logger.debug("Steam enrichment already up to date")
                 return
 
@@ -278,13 +291,28 @@ class SnapshotManager:
                     logger.debug(f"Store tags fetch failed for {appid}: {e}")
                 await asyncio.sleep(_ENRICH_SLEEP_S)
 
+            for game in name_targets:
+                appid = game["appid"]
+                variants: dict[str, str] = {}
+                for key, lang in _ALT_NAME_LANGS.items():
+                    try:
+                        name = await self._client.app_name_localized(appid, lang)
+                    except Exception as e:
+                        logger.debug(f"Alt-name fetch failed for {appid}/{lang}: {e}")
+                        name = None
+                    if name and name != game.get("name"):
+                        variants[key] = name
+                    await asyncio.sleep(_ENRICH_SLEEP_S)
+                alt_names[str(appid)] = variants or None
+
             snapshot["achievements"] = achievements
             snapshot["game_tags"] = game_tags
+            snapshot["alt_names"] = alt_names
             snapshot["enriched_at"] = _now_iso()
             self._save(snapshot)
             logger.info(
                 f"Steam enrichment refreshed: +{len(ach_targets)} achievement / "
-                f"+{len(tag_targets)} tag targets"
+                f"+{len(tag_targets)} tag / +{len(name_targets)} alt-name targets"
             )
         except Exception as e:
             logger.warning(f"Steam enrichment failed (skipped): {e}")
@@ -431,35 +459,60 @@ class SnapshotManager:
         if not q or not snapshot:
             return []
 
+        alt_names = snapshot.get("alt_names") or {}
         candidates: dict[int, dict] = {}
         for where in ("owned", "wishlist", "followed"):
             for g in snapshot.get(where) or []:
                 appid = _int(g.get("appid"))
                 if appid in candidates:
                     continue  # owned wins over wishlist wins over followed
+                variants = [g.get("name") or ""]
+                alts = alt_names.get(str(appid))
+                if isinstance(alts, dict):
+                    variants.extend(v for v in alts.values() if v)
                 candidates[appid] = {
                     "appid": appid,
                     "name": g.get("name") or "",
                     "where": where,
                     "playtime_forever": _int(g.get("playtime_forever")),
+                    "_names": variants,  # matched against; stripped on return
                 }
 
-        subs = [c for c in candidates.values() if q in _norm(c["name"])]
+        def _hit(c: dict) -> str | None:
+            for v in c["_names"]:
+                if q in _norm(v):
+                    return v
+            return None
+
+        def _strip(c: dict, matched: str | None = None) -> dict:
+            out = {k: v for k, v in c.items() if k != "_names"}
+            if matched and matched != c["name"]:
+                out["matched_name"] = matched
+            return out
+
+        subs = [(c, _hit(c)) for c in candidates.values()]
+        subs = [(c, m) for c, m in subs if m]
         if subs:
             subs.sort(
-                key=lambda c: (
-                    0 if _norm(c["name"]) == q else 1,
-                    -c["playtime_forever"],
+                key=lambda cm: (
+                    0 if any(_norm(v) == q for v in cm[0]["_names"]) else 1,
+                    -cm[0]["playtime_forever"],
                 )
             )
-            return subs[:10]
+            return [_strip(c, m) for c, m in subs[:10]]
 
-        by_norm: dict[str, list[dict]] = {}
+        by_norm: dict[str, list[tuple]] = {}
         for c in candidates.values():
-            by_norm.setdefault(_norm(c["name"]), []).append(c)
+            for v in c["_names"]:
+                by_norm.setdefault(_norm(v), []).append((c, v))
         matches: list[dict] = []
+        seen: set[int] = set()
         for norm_name in difflib.get_close_matches(q, list(by_norm), n=5, cutoff=0.5):
-            matches.extend(by_norm[norm_name])
+            for c, v in by_norm[norm_name]:
+                if c["appid"] in seen:
+                    continue
+                seen.add(c["appid"])
+                matches.append(_strip(c, v))
         return matches[:10]
 
     def top_played(self, snapshot: dict, n: int) -> list[dict]:
