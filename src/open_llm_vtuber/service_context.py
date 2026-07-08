@@ -42,6 +42,10 @@ from .memory.persistent_memory import PersistentMemoryManager
 from .pidfile import mark_backfill_settled
 from .alarms import get_alarm_store
 
+# Strong refs to fire-and-forget Steam background tasks (asyncio keeps only
+# weak refs; without this the enrichment task could be GC'd mid-flight).
+_STEAM_BG_TASKS: set = set()
+
 
 class ServiceContext:
     """Initializes, stores, and updates the asr, tts, and llm instances and other
@@ -259,6 +263,14 @@ class ServiceContext:
             self.character_config.agent_config.agent_settings.basic_memory_agent.mcp_enabled_servers,
         )
 
+        # Wire the Steam runtime (snapshot + tools + digest) into the shared
+        # agent. Done here — not in init_agent — for the same reason as the
+        # backfill below: this runs on the live event loop, so the Steam
+        # client's lazily-created httpx.AsyncClient and the fire-and-forget
+        # enrichment task bind to the loop that will actually serve requests.
+        # Guarded inside so only the first connection does the work.
+        await self._init_steam_runtime()
+
         # Kick off persistent-memory backfill on the live event loop. The
         # class-level in-progress guard makes this safe to call on every
         # connection — only the first one will actually do work.
@@ -303,6 +315,106 @@ class ServiceContext:
             ran = True  # facts won't change further; don't block the bot forever
         if ran:
             mark_backfill_settled(conf_uid=conf_uid)
+
+    async def _init_steam_runtime(self) -> None:
+        """Build the Steam client + startup snapshot and hand them to the agent.
+
+        Called from load_cache() (first client connection) and after a config
+        switch — i.e. always on the live event loop, never inside the
+        throwaway startup asyncio.run() loop (init_agent may run there; an
+        httpx client or task created on it would die with that loop — same
+        lesson as the memory backfill above).
+
+        Wired at most once per agent instance: the shared agent carries a
+        check-and-set flag (_steam_wiring_started, flipped before the first
+        await so concurrent connections can't double-run). A config switch
+        creates a fresh agent, which re-triggers wiring on its next call.
+        Never raises; failures are logged loudly and leave Steam off.
+        """
+        try:
+            agent = self.agent_engine
+            if agent is None or not hasattr(agent, "set_steam_runtime"):
+                return
+            steam_cfg = getattr(self.config, "steam_config", None)
+            if not steam_cfg or not getattr(steam_cfg, "enabled", False):
+                logger.debug("[steam] disabled (steam_config.enabled is false).")
+                return
+            if getattr(agent, "_steam_wiring_started", False):
+                return
+            agent._steam_wiring_started = True
+
+            from .steam import SteamClient, SnapshotManager
+
+            steamid = (steam_cfg.steamid64 or "").strip()
+            if not steamid:
+                steamid = SnapshotManager.detect_steamid64() or ""
+                logger.info(
+                    "[steam] steamid64 autodetect: "
+                    + (
+                        f"found {steamid}"
+                        if steamid
+                        else "NOT found — library reading disabled "
+                        "(set steam_config.steamid64 in conf.yaml)"
+                    )
+                )
+            client = SteamClient(
+                web_api_key=steam_cfg.web_api_key,
+                steamid=steamid,
+                cc=steam_cfg.cc,
+                lang=steam_cfg.lang,
+            )
+            snapshot_mgr = SnapshotManager(
+                client,
+                achievements_top_n=steam_cfg.achievements_top_n,
+                tags_top_n=steam_cfg.tags_top_n,
+            )
+            snapshot = snapshot_mgr.load()
+            if snapshot:
+                logger.info("[steam] loaded prior snapshot from disk.")
+            try:
+                snapshot = await asyncio.wait_for(
+                    snapshot_mgr.refresh_core(), timeout=25.0
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[steam] refresh_core failed ({e}); using "
+                    + ("stale snapshot from disk." if snapshot else "no snapshot.")
+                )
+            if snapshot:
+                digest = snapshot_mgr.build_digest(snapshot)
+                logger.info(
+                    "[steam] snapshot ready: {} owned, {} wishlist, {} followed "
+                    "(library_ok={}).".format(
+                        len(snapshot.get("owned") or []),
+                        len(snapshot.get("wishlist") or []),
+                        len(snapshot.get("followed") or []),
+                        snapshot.get("library_ok"),
+                    )
+                )
+            else:
+                digest = (
+                    "【Steamライブラリ概況（起動時スナップショット）】\n"
+                    "ライブラリ未取得（初回スナップショット取得に失敗。"
+                    "steam_search / steam_game / steam_discover のストア照会は利用可能）"
+                )
+                logger.warning("[steam] no snapshot available; using fallback digest.")
+            # Must happen before the first turn — the digest joins the cached
+            # system-prompt prefix and must never change mid-session.
+            agent.set_steam_runtime(client, snapshot_mgr, digest)
+            logger.info("[steam] agent wired: 4 steam_* tools + resident digest.")
+
+            async def _enrich() -> None:
+                try:
+                    await snapshot_mgr.refresh_enrichment()
+                    logger.info("[steam] snapshot enrichment finished.")
+                except Exception as e:
+                    logger.warning(f"[steam] snapshot enrichment failed: {e}")
+
+            task = asyncio.create_task(_enrich())
+            _STEAM_BG_TASKS.add(task)
+            task.add_done_callback(_STEAM_BG_TASKS.discard)
+        except Exception:
+            logger.exception("[steam] failed to initialise Steam integration")
 
     async def load_from_config(self, config: Config) -> None:
         """
@@ -703,6 +815,9 @@ class ServiceContext:
                 }
                 new_config = validate_config(new_config)
                 await self.load_from_config(new_config)  # Await the async load
+                # A config switch may have built a fresh agent (which lacks the
+                # steam runtime); re-wire it here on the live loop.
+                await self._init_steam_runtime()
                 logger.debug(f"New config: {self}")
                 logger.debug(
                     f"New character config: {redact_secrets(self.character_config.model_dump())}"

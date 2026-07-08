@@ -643,3 +643,25 @@ model_health_config:
   mention_admin_on_alert: true
   # 给角色一个 check_model_status 工具，可查自己（或指定模型）的基准分 + 官方状态。
   self_check_tool_enabled: true
+
+# Steam 集成
+# 商店查询（搜索、价格、评测、标签）无需密钥；读取自己的库/游玩时长/成就
+# 需要免费的 Steam Web API 密钥。
+steam_config:
+  # 启用 Steam 集成（商店工具 + 库快照）。
+  enabled: false
+  # Steam Web API 密钥。在 https://steamcommunity.com/dev/apikey 免费申请。
+  # 仅读取自己的库时需要；留空则关闭库读取（商店功能不受影响）。
+  # 切勿提交真实密钥——它绝不会被打印或写入日志。
+  web_api_key: ""
+  # 你的 64 位 SteamID。留空 = 从本机 Steam 安装自动检测
+  # （取 loginusers.vdf 中最近登录的账号）。
+  steamid64: ""
+  # 商店区域代码（决定价格/可购状态）。默认 jp。
+  cc: "jp"
+  # 商店语言（Steam 完整语言名），影响简介、标签与评测文案。默认 japanese。
+  lang: "japanese"
+  # 快照增强时，为游玩时长前 N 的游戏抓取成就进度。越大信息越全、API 调用越多。
+  achievements_top_n: 40
+  # 快照增强时，为游玩时长前 N 的游戏抓取商店页社区标签。
+  tags_top_n: 40

@@ -685,3 +685,29 @@ model_health_config:
   # Give the character a check_model_status tool to look up its own (or a named
   # model's) benchmark + official-status report.
   self_check_tool_enabled: true
+
+# Steam Integration
+# Storefront lookups (search, prices, reviews, tags) are keyless. Reading your
+# own library/playtime/achievements needs a free Steam Web API key.
+steam_config:
+  # Enable the Steam integration (store tools + library snapshot).
+  enabled: false
+  # Steam Web API key. Get one for free at
+  # https://steamcommunity.com/dev/apikey. Only needed for reading your own
+  # library; leave empty to disable library reading (storefront still works).
+  # NEVER commit a real key — it is never printed or logged.
+  web_api_key: ""
+  # Your 64-bit SteamID. Empty = autodetect from the local Steam install
+  # (most recent login in loginusers.vdf).
+  steamid64: ""
+  # Storefront country code (prices/availability). Default jp.
+  cc: "jp"
+  # Storefront language (Steam full language name) for descriptions, tags and
+  # review labels. Default japanese.
+  lang: "japanese"
+  # Fetch achievement progress for this many top-playtime games during
+  # snapshot enrichment. Higher = richer digest but more API calls.
+  achievements_top_n: 40
+  # Fetch store-page community tags for this many top-playtime games during
+  # snapshot enrichment.
+  tags_top_n: 40

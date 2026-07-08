@@ -9,9 +9,12 @@ from typing import (
     Optional,
     Set,
 )
+import asyncio
 import json
 import hashlib
 import re
+import time
+import unicodedata
 from datetime import datetime
 from loguru import logger
 from .agent_interface import AgentInterface
@@ -58,7 +61,7 @@ from ...mcpp.tool_executor import ToolExecutor
 # "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
 # query/url that itself contains '*' (rare) is left as-is rather than risk
 # eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
-# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断).
+# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam).
 _TOOL_MARKER_RE = re.compile(
     r"[ \t]*(?:"
     r"🍔[ \t]*\*Uber Eats\*"
@@ -66,6 +69,7 @@ _TOOL_MARKER_RE = re.compile(
     r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
     r"|⏰[ \t]*\*Alarm set:[^*\n]*\*"
     r"|🧠[ \t]*\*自己診断\*"
+    r"|🎮[ \t]*\*Steam\*"
     r")"
 )
 
@@ -130,6 +134,24 @@ class BasicMemoryAgent(AgentInterface):
         self._model_health_enabled = False  # set via set_model_health_enabled()
         self._asl_client = None
         self._status_client = None
+
+        # Steam integration (four in-process steam_* tools + resident library
+        # digest). All set via set_steam_runtime() once the startup snapshot
+        # is ready — before the first turn, so the digest is cache-stable.
+        self._steam_enabled = False
+        # Check-and-set guard used by ServiceContext._init_steam_runtime so the
+        # shared agent is wired at most once (set before its first await).
+        self._steam_wiring_started = False
+        self._steam_client = None  # steam.SteamClient
+        self._steam_snapshot_mgr = None  # steam.SnapshotManager
+        self._steam_digest = ""
+        self._steam_snapshot_cache: Optional[Dict[str, Any]] = None
+        self._steam_snapshot_loaded_at: float = 0.0
+        # Compact copies of successful steam tool results. Folded into the
+        # NEXT outgoing user message the same persist-not-ephemeral way as the
+        # RAG blocks (stored == sent, never assistant-role), so results stay
+        # visible across turns without teaching the model to imitate them.
+        self._steam_pending_blocks: List[str] = []
 
         # Diary RAG (long-tail recall). The in-context list is ephemeral: it
         # holds retrieved diaries with a per-turn TTL and is injected only into
@@ -290,6 +312,23 @@ class BasicMemoryAgent(AgentInterface):
         """Turn the check_model_status self-check tool on/off (config-driven)."""
         self._model_health_enabled = bool(enabled)
 
+    def set_steam_runtime(self, client, snapshot_mgr, digest: str) -> None:
+        """Attach the Steam client + snapshot manager, enabling the four
+        steam_* built-in tools and the resident library digest.
+
+        ``digest`` is a short Japanese summary of the startup snapshot that
+        rides in the system prompt. It MUST be set once before the first turn
+        and never changed mid-session — a mid-session change would bust the
+        prompt-cache prefix (same rule as the persona/facts blocks)."""
+        self._steam_client = client
+        self._steam_snapshot_mgr = snapshot_mgr
+        self._steam_digest = (digest or "").strip()
+        self._steam_enabled = client is not None and snapshot_mgr is not None
+        logger.info(
+            f"[steam] agent runtime set (enabled={self._steam_enabled}, "
+            f"digest={len(self._steam_digest)} chars)."
+        )
+
     @staticmethod
     def _format_timestamp(ts: str) -> str:
         """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS Weekday]'."""
@@ -379,6 +418,37 @@ class BasicMemoryAgent(AgentInterface):
         "断罪する必要はない。推測で調子を語る前に、まず実際に呼び出すこと。"
     )
 
+    # Affirmative capability note for the Steam tools, with hard no-fabricate
+    # rules — the known failure mode is recommending games from memory (or
+    # inventing ones) instead of pulling real store data. Static /
+    # cache-stable; gated on the steam runtime being attached.
+    _STEAM_CAPABILITY_NOTE = (
+        "【Steam（ゲームライブラリ・ストア）について】\n"
+        "あなたにはユーザーのSteamライブラリと、実際のSteamストアを調べるツールが"
+        "実際に備わっている。これは実在する機能で、呼び出せば本物のデータが返る：\n"
+        "- steam_library：ユーザーの所持ゲーム・プレイ時間・直近プレイ・"
+        "ウィッシュリスト等（起動時スナップショット）をローカルで照会する\n"
+        "- steam_search：ゲーム名でストアを検索し、appid・正式名称・価格を解決する\n"
+        "- steam_game：appid を指定してストアページ相当の詳細"
+        "（価格・割引・説明・レビュー概況・タグ）を見る\n"
+        "- steam_discover：類似ゲーム・タグ別一覧・セール中など、"
+        "実在の候補リストを得る（所持済みタイトルは除外済み）\n"
+        "【厳守】\n"
+        "- ストアのゲームを勧める時は、必ず steam_discover / steam_search の"
+        "結果に含まれるタイトルからのみ選ぶこと。記憶からタイトルを挙げたり、"
+        "存在しないゲームを作ってはならない。まだ呼び出していなければ、"
+        "あなたは実在のストアデータを一切持っていない。\n"
+        "- 特定のゲームの価格・評価・発売日などを述べる前に、"
+        "まず steam_search で名前→appid を解決し、steam_game で確認すること。\n"
+        "- 価格はすべて日本円の整数に正規化済み（そのまま「◯円」と言ってよい）。\n"
+        "- ライブラリの概況は起動時スナップショットとして既にこのsystem prompt内に"
+        "ある。詳細（所持確認・プレイ時間の一覧など）が必要な時だけ "
+        "steam_library を呼ぶこと。\n"
+        "なお、ツールの結果は次のユーザーメッセージの冒頭に『【Steamデータ】』"
+        "ブロックとして参照用に残ることがある。これはユーザーの発言ではなく、"
+        "あなたが取得したデータの控えである。"
+    )
+
     # Trailing system block placed right before the message history.
     # No cache_control marker — small, static, and positional. By sitting
     # last in the system prompt, it's the closest instruction to the
@@ -465,6 +535,10 @@ class BasicMemoryAgent(AgentInterface):
         right before it encounters the data they apply to.
         """
         parts = [self._system, self._TIMESTAMP_NOTE] + self._tool_capability_notes()
+        # Resident Steam library digest — set once before the first turn and
+        # never changed mid-session, so it is as cache-stable as the notes.
+        if self._steam_digest:
+            parts.append(self._steam_digest)
         facts_fp = diaries_fp = "-"
         if self._memory_manager:
             facts_text = self._memory_manager.get_facts_prompt()
@@ -530,7 +604,11 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "text",
                 "text": "\n\n".join(
-                    [self._system, self._TIMESTAMP_NOTE] + self._tool_capability_notes()
+                    [self._system, self._TIMESTAMP_NOTE]
+                    + self._tool_capability_notes()
+                    # Steam digest: set once before the first turn, immutable
+                    # for the session, so it belongs in this cached block.
+                    + ([self._steam_digest] if self._steam_digest else [])
                 ),
                 "cache_control": self._CACHE_CONTROL_1H,
             }
@@ -674,6 +752,7 @@ class BasicMemoryAgent(AgentInterface):
         self._pending_rag_block = ""
         self._session_injected_fact_ids = set()
         self._pending_facts_block = ""
+        self._steam_pending_blocks = []
         # Reset banner state; will be set True below if the current
         # session already has messages here, or later by _add_message
         # when the first user message of a fresh session comes in.
@@ -798,9 +877,16 @@ class BasicMemoryAgent(AgentInterface):
         # _add_message below, so _memory — and therefore the persisted history
         # and the cache prefix — stay clean (see _maybe_inject_diary_rag).
         # Diary block first, then the facts block (independent subsystem), then
-        # the user's actual text. Both ride only on the outgoing payload.
+        # any pending Steam tool-result blocks (staged by _run_steam_tool during
+        # earlier turns), then the user's actual text. All ride only on the
+        # outgoing payload — which is then stored verbatim (stored == sent).
+        steam_blocks = self._steam_pending_blocks
+        self._steam_pending_blocks = []
         rag_block = "\n\n".join(
-            b for b in (self._pending_rag_block, self._pending_facts_block) if b
+            b
+            for b in (self._pending_rag_block, self._pending_facts_block)
+            + tuple(steam_blocks)
+            if b
         )
         self._pending_rag_block = ""
         self._pending_facts_block = ""
@@ -1145,11 +1231,14 @@ class BasicMemoryAgent(AgentInterface):
                     if assistant_text_for_memory:
                         self._add_message(assistant_text_for_memory, "assistant")
 
-                # Split: in-process tools (alarms + self-check) are handled here,
-                # provider-agnostic; everything else goes to the MCP executor.
+                # Split: in-process tools (alarms + self-check + steam) are
+                # handled here, provider-agnostic; everything else goes to the
+                # MCP executor.
                 inproc_names = set(self._ALARM_TOOL_NAMES)
                 if self._model_health_enabled:
                     inproc_names.add(self._MODEL_HEALTH_TOOL_NAME)
+                if self._steam_enabled:
+                    inproc_names.update(self._STEAM_TOOL_NAMES)
                 inproc_calls = [
                     c for c in pending_tool_calls if c.get("name") in inproc_names
                 ]
@@ -1165,11 +1254,18 @@ class BasicMemoryAgent(AgentInterface):
                         marker, result = await self._run_model_health_tool(
                             c.get("input") or {}
                         )
+                    elif cname in self._STEAM_TOOL_NAMES:
+                        marker, result = await self._run_steam_tool(
+                            cname, c.get("input") or {}
+                        )
                     else:
                         marker, result = await self._run_alarm_tool(
                             cname, c.get("input") or {}
                         )
-                    if marker:
+                    # Dedupe by exact text so constant tags (e.g. the 🎮 Steam
+                    # marker) surface once per turn even across chained calls.
+                    if marker and marker not in emitted_markers:
+                        emitted_markers.add(marker)
                         yield marker
                     tool_results_for_llm.append(
                         {
@@ -1401,8 +1497,11 @@ class BasicMemoryAgent(AgentInterface):
                             # streams it to the UI, exactly as the old web-tool
                             # loop did. (A bare dict would pass untouched through
                             # the transformers and be dropped downstream.)
+                            # Deduped by exact text so constant tags (e.g. the
+                            # 🎮 Steam marker) appear once per turn.
                             marker = ev.get("text", "")
-                            if marker:
+                            if marker and marker not in emitted_markers:
+                                emitted_markers.add(marker)
                                 yield marker
 
                 if mcp_calls:
@@ -1481,6 +1580,8 @@ class BasicMemoryAgent(AgentInterface):
                     claude_tools.extend(self._build_alarm_tools_claude())
                 if self._model_health_enabled:
                     claude_tools.extend(self._build_model_health_tools_claude())
+                if self._steam_enabled:
+                    claude_tools.extend(self._build_steam_tools_claude())
                 if claude_tools:
                     logger.debug(
                         f"Starting Claude tool loop with {len(claude_tools)} tools."
@@ -1569,6 +1670,8 @@ class BasicMemoryAgent(AgentInterface):
             notes.append(self._UBER_CAPABILITY_NOTE)
         if self._model_health_enabled:
             notes.append(self._MODEL_HEALTH_CAPABILITY_NOTE)
+        if self._steam_enabled:
+            notes.append(self._STEAM_CAPABILITY_NOTE)
         return notes
 
     def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:
@@ -1583,6 +1686,8 @@ class BasicMemoryAgent(AgentInterface):
             tools.extend(self._build_alarm_tools_openai())
         if self._model_health_enabled:
             tools.extend(self._build_model_health_tools_openai())
+        if self._steam_enabled:
+            tools.extend(self._build_steam_tools_openai())
         return tools
 
     def _builtin_tool_names(self) -> set:
@@ -1782,6 +1887,177 @@ class BasicMemoryAgent(AgentInterface):
     def _build_model_health_tools_claude(self) -> List[Dict[str, Any]]:
         return self._to_claude_schema(self._build_model_health_tools_openai())
 
+    @staticmethod
+    def _build_steam_tools_openai() -> List[Dict[str, Any]]:
+        """OpenAI schemas for the four in-process Steam tools. Descriptions
+        are in Japanese, matching the persona/model's working language."""
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "steam_library",
+                    "description": (
+                        "ユーザーのSteamライブラリ（起動時スナップショット）を"
+                        "ローカルで照会する。ネットワーク不要で即答。"
+                        "所持ゲーム・プレイ時間・直近プレイ・ウィッシュリスト・"
+                        "フォロー中タイトルを調べられる。"
+                        "「このゲーム持ってる？」の類いは action=check + name で"
+                        "調べる（名前はスナップショットにあいまい一致される）。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": [
+                                    "overview",
+                                    "top_played",
+                                    "recent",
+                                    "check",
+                                    "wishlist",
+                                    "followed",
+                                ],
+                                "description": (
+                                    "照会の種類。overview=概況 / top_played=プレイ時間上位 / "
+                                    "recent=直近2週間にプレイしたもの / check=特定ゲームの所持確認 / "
+                                    "wishlist=ウィッシュリスト / followed=フォロー中。"
+                                ),
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": (
+                                    "action=check のときのゲーム名。"
+                                    "ローカルスナップショットにあいまい一致される。"
+                                ),
+                            },
+                            "n": {
+                                "type": "integer",
+                                "description": "リスト系actionで返す件数。既定10。",
+                            },
+                        },
+                        "required": ["action"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "steam_search",
+                    "description": (
+                        "実際のSteamストアをゲーム名で検索し、appid・正式名称・"
+                        "価格（円）を得る。あらゆるゲーム名を appid に解決する"
+                        "入口として、正確な情報が要る時はまずこれを呼び、"
+                        "得た appid で steam_game 等の精密照会に進むこと。"
+                        "表記ゆれに備え、確信がなければ日本語名と英語名の両方を"
+                        "queries に入れる。結果は実在のストアデータ。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "queries": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "検索する名前の候補（最大4件）。"
+                                    "日本語名と英語名の両方を入れると取りこぼしにくい。"
+                                ),
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "返す件数の上限。既定5。",
+                            },
+                        },
+                        "required": ["queries"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "steam_game",
+                    "description": (
+                        "appid を指定して、そのゲームのストアページ相当の詳細を見る"
+                        "（価格・割引・説明・ジャンル・発売日・レビュー概況・"
+                        "コミュニティタグ・所持有無）。appid が不明なら先に "
+                        "steam_search で解決すること。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "appid": {
+                                "type": "integer",
+                                "description": "SteamのアプリID。",
+                            }
+                        },
+                        "required": ["appid"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "steam_discover",
+                    "description": (
+                        "実際のSteamストアからおすすめ候補リストを得る。"
+                        "ユーザーの所持済みタイトルは除外済み。"
+                        "ゲームを勧める時は、必ずこの結果（または steam_search の"
+                        "結果）の中からのみ選ぶこと。mode: similar=あるゲームに"
+                        "似たタイトル / tag=タグ別の一覧（section で並び替え）/ "
+                        "specials=セール中のタイトル。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "mode": {
+                                "type": "string",
+                                "enum": ["similar", "tag", "specials"],
+                                "description": "候補の探し方。",
+                            },
+                            "anchor": {
+                                "type": "string",
+                                "description": (
+                                    "mode=similar の基準となるゲーム名または appid"
+                                    "（similar では必須）。名前はまずライブラリ内で"
+                                    "解決される。見つからなければ steam_search で "
+                                    "appid を得てから渡すこと。"
+                                ),
+                            },
+                            "tag": {
+                                "type": "string",
+                                "description": (
+                                    "mode=tag のタグ（tag では必須）。自然な言い方で"
+                                    "よく、実在のSteamタグ表に解決される"
+                                    "（例:「ローグライク」「ビジュアルノベル」）。"
+                                ),
+                            },
+                            "section": {
+                                "type": "string",
+                                "enum": [
+                                    "trending_new",
+                                    "top_sellers",
+                                    "top_rated",
+                                    "new_releases",
+                                    "coming_soon",
+                                    "most_wishlisted",
+                                ],
+                                "description": (
+                                    "mode=tag のときの並び。既定 trending_new。"
+                                ),
+                            },
+                            "count": {
+                                "type": "integer",
+                                "description": "返す件数。既定10。",
+                            },
+                        },
+                        "required": ["mode"],
+                    },
+                },
+            },
+        ]
+
+    def _build_steam_tools_claude(self) -> List[Dict[str, Any]]:
+        return self._to_claude_schema(self._build_steam_tools_openai())
+
     async def _run_model_health_tool(self, args: Dict[str, Any]) -> tuple:
         """Run check_model_status. Returns (marker, result_dict). The JA report is
         the tool result the character relays; a ZH copy is logged so あさひ can see
@@ -1810,7 +2086,9 @@ class BasicMemoryAgent(AgentInterface):
                 "error": "調子の確認に失敗した（データ源に接続できず）。",
             }
         ja, zh = render_ja(assessment), render_zh(assessment)
-        logger.info(f"[model_health] self-check ({model}) verdict={assessment.verdict}\n{zh}")
+        logger.info(
+            f"[model_health] self-check ({model}) verdict={assessment.verdict}\n{zh}"
+        )
         marker = "\n🧠 *自己診断*\n"
         return marker, {"status": "ok", "report": ja}
 
@@ -1871,6 +2149,10 @@ class BasicMemoryAgent(AgentInterface):
             marker, result = await self._run_model_health_tool(args)
             if marker:
                 yield {"type": "tool_marker", "text": marker}
+        elif name in self._STEAM_TOOL_NAMES:
+            marker, result = await self._run_steam_tool(name, args)
+            if marker:
+                yield {"type": "tool_marker", "text": marker}
         else:
             result = {"error": f"unknown builtin tool {name!r}"}
 
@@ -1885,6 +2167,23 @@ class BasicMemoryAgent(AgentInterface):
 
     _ALARM_TOOL_NAMES = ("set_alarm", "list_alarms", "cancel_alarm")
     _MODEL_HEALTH_TOOL_NAME = "check_model_status"
+    _STEAM_TOOL_NAMES = (
+        "steam_library",
+        "steam_search",
+        "steam_game",
+        "steam_discover",
+    )
+    _STEAM_MARKER = "\n🎮 *Steam*\n"
+    # steam_discover section → search/results parameters (verified live for the
+    # filter= variants; the sort_by variants are the same endpoint family).
+    _STEAM_SECTION_MAP = {
+        "trending_new": {"filter": "popularnew"},
+        "top_sellers": {"filter": "topsellers"},
+        "coming_soon": {"filter": "comingsoon"},
+        "most_wishlisted": {"filter": "popularwishlist"},
+        "top_rated": {"sort_by": "Reviews_DESC"},
+        "new_releases": {"sort_by": "Released_DESC"},
+    }
 
     async def _run_alarm_tool(self, name: str, args: Dict[str, Any]) -> tuple:
         """Execute one alarm tool call. Returns (marker_text|None, result_dict).
@@ -1967,6 +2266,480 @@ class BasicMemoryAgent(AgentInterface):
                 "id": alarm_id,
             }
         return None, {"error": f"unknown alarm tool {name!r}"}
+
+    # ------------------------------------------------------------------
+    # Steam tools (in-process, provider-agnostic — shared by both loops)
+    # ------------------------------------------------------------------
+
+    async def _run_steam_tool(self, name: str, args: Dict[str, Any]) -> tuple:
+        """Execute one steam_* tool call. Returns (marker_text|None, result_dict).
+
+        Never raises: SteamUnavailable (and anything else) is converted into a
+        Japanese, actionable error dict. On success the result is also staged
+        as a compact 【Steamデータ】 block folded into the NEXT outgoing user
+        message (cross-turn visibility; see _stage_steam_block)."""
+        if (
+            not self._steam_enabled
+            or self._steam_client is None
+            or self._steam_snapshot_mgr is None
+        ):
+            return None, {
+                "status": "error",
+                "message": "Steam機能は現在利用できない（未設定）。",
+            }
+        args = args or {}
+        try:
+            from ...steam import SteamUnavailable
+        except Exception as e:  # module not importable — should not happen once wired
+            logger.error(f"[steam] steam module unavailable: {e}")
+            return None, {
+                "status": "error",
+                "message": "Steamモジュールを読み込めなかった。",
+            }
+        try:
+            if name == "steam_library":
+                result = self._steam_library_query(args)
+            elif name == "steam_search":
+                result = await self._steam_search_query(args)
+            elif name == "steam_game":
+                result = await self._steam_game_query(args)
+            elif name == "steam_discover":
+                result = await self._steam_discover_query(args)
+            else:
+                return None, {
+                    "status": "error",
+                    "message": f"不明なSteamツール: {name!r}",
+                }
+        except SteamUnavailable as e:
+            logger.warning(f"[steam] {name} unavailable: {e}")
+            return None, {
+                "status": "error",
+                "message": (
+                    f"Steamに接続できなかった（{e}）。"
+                    "一時的な不調の可能性が高いので、少し待ってから再試行すること。"
+                ),
+            }
+        except Exception:
+            logger.exception(f"[steam] {name} failed unexpectedly")
+            return None, {
+                "status": "error",
+                "message": "Steamデータの処理中に内部エラーが起きた。再試行してよい。",
+            }
+        if result.get("status") == "ok":
+            self._stage_steam_block(name, args, result)
+        return self._STEAM_MARKER, result
+
+    def _steam_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Current snapshot dict, reloaded from disk at most every 30s so the
+        background enrichment pass (tags/achievements landing after startup)
+        becomes visible without a restart. Last good copy kept as fallback."""
+        now = time.monotonic()
+        if (
+            self._steam_snapshot_cache is not None
+            and now - self._steam_snapshot_loaded_at < 30.0
+        ):
+            return self._steam_snapshot_cache
+        try:
+            snap = self._steam_snapshot_mgr.load() if self._steam_snapshot_mgr else None
+        except Exception as e:
+            logger.warning(f"[steam] snapshot load failed: {e}")
+            snap = None
+        if snap is not None:
+            self._steam_snapshot_cache = snap
+        self._steam_snapshot_loaded_at = now
+        return self._steam_snapshot_cache
+
+    def _steam_owned_set(self) -> Set[int]:
+        snapshot = self._steam_snapshot()
+        if not snapshot:
+            return set()
+        try:
+            return self._steam_snapshot_mgr.owned_set(snapshot)
+        except Exception as e:
+            logger.warning(f"[steam] owned_set failed: {e}")
+            return set()
+
+    @staticmethod
+    def _steam_game_row(g: Dict[str, Any]) -> Dict[str, Any]:
+        """Compact copy of a snapshot game record: playtime minutes → hours,
+        unix last-played → date string. Unknown keys pass through untouched."""
+        row = dict(g)
+        for key, out in (
+            ("playtime_forever", "hours_total"),
+            ("playtime_2weeks", "hours_2weeks"),
+        ):
+            if row.get(key) is not None:
+                try:
+                    row[out] = round(int(row.pop(key)) / 60, 1)
+                except (TypeError, ValueError):
+                    row.pop(key, None)
+        rt = row.pop("rtime_last_played", None)
+        if rt:
+            try:
+                row["last_played"] = datetime.fromtimestamp(int(rt)).strftime(
+                    "%Y-%m-%d"
+                )
+            except (TypeError, ValueError, OSError, OverflowError):
+                pass
+        return row
+
+    def _steam_library_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Pure local snapshot queries — no network."""
+        action = str(args.get("action", "")).strip()
+        try:
+            n = max(1, min(int(args.get("n", 10)), 50))
+        except (TypeError, ValueError):
+            n = 10
+        mgr = self._steam_snapshot_mgr
+        snapshot = self._steam_snapshot()
+        if snapshot is None:
+            return {
+                "status": "error",
+                "message": (
+                    "Steamスナップショットが未取得（起動直後か、取得に失敗）。"
+                    "ストア照会（steam_search / steam_game / steam_discover）は使える。"
+                ),
+            }
+        library_ok = bool(snapshot.get("library_ok"))
+        if action == "overview":
+            owned = snapshot.get("owned") or []
+            total_min = sum(int(g.get("playtime_forever") or 0) for g in owned)
+            out = {
+                "status": "ok",
+                "library_ok": library_ok,
+                "owned_count": len(owned),
+                "total_hours": round(total_min / 60, 1),
+                "wishlist_count": len(snapshot.get("wishlist") or []),
+                "followed_count": len(snapshot.get("followed") or []),
+                "top_played": [
+                    self._steam_game_row(g) for g in mgr.top_played(snapshot, 5)
+                ],
+            }
+            if not library_ok:
+                out["note"] = (
+                    "ライブラリ未取得（APIキー未設定またはプロフィール非公開）。"
+                    "所持・プレイ時間データは無い。"
+                )
+            return out
+        if action == "top_played":
+            return {
+                "status": "ok",
+                "library_ok": library_ok,
+                "games": [self._steam_game_row(g) for g in mgr.top_played(snapshot, n)],
+            }
+        if action == "recent":
+            return {
+                "status": "ok",
+                "library_ok": library_ok,
+                "games": [self._steam_game_row(g) for g in mgr.recent_detail(snapshot)][
+                    :n
+                ],
+            }
+        if action == "check":
+            query = str(args.get("name", "")).strip()
+            if not query:
+                return {
+                    "status": "error",
+                    "message": "action=check には name（ゲーム名）が必要。",
+                }
+            matches = mgr.find_game(snapshot, query)
+            if not matches:
+                return {
+                    "status": "ok",
+                    "found": False,
+                    "query": query,
+                    "hint": (
+                        "ライブラリ外。steam_searchでappidを解決してから"
+                        "steam_gameで確認可能"
+                    ),
+                }
+            return {
+                "status": "ok",
+                "found": True,
+                "query": query,
+                "matches": [self._steam_game_row(m) for m in matches[:n]],
+            }
+        if action == "wishlist":
+            wl = snapshot.get("wishlist") or []
+            return {
+                "status": "ok",
+                "count": len(wl),
+                "items": [
+                    {
+                        "appid": w.get("appid"),
+                        "name": w.get("name"),
+                        "date_added": w.get("date_added"),
+                    }
+                    for w in wl[:n]
+                ],
+            }
+        if action == "followed":
+            fl = snapshot.get("followed") or []
+            return {
+                "status": "ok",
+                "count": len(fl),
+                "items": [
+                    {"appid": f.get("appid"), "name": f.get("name")} for f in fl[:n]
+                ],
+            }
+        return {"status": "error", "message": f"不明なaction: {action!r}"}
+
+    async def _steam_search_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Store search over up to 4 name variants, merged round-robin and
+        deduped by appid, with owned/wishlist membership marked."""
+        queries = args.get("queries")
+        if isinstance(queries, str):
+            queries = [queries]
+        queries = [str(q).strip() for q in (queries or []) if str(q).strip()][:4]
+        if not queries:
+            return {
+                "status": "error",
+                "message": "queries（ゲーム名の候補、配列）が必要。",
+            }
+        try:
+            limit = max(1, min(int(args.get("limit", 5)), 20))
+        except (TypeError, ValueError):
+            limit = 5
+        raw = await asyncio.gather(
+            *(self._steam_client.store_search(q, limit=limit) for q in queries),
+            return_exceptions=True,
+        )
+        per_query: List[List[Dict[str, Any]]] = []
+        failures = 0
+        for q, res in zip(queries, raw):
+            if isinstance(res, BaseException):
+                logger.warning(f"[steam] store_search({q!r}) failed: {res}")
+                failures += 1
+                per_query.append([])
+            else:
+                per_query.append(list(res or []))
+        if failures == len(queries):
+            return {
+                "status": "error",
+                "message": "Steamストア検索に失敗した。少し待ってから再試行すること。",
+            }
+        snapshot = self._steam_snapshot() or {}
+        owned = self._steam_owned_set()
+        wishlisted = {w.get("appid") for w in (snapshot.get("wishlist") or [])}
+        seen: Set[int] = set()
+        merged: List[Dict[str, Any]] = []
+        # Round-robin across the query variants so each contributes its best
+        # hits even when the cap cuts the tail.
+        for i in range(max((len(lst) for lst in per_query), default=0)):
+            for lst in per_query:
+                if i < len(lst):
+                    item = lst[i]
+                    appid = item.get("appid")
+                    if appid in seen:
+                        continue
+                    seen.add(appid)
+                    row = dict(item)
+                    row["owned"] = appid in owned
+                    row["wishlisted"] = appid in wishlisted
+                    merged.append(row)
+        merged = merged[:limit]
+        return {
+            "status": "ok",
+            "queries": queries,
+            "count": len(merged),
+            "results": merged,
+        }
+
+    async def _steam_game_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Store-page view: appdetails + review summary fetched concurrently
+        and merged; each part may fail independently."""
+        try:
+            appid = int(args.get("appid"))
+        except (TypeError, ValueError):
+            return {
+                "status": "error",
+                "message": "appid（整数）が必要。名前しか分からなければ先にsteam_searchで解決すること。",
+            }
+        details_res, reviews_res = await asyncio.gather(
+            self._steam_client.app_details(appid),
+            self._steam_client.app_reviews_summary(appid),
+            return_exceptions=True,
+        )
+        details = None if isinstance(details_res, BaseException) else details_res
+        reviews = None if isinstance(reviews_res, BaseException) else reviews_res
+        if isinstance(details_res, BaseException):
+            logger.warning(f"[steam] app_details({appid}) failed: {details_res}")
+        if isinstance(reviews_res, BaseException):
+            logger.warning(
+                f"[steam] app_reviews_summary({appid}) failed: {reviews_res}"
+            )
+        if details is None and reviews is None:
+            return {
+                "status": "error",
+                "message": (
+                    f"appid {appid} の情報を取得できなかった"
+                    "（存在しないappidか、一時的な失敗）。"
+                ),
+            }
+        result: Dict[str, Any] = {"status": "ok", "appid": appid}
+        if details:
+            result.update(details)
+        else:
+            result["note"] = "詳細の取得に失敗（レビュー概況のみ）。"
+        result["reviews"] = reviews
+        result.pop("header_image", None)  # URL noise for the LLM
+        snapshot = self._steam_snapshot() or {}
+        game_tags = snapshot.get("game_tags") or {}
+        tags = game_tags.get(str(appid)) or game_tags.get(appid)
+        if tags:
+            result["community_tags"] = tags
+        result["owned"] = appid in self._steam_owned_set()
+        return result
+
+    async def _steam_discover_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Real store candidates (similar / tag ranking / specials), with the
+        user's owned titles always filtered out."""
+        mode = str(args.get("mode", "")).strip()
+        try:
+            count = max(1, min(int(args.get("count", 10)), 30))
+        except (TypeError, ValueError):
+            count = 10
+        mgr = self._steam_snapshot_mgr
+        snapshot = self._steam_snapshot()
+        owned = self._steam_owned_set()
+
+        def _finish(
+            rows: List[Dict[str, Any]], extra: Dict[str, Any]
+        ) -> Dict[str, Any]:
+            unowned = [r for r in rows if r.get("appid") not in owned]
+            out = {
+                "status": "ok",
+                "mode": mode,
+                "results": unowned[:count],
+                "count": len(unowned[:count]),
+                "owned_filtered": len(rows) - len(unowned),
+                "note": (
+                    "所持済みタイトルは除外済み。勧めるならこのresults内から"
+                    "のみ選ぶこと。"
+                ),
+            }
+            out.update(extra)
+            return out
+
+        if mode == "similar":
+            anchor = str(args.get("anchor") or "").strip()
+            if not anchor:
+                return {
+                    "status": "error",
+                    "message": "mode=similar には anchor（ゲーム名またはappid）が必要。",
+                }
+            anchor_extra: Dict[str, Any] = {}
+            if anchor.isdigit():
+                appid = int(anchor)
+            else:
+                matches = mgr.find_game(snapshot, anchor) if snapshot else []
+                appid = matches[0].get("appid") if matches else None
+                if matches:
+                    anchor_extra["anchor_name"] = matches[0].get("name")
+                if not appid:
+                    return {
+                        "status": "error",
+                        "message": (
+                            f"「{anchor}」をライブラリ内で特定できなかった。"
+                            "steam_searchでappidを解決し、そのappidをanchorに"
+                            "渡して呼び直すこと。"
+                        ),
+                    }
+            rows = await self._steam_client.morelike(appid)
+            anchor_extra["anchor_appid"] = appid
+            return _finish(rows, anchor_extra)
+
+        if mode == "tag":
+            text = str(args.get("tag") or "").strip()
+            if not text:
+                return {
+                    "status": "error",
+                    "message": "mode=tag には tag（タグ名）が必要。",
+                }
+            if snapshot is None:
+                return {
+                    "status": "error",
+                    "message": (
+                        "タグ表（スナップショット）が未取得のためタグ解決が"
+                        "できない。少し待って再試行すること。"
+                    ),
+                }
+            candidates = mgr.resolve_tag(snapshot, text) or []
+            if not candidates:
+                return {
+                    "status": "error",
+                    "message": (
+                        f"タグ「{text}」を実在のタグ表に解決できなかった。"
+                        "別の言い方で試すこと。"
+                    ),
+                }
+
+            def _norm(t: str) -> str:
+                return unicodedata.normalize("NFKC", t or "").casefold()
+
+            exact = [c for c in candidates if _norm(c.get("name", "")) == _norm(text)]
+            if exact:
+                chosen = exact[0]
+            elif len(candidates) == 1:
+                chosen = candidates[0]
+            else:
+                return {
+                    "status": "need_clarification",
+                    "message": (
+                        "タグ候補が複数ある。candidatesのいずれかの正確な名前を "
+                        "tag に指定して呼び直すこと。"
+                    ),
+                    "candidates": candidates[:8],
+                }
+            section = str(args.get("section") or "trending_new").strip()
+            params = self._STEAM_SECTION_MAP.get(section)
+            if params is None:
+                section = "trending_new"
+                params = self._STEAM_SECTION_MAP[section]
+            # Over-fetch so the owned-filter still leaves ~count rows.
+            total, rows = await self._steam_client.search_results(
+                tags=[chosen["tagid"]], count=count + 15, **params
+            )
+            return _finish(
+                rows, {"tag": chosen, "section": section, "total_count": total}
+            )
+
+        if mode == "specials":
+            data = await self._steam_client.featured_categories()
+            rows = data.get("specials") or []
+            if not rows:
+                return {
+                    "status": "error",
+                    "message": "セール情報を取得できなかった。後で再試行すること。",
+                    "sections_available": sorted(data.keys()),
+                }
+            return _finish(rows, {"section": "specials"})
+
+        return {"status": "error", "message": f"不明なmode: {mode!r}"}
+
+    def _stage_steam_block(
+        self, tool: str, args: Dict[str, Any], result: Dict[str, Any]
+    ) -> None:
+        """Stage a compact plain-text copy of a successful steam tool result.
+
+        The blocks are folded into the NEXT outgoing user message by
+        _to_messages (persist-not-ephemeral, exactly like the RAG blocks:
+        stored == sent, never assistant-role), so the data stays visible
+        across turns without the model learning to imitate tool output."""
+        try:
+            arg_desc = json.dumps(args or {}, ensure_ascii=False)[:120]
+            body = json.dumps(result, ensure_ascii=False)
+            if len(body) > 1200:
+                body = body[:1200] + "…"
+            self._steam_pending_blocks.append(
+                f"【Steamデータ】(tool={tool}, args={arg_desc})\n{body}"
+            )
+            # Bound the buffer: chained calls in one turn (or an interrupted
+            # turn) must not balloon the next user message.
+            if len(self._steam_pending_blocks) > 6:
+                self._steam_pending_blocks = self._steam_pending_blocks[-6:]
+        except Exception as e:
+            logger.warning(f"[steam] failed to stage cross-turn block: {e}")
 
     async def chat(
         self,
