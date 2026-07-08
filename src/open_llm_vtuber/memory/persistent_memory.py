@@ -771,18 +771,16 @@ class PersistentMemoryManager:
         }
 
     async def update_fact_manual(self, fact_id: str, new_text: str) -> Dict[str, Any]:
-        """Rewrite one fact's text (memory_update). ``user``-tier is blocked."""
+        """Rewrite one fact's text (memory_update). Allowed on ALL tiers,
+        including ``user`` (あさひ 2026-07-09: content is editable; what stays
+        forbidden is CREATING user-tier facts and DELETING them). The tier
+        itself is preserved."""
         new_text = " ".join((new_text or "").split())
         if not new_text:
             return {"status": "error", "message": "新しい本文が空。"}
         facts = self._load_facts()
         for f in facts:
             if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
-                if (f.get("importance") or "low") == "user":
-                    return {
-                        "status": "error",
-                        "message": "userレベルの記憶は本人管理のため書き換え不可。",
-                    }
                 old = f["fact"]
                 f["fact"] = new_text
                 f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")

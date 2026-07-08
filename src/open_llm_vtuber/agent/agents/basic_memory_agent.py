@@ -70,7 +70,7 @@ _TOOL_MARKER_RE = re.compile(
     r"|⏰[ \t]*\*Alarm set:[^*\n]*\*"
     r"|🧠[ \t]*\*自己診断\*"
     r"|🎮[ \t]*\*Steam\*"
-    r"|📝[ \t]*\*記憶\*"
+    r"|📝[ \t]*\*記憶[^*\n]*\*"
     r")"
 )
 
@@ -419,7 +419,8 @@ class BasicMemoryAgent(AgentInterface):
         "memory_search。会話で判明した事実の保存・訂正は memory_add / "
         "memory_update（本人の依頼かはっきりした訂正だけ、書き換えは慎重に）。"
         "削除は本人同意制の memory_delete。追加・修正は検索に即時反映、"
-        "常駐リストへは次回起動から。user印の記憶は本人管理で変更不可。"
+        "常駐リストへは次回起動から。user印の記憶は本人管理"
+        "（新規作成・削除は不可、内容の修正は可）。"
     )
 
     # Trailing system block placed right before the message history.
@@ -2056,7 +2057,9 @@ class BasicMemoryAgent(AgentInterface):
                         "自分の長期記憶（事実facts・過去の日記）を意味検索する。"
                         "自動想起とは別に、必要な時に自分から過去を調べる入口。"
                         "結果の事実には id が付き、memory_update / memory_delete "
-                        "で使う。"
+                        "で使う。importance の意味：user=本人が手動管理（毎セッション"
+                        "常駐）/ llm=重要（毎セッション常駐）/ low=検索・想起された"
+                        "時だけ文脈に入る。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -2116,8 +2119,8 @@ class BasicMemoryAgent(AgentInterface):
                     "name": "memory_update",
                     "description": (
                         "既存の事実を書き直す（訂正・追記）。対象の id は "
-                        "memory_search で確認してから使うこと。user印の記憶は"
-                        "本人管理のため書き換え不可。"
+                        "memory_search で確認してから使うこと。importance は"
+                        "変わらない（user印も内容の修正は可）。"
                     ),
                     "parameters": {
                         "type": "object",
@@ -2309,7 +2312,8 @@ class BasicMemoryAgent(AgentInterface):
         "memory_update",
         "memory_delete",
     )
-    _MEMORY_MARKER = "\n📝 *記憶*\n"
+    # Per-operation marker text is built by _memory_marker (📝 *記憶◯◯: …*);
+    # display/history only — stripped from the AI replay like all markers.
     # Approval phrases あさひ might actually type (JA/ZH/EN). Matched against
     # the TAIL of his latest real message — the second factor behind the
     # model's confirmed=true claim. Staged deletions expire after 15 min.
@@ -2948,7 +2952,33 @@ class BasicMemoryAgent(AgentInterface):
                 "status": "error",
                 "message": "記憶の処理中に内部エラーが起きた。再試行してよい。",
             }
-        return self._MEMORY_MARKER, result
+        return self._memory_marker(name, args, result), result
+
+    @staticmethod
+    def _memory_marker(
+        name: str, args: Dict[str, Any], result: Dict[str, Any]
+    ) -> Optional[str]:
+        """Human-facing marker describing WHAT the memory op did — shown in
+        chat / kept in stored history, stripped from the AI replay. No marker
+        for failed ops (nothing happened)."""
+        if result.get("status") not in ("ok", "pending_approval"):
+            return None
+
+        def _clip(t: Any, n: int = 24) -> str:
+            s = " ".join(str(t or "").split()).replace("*", "＊")
+            return s[:n] + ("…" if len(s) > n else "")
+
+        if name == "memory_search":
+            label = f"記憶検索: {_clip(args.get('query'))}"
+        elif name == "memory_add":
+            label = f"記憶追加: {_clip(args.get('fact'))}"
+        elif name == "memory_update":
+            label = f"記憶更新: {_clip(args.get('new_fact'))}"
+        elif result.get("status") == "pending_approval":
+            label = f"記憶削除申請: {_clip(result.get('fact'))}"
+        else:
+            label = f"記憶削除: {_clip(result.get('deleted'))}"
+        return f"\n📝 *{label}*\n"
 
     async def _memory_delete_flow(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Two-phase deletion with mechanically-verified user approval."""
