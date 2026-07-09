@@ -67,10 +67,11 @@ _TOOL_MARKER_RE = re.compile(
     r"🍔[ \t]*\*Uber Eats\*"
     r"|🔍[ \t]*\*Web検索:[^*\n]*\*"
     r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
-    r"|⏰[ \t]*\*Alarm set:[^*\n]*\*"
-    r"|🧠[ \t]*\*自己診断\*"
+    r"|⏰[ \t]*\*Alarm[^*\n]*\*"
+    r"|🧠[ \t]*\*自己診断[^*\n]*\*"
     r"|🎮[ \t]*\*Steam[^*\n]*\*"
     r"|📝[ \t]*\*記憶[^*\n]*\*"
+    r"|🔧[ \t]*\*ツール:[^*\n]*\*"
     r")"
 )
 
@@ -1743,10 +1744,13 @@ class BasicMemoryAgent(AgentInterface):
 
     @staticmethod
     def _mcp_tool_marker(tool_name: str) -> str:
-        """Short inline tag flagging that an MCP tool was used (kept minimal —
-        currently just Uber Eats)."""
+        """Short inline tag flagging that an MCP tool was used. Uber keeps its
+        own glyph; any other MCP tool gets a generic 🔧 tag so EVERY tool call
+        is visible in chat (あさひ audits usage from there when away)."""
         if tool_name.startswith("uber"):
             return "\n🍔 *Uber Eats*\n"
+        if tool_name:
+            return f"\n🔧 *ツール: {tool_name[:40]}*\n"
         return ""
 
     @staticmethod
@@ -2321,7 +2325,7 @@ class BasicMemoryAgent(AgentInterface):
             )
         except Exception as e:  # never break the turn
             logger.warning(f"[model_health] self-check failed: {e}")
-            return None, {
+            return "\n🧠 *自己診断(失敗)*\n", {
                 "status": "error",
                 "error": "調子の確認に失敗した（データ源に接続できず）。",
             }
@@ -2464,12 +2468,12 @@ class BasicMemoryAgent(AgentInterface):
                 in_minutes=args.get("in_minutes"), at=args.get("at")
             )
             if not note:
-                return None, {
+                return "\n⏰ *Alarm set(失敗)*\n", {
                     "status": "error",
                     "message": "note（思い出す内容）が必要です。",
                 }
             if err:
-                return None, {
+                return "\n⏰ *Alarm set(失敗)*\n", {
                     "status": "error",
                     "message": f"時刻を解釈できませんでした: {err}",
                 }
@@ -2479,7 +2483,7 @@ class BasicMemoryAgent(AgentInterface):
                 # Near-duplicate: don't create. Hand the existing alarm back so the
                 # model can reconsider this same turn and, if it still judges
                 # another is needed, re-call with force=true.
-                return None, {
+                return "\n⏰ *Alarm set(重複スキップ)*\n", {
                     "status": "duplicate_nearby",
                     "message": (
                         f"近い時刻（{format_local(dup['fire_at_utc'])}）に"
@@ -2505,7 +2509,7 @@ class BasicMemoryAgent(AgentInterface):
             }
         if name == "list_alarms":
             pending = await self._alarm_store.list_pending()
-            return None, {
+            return f"\n⏰ *Alarm list: {len(pending)}件*\n", {
                 "status": "ok",
                 "count": len(pending),
                 "alarms": [
@@ -2521,14 +2525,15 @@ class BasicMemoryAgent(AgentInterface):
             alarm_id = str(args.get("alarm_id", "")).strip()
             record = await self._alarm_store.cancel(alarm_id)
             if record is None:
-                return None, {
+                return "\n⏰ *Alarm cancel(失敗)*\n", {
                     "status": "error",
                     "message": (
                         f"アラーム {alarm_id} が見つかりませんでした"
                         "（既に取り消し済み、または通知済みかもしれません）。"
                     ),
                 }
-            return None, {
+            local = format_local(record.get("fire_at_utc")) if record else alarm_id
+            return f"\n⏰ *Alarm cancel: {local}*\n", {
                 "status": "ok",
                 "message": "アラームを取り消しました。",
                 "id": alarm_id,
@@ -2581,19 +2586,21 @@ class BasicMemoryAgent(AgentInterface):
                 }
         except SteamUnavailable as e:
             logger.warning(f"[steam] {name} unavailable: {e}")
-            return None, {
+            result = {
                 "status": "error",
                 "message": (
                     f"Steamに接続できなかった（{e}）。"
                     "一時的な不調の可能性が高いので、少し待ってから再試行すること。"
                 ),
             }
+            return self._steam_marker(name, args, result), result
         except Exception:
             logger.exception(f"[steam] {name} failed unexpectedly")
-            return None, {
+            result = {
                 "status": "error",
                 "message": "Steamデータの処理中に内部エラーが起きた。再試行してよい。",
             }
+            return self._steam_marker(name, args, result), result
         if result.get("status") == "ok":
             self._stage_steam_block(name, args, result)
         return self._steam_marker(name, args, result), result
@@ -2609,10 +2616,8 @@ class BasicMemoryAgent(AgentInterface):
         name: str, args: Dict[str, Any], result: Dict[str, Any]
     ) -> Optional[str]:
         """Human-facing marker describing WHAT the Steam op did — shown in
-        chat / kept in stored history, stripped from the AI replay. No marker
-        for failed ops."""
-        if result.get("status") not in ("ok", "need_clarification"):
-            return None
+        chat / kept in stored history, stripped from the AI replay. EVERY call
+        gets one (あさひ audits tool use from chat); failures carry (失敗)."""
         clip = BasicMemoryAgent._clip_marker
         if name == "steam_library":
             action = str(args.get("action", ""))
@@ -2647,6 +2652,8 @@ class BasicMemoryAgent(AgentInterface):
                 label = f"Steamタグ候補: {clip(tag_name or args.get('tag'))}"
             else:
                 label = "Steamセール確認"
+        if result.get("status") not in ("ok", "need_clarification"):
+            label += "(失敗)"
         return f"\n🎮 *{label}*\n"
 
     def _steam_snapshot(self) -> Optional[Dict[str, Any]]:
@@ -3154,10 +3161,11 @@ class BasicMemoryAgent(AgentInterface):
                 }
         except Exception:
             logger.exception(f"[memory_tool] {name} failed unexpectedly")
-            return None, {
+            result = {
                 "status": "error",
                 "message": "記憶の処理中に内部エラーが起きた。再試行してよい。",
             }
+            return self._memory_marker(name, args, result), result
         return self._memory_marker(name, args, result), result
 
     @staticmethod
@@ -3165,11 +3173,10 @@ class BasicMemoryAgent(AgentInterface):
         name: str, args: Dict[str, Any], result: Dict[str, Any]
     ) -> Optional[str]:
         """Human-facing marker describing WHAT the memory op did — shown in
-        chat / kept in stored history, stripped from the AI replay. No marker
-        for failed ops (nothing happened)."""
-        if result.get("status") not in ("ok", "pending_approval"):
-            return None
+        chat / kept in stored history, stripped from the AI replay. EVERY call
+        gets one (あさひ audits tool use from chat); failures carry (失敗)."""
         _clip = BasicMemoryAgent._clip_marker
+        status = result.get("status")
         if name == "memory_search":
             label = f"記憶検索: {_clip(args.get('query'))}"
         elif name == "memory_add":
@@ -3183,10 +3190,12 @@ class BasicMemoryAgent(AgentInterface):
                 result.get("injected_diaries", 0)
             )
             label = f"記憶注入: {n}件"
-        elif result.get("status") == "pending_approval":
+        elif status == "pending_approval":
             label = f"記憶削除申請: {_clip(result.get('fact'))}"
         else:
-            label = f"記憶削除: {_clip(result.get('deleted'))}"
+            label = f"記憶削除: {_clip(result.get('deleted') or args.get('fact_id'))}"
+        if status not in ("ok", "pending_approval"):
+            label += "(失敗)"
         return f"\n📝 *{label}*\n"
 
     def _memory_read_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
