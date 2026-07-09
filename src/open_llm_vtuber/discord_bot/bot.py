@@ -200,15 +200,22 @@ class DiscordVTuberBot(discord.Client):
             lines = max(1, min(200, lines))
             await interaction.response.defer(ephemeral=True)
 
-            targets: list[tuple[str, str]] = []
+            # Prefer the console-mirror files (exactly what the console
+            # shows); fall back to the DEBUG files if a mirror doesn't exist
+            # yet (first run after this change).
+            targets: list[tuple[str, tuple[str, ...]]] = []
             if target in ("bot", "both"):
-                targets.append(("Discord bot", "discord_"))
+                targets.append(("Discord bot", ("discord_console_", "discord_")))
             if target in ("olv", "both"):
-                targets.append(("OLV", "debug_"))
+                targets.append(("OLV", ("console_", "debug_")))
 
             chunks: list[str] = []
-            for label, prefix in targets:
-                path = self._find_latest_log(prefix)
+            for label, prefixes in targets:
+                path = None
+                for prefix in prefixes:
+                    path = self._find_latest_log(prefix)
+                    if path is not None:
+                        break
                 if path is None:
                     chunks.append(f"**{label}**: no log file found.")
                     continue

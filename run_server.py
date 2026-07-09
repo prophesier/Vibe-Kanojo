@@ -47,6 +47,18 @@ def init_logger(console_log_level: str = "INFO") -> None:
         diagnose=True,
     )
 
+    # Console-mirror file: same level/format as the console sink (minus
+    # color), so the Discord /logs command can send exactly what the console
+    # shows. The DEBUG file is useless for that — its tail is dominated by a
+    # 30s heartbeat broadcast DEBUG line.
+    logger.add(
+        "logs/console_{time:YYYY-MM-DD}.log",
+        rotation="10 MB",
+        retention="30 days",
+        level=console_log_level,
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
+    )
+
 
 def check_frontend_submodule(lang=None):
     """

@@ -68,6 +68,19 @@ async def _main() -> int:
         diagnose=True,
     )
 
+    # Console-mirror (INFO+) — what /logs sends; the DEBUG file's tail is
+    # dominated by low-level noise.
+    logger.add(
+        str(log_dir / "discord_console_{time:YYYY-MM-DD}.log"),
+        rotation="10 MB",
+        retention="30 days",
+        level="INFO",
+        format=(
+            "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | "
+            "{name}:{function}:{line} | {message}"
+        ),
+    )
+
     # Write PID so restart.bat can find and kill this process.
     write_pid("discord", root=project_root)
 
