@@ -387,8 +387,12 @@ class BasicMemoryAgent(AgentInterface):
 
     @staticmethod
     def _format_timestamp(ts: str) -> str:
-        """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS Weekday]'."""
-        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS 曜日]'.
+
+        Japanese single-kanji weekday (月..日) — higher salience for the
+        JA persona than the earlier 'Mon'..'Sun' (she misread a weekday),
+        and it matches the 曜日 wording in _TIMESTAMP_NOTE/_HISTORY_NOTE."""
+        weekdays = ["月", "火", "水", "木", "金", "土", "日"]
         try:
             dt = datetime.fromisoformat(ts)
             return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}]"
@@ -709,7 +713,7 @@ class BasicMemoryAgent(AgentInterface):
         to the first message of each session so the LLM can distinguish
         independent sessions in the otherwise-flat message stream.
         """
-        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        weekdays = ["月", "火", "水", "木", "金", "土", "日"]
         label = "現在進行中のセッション" if is_current else "セッション"
         parts = uid.split("_")
         if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
