@@ -162,6 +162,9 @@ class BasicMemoryAgent(AgentInterface):
         # _memory, not from the tool arguments).
         self._memory_tools_enabled = False  # set via set_memory_tools_enabled()
         self._pending_memory_deletes: Dict[str, Dict[str, Any]] = {}
+        # In-process tool calls made during the CURRENT turn — the log-only
+        # "claimed but never called" canary (_check_stateful_claims).
+        self._turn_inproc_calls: List[str] = []
         # Memory blocks pinned via memory_inject — folded into the NEXT
         # outgoing user message exactly like the RAG/steam blocks
         # (persist-not-ephemeral), so they stay visible across turns.
@@ -249,6 +252,32 @@ class BasicMemoryAgent(AgentInterface):
 
         self._system = system
 
+    # Stateful-action claims (remember/save/alarm set/cancel …) an assistant
+    # reply can make. If one appears in a turn where NO in-process tool ran,
+    # that's the observed fabrication mode — log it loudly (surface, don't
+    # suppress: あさひ uses these failures as his model-quality canary).
+    _STATEFUL_CLAIM_RE = re.compile(
+        r"(覚えて(おく|おいた|おきます)|記憶し(た|ておく|ておいた)|"
+        r"メモし(た|ておく|ておいた)|保存し(た|ておいた)|記録し(た|ておいた)|"
+        r"(アラーム|リマインダー)を?(セットした|設定した|入れた|入れておいた|"
+        r"取り消した|キャンセルした)|予約し(た|ておいた)|取り消しておいた)"
+    )
+
+    def _check_stateful_claims(self, text: str) -> None:
+        """Log-only tool-honesty canary (never raises, never alters output)."""
+        try:
+            if self._turn_inproc_calls:
+                return
+            m = self._STATEFUL_CLAIM_RE.search(text)
+            if m:
+                excerpt = text[max(0, m.start() - 30) : m.end() + 20]
+                logger.warning(
+                    f"[tool_honesty] stateful claim with NO in-process tool "
+                    f"call this turn: …{excerpt}…"
+                )
+        except Exception:
+            pass
+
     def _add_message(
         self,
         message: Union[str, List[Dict[str, Any]]],
@@ -276,6 +305,9 @@ class BasicMemoryAgent(AgentInterface):
 
         if not text_content and role == "assistant":
             return
+
+        if role == "assistant" and text_content:
+            self._check_stateful_claims(text_content)
 
         # Inject the current-session banner onto the FIRST user message of
         # a freshly-started session. set_memory_from_recent_histories
@@ -390,8 +422,9 @@ class BasicMemoryAgent(AgentInterface):
     # reminders. Static / cache-stable; gated on alarms being active.
     _ALARM_CAPABILITY_NOTE = (
         "【アラーム】未来の時刻に自分から話しかけたい時（頼まれたリマインダー、"
-        "話の続き、様子伺いなど）は set_alarm を使う。言葉で「後で知らせる」と"
-        "言うだけでは何も起きない——必要なら呼ぶこと。"
+        "話の続き、様子伺いなど）は set_alarm を使う。確認は list_alarms、"
+        "取消は cancel_alarm——設定と同じく実際に呼ぶこと。言葉で「後で知らせる」"
+        "「取り消した」と言うだけでは何も起きない。"
     )
 
     # When-to-use only; tool mechanics live in the schema descriptions.
@@ -504,7 +537,17 @@ class BasicMemoryAgent(AgentInterface):
         "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
         "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
-        "囲みの後にあるユーザーの実際の発言に対して返答すること。"
+        "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
+        "【ツールの実行に関する厳格なルール】\n\n"
+        "状態を変える行為——記憶の保存・修正・削除（memory_add / memory_update / "
+        "memory_delete）、アラームの設定・確認・取消（set_alarm / list_alarms / "
+        "cancel_alarm）など——を「やった」と口にできるのは、そのターンで対応する"
+        "ツールを**実際に呼び出した後**だけ。呼んでいないのに「覚えておいた」"
+        "「取り消した」「セットした」などと言うことは虚偽報告であり禁止する。\n"
+        "- ユーザーに「覚えておいて」と頼まれた、または自分が「覚えておく」と"
+        "言いたくなった → 先に memory_add を呼ぶ\n"
+        "- 過去の詳細があいまいなまま語りそうになった → 先に memory_search で調べる\n"
+        "- アラームの確認・取消も設定と同様、口頭ではなくツールで行う"
     )
 
     def _build_runtime_system(self) -> str:
@@ -1562,6 +1605,7 @@ class BasicMemoryAgent(AgentInterface):
             """Process chat with memory and tools."""
             self.reset_interrupt()
             self.prompt_mode_flag = False
+            self._turn_inproc_calls = []
 
             await self._maybe_inject_diary_rag(input_data)
             await self._maybe_inject_facts_rag(input_data)
@@ -2257,6 +2301,7 @@ class BasicMemoryAgent(AgentInterface):
         """Run check_model_status. Returns (marker, result_dict). The JA report is
         the tool result the character relays; a ZH copy is logged so あさひ can see
         what it was told. No LLM — pure data + reference + rule-based verdict."""
+        self._turn_inproc_calls.append(self._MODEL_HEALTH_TOOL_NAME)
         from ...model_health.aistupidlevel_client import AiStupidLevelClient
         from ...model_health.anthropic_status_client import AnthropicStatusClient
         from ...model_health.report import build_assessment, render_ja, render_zh
@@ -2410,6 +2455,7 @@ class BasicMemoryAgent(AgentInterface):
     async def _run_alarm_tool(self, name: str, args: Dict[str, Any]) -> tuple:
         """Execute one alarm tool call. Returns (marker_text|None, result_dict).
         Shared by the OpenAI and Claude loops — alarms are provider-agnostic."""
+        self._turn_inproc_calls.append(name)
         if self._alarm_store is None:
             return None, {"error": "alarm feature is not available"}
         if name == "set_alarm":
@@ -2500,6 +2546,7 @@ class BasicMemoryAgent(AgentInterface):
         Japanese, actionable error dict. On success the result is also staged
         as a compact 【Steamデータ】 block folded into the NEXT outgoing user
         message (cross-turn visibility; see _stage_steam_block)."""
+        self._turn_inproc_calls.append(name)
         if (
             not self._steam_enabled
             or self._steam_client is None
@@ -3061,6 +3108,7 @@ class BasicMemoryAgent(AgentInterface):
 
     async def _run_memory_tool(self, name: str, args: Dict[str, Any]) -> tuple:
         """Execute one memory_* tool call. Returns (marker|None, result_dict).
+        Registers into _turn_inproc_calls first (tool-honesty canary).
 
         Never raises. CRUD goes through PersistentMemoryManager (disk = live
         truth, index synced immediately; the frozen header block catches up on
@@ -3068,6 +3116,7 @@ class BasicMemoryAgent(AgentInterface):
         → confirmed=true is honored only when the latest REAL user message
         (read from _memory, not from the model) contains an approval phrase.
         """
+        self._turn_inproc_calls.append(name)
         if not self._memory_tools_active:
             return None, {
                 "status": "error",
