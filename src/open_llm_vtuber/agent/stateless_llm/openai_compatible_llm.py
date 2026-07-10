@@ -710,7 +710,12 @@ class AsyncLLM(StatelessLLMInterface):
             if flat_tools:
                 request_kwargs["tools"] = flat_tools
             if reasoning_effort:
-                request_kwargs["reasoning"] = {"effort": reasoning_effort}
+                # summary:"auto" = the model's own reasoning digest, logged as
+                # [thinking] below (raw CoT is never exposed on this API).
+                request_kwargs["reasoning"] = {
+                    "effort": reasoning_effort,
+                    "summary": "auto",
+                }
                 # Without this, reasoning items come back without content and
                 # the chain can't be replayed across tool hops (store=false).
                 request_kwargs["include"] = ["reasoning.encrypted_content"]
@@ -735,6 +740,18 @@ class AsyncLLM(StatelessLLMInterface):
                     # Degrade gracefully on partially-compatible providers
                     # (Ollama/Groq/vLLM implement the stateless subset with
                     # varying extras). Each drop is logged, never silent.
+                    # Summary first: its error message also contains
+                    # "reasoning", which would wrongly drop the whole knob.
+                    if "summary" in msg and "summary" in (
+                        request_kwargs.get("reasoning") or {}
+                    ):
+                        request_kwargs["reasoning"].pop("summary", None)
+                        logger.warning(
+                            "/v1/responses rejected reasoning summary (often an "
+                            "unverified-org restriction); retrying without it — "
+                            "[thinking] log lines unavailable."
+                        )
+                        continue
                     droppable = [
                         ("include", "encrypted reasoning replay unavailable"),
                         ("temperature", "temperature not supported here"),
@@ -782,6 +799,17 @@ class AsyncLLM(StatelessLLMInterface):
                     raw_output_items.append(item_dict)
                     if item_dict.get("type") == "function_call":
                         func_call_items.append(item_dict)
+                    elif item_dict.get("type") == "reasoning":
+                        # Same visibility as the Claude path's [thinking] line:
+                        # log the model's reasoning summary, never shown to the
+                        # user and never stored to chat history.
+                        summary = " ".join(
+                            s.get("text", "")
+                            for s in item_dict.get("summary") or []
+                            if isinstance(s, dict)
+                        ).strip()
+                        if summary:
+                            logger.info(f"[thinking] {summary}")
                 elif etype in ("response.completed", "response.incomplete"):
                     usage = getattr(getattr(event, "response", None), "usage", None)
                     if usage:
