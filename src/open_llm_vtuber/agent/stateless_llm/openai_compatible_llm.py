@@ -102,15 +102,11 @@ class AsyncLLM(StatelessLLMInterface):
         completion_tokens = cls._get_usage_value(usage, "completion_tokens", 0) or 0
         prompt_details = cls._get_usage_value(usage, "prompt_tokens_details", None)
         cached = cls._get_usage_value(prompt_details, "cached_tokens", 0) or 0
-        cache_write = (
-            cls._get_usage_value(prompt_details, "cache_write_tokens", 0) or 0
-        )
+        cache_write = cls._get_usage_value(prompt_details, "cache_write_tokens", 0) or 0
         completion_details = cls._get_usage_value(
             usage, "completion_tokens_details", None
         )
-        reasoning = (
-            cls._get_usage_value(completion_details, "reasoning_tokens", 0) or 0
-        )
+        reasoning = cls._get_usage_value(completion_details, "reasoning_tokens", 0) or 0
 
         fresh = max(prompt_tokens - cached, 0)
         hit_pct = (cached / prompt_tokens * 100) if prompt_tokens else 0
@@ -286,16 +282,31 @@ class AsyncLLM(StatelessLLMInterface):
                         )
                         request_kwargs.pop("stream_options", None)
                         continue
-                    if (
-                        reasoning_effort
-                        and "reasoning_effort" in request_kwargs
-                        and self._is_reasoning_effort_unsupported(e)
-                    ):
-                        request_kwargs.pop("reasoning_effort", None)
-                        logger.warning(
-                            "Endpoint rejected reasoning_effort; retrying without it."
-                        )
-                        continue
+                    if self._is_reasoning_effort_unsupported(e):
+                        # gpt-5.6 on /v1/chat/completions: function tools +
+                        # reasoning are mutually exclusive ("use /v1/responses
+                        # or set reasoning_effort to 'none'"). The default is
+                        # medium, so DROPPING the param doesn't help — the
+                        # error tells us to send an explicit 'none'.
+                        if (
+                            "'none'" in str(e)
+                            and request_kwargs.get("reasoning_effort") != "none"
+                        ):
+                            request_kwargs["reasoning_effort"] = "none"
+                            logger.warning(
+                                "Endpoint requires reasoning_effort='none' with "
+                                "function tools (chat/completions limitation); "
+                                "retrying with none. For reasoning + tools this "
+                                "model needs the /v1/responses API."
+                            )
+                            continue
+                        if "reasoning_effort" in request_kwargs:
+                            request_kwargs.pop("reasoning_effort", None)
+                            logger.warning(
+                                "Endpoint rejected reasoning_effort; retrying "
+                                "without it."
+                            )
+                            continue
                     if (
                         max_tokens
                         and self._completion_token_param == "max_tokens"
@@ -443,7 +454,9 @@ class AsyncLLM(StatelessLLMInterface):
             # (insufficient_quota: out of credit / monthly budget cap). str(e)
             # carries the message + code, so log it to tell the two apart.
             detail = f"{getattr(e, 'code', '') or ''} {e}"
-            logger.error(f"Error calling the chat endpoint: 429 Too Many Requests — {e}")
+            logger.error(
+                f"Error calling the chat endpoint: 429 Too Many Requests — {e}"
+            )
             if "insufficient_quota" in detail:
                 yield (
                     "Error calling the chat endpoint: OpenAI quota/credit exhausted "
