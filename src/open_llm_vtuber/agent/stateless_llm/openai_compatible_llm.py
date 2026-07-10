@@ -32,6 +32,7 @@ class AsyncLLM(StatelessLLMInterface):
         organization_id: str = "z",
         project_id: str = "z",
         temperature: float = 1.0,
+        reasoning_effort: str = "",
     ):
         """
         Initializes an instance of the `AsyncLLM` class.
@@ -43,10 +44,15 @@ class AsyncLLM(StatelessLLMInterface):
         - project_id (str, optional): The project ID for the OpenAI API. Defaults to "z".
         - llm_api_key (str, optional): The API key for the OpenAI API. Defaults to "z".
         - temperature (float, optional): What sampling temperature to use, between 0 and 2. Defaults to 1.0.
+        - reasoning_effort (str, optional): Default reasoning effort for CHAT
+          completions (none/low/medium/high). Empty = don't send (provider
+          default: gpt-5.5/5.6 = medium, gpt-5.1 = none). Per-call callers
+          (memory tasks) still override by passing the argument explicitly.
         """
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
+        self._reasoning_effort = (reasoning_effort or "").strip()
         # Stable per-character routing hint for OpenAI's prompt cache. Empty
         # until set_prompt_cache_key is called (e.g. with the conf_uid).
         self._prompt_cache_key: str = ""
@@ -232,10 +238,13 @@ class AsyncLLM(StatelessLLMInterface):
                 )
             if self._include_usage_supported:
                 request_kwargs["stream_options"] = {"include_usage": True}
-            # Explicit reasoning effort for callers that need it (memory tasks):
-            # gpt-5.1 defaults to "none", so without this it skips reasoning. Sent
-            # only when provided; dropped on the retry below if the model/endpoint
-            # rejects it.
+            # Reasoning effort. Per-call value wins (memory tasks pass their
+            # own knob; "" there means "don't send"); None falls back to the
+            # instance default from config (chat path never passes it). Sent
+            # only when non-empty; dropped on the retry below if the
+            # model/endpoint rejects it.
+            if reasoning_effort is None:
+                reasoning_effort = self._reasoning_effort
             if reasoning_effort:
                 request_kwargs["reasoning_effort"] = reasoning_effort
             # Pin cache routing. OpenAI keys its prompt cache per-machine; without

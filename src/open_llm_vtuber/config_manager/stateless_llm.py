@@ -64,6 +64,9 @@ class OpenAICompatibleConfig(StatelessLLMBaseConfig):
     organization_id: str | None = Field(None, alias="organization_id")
     project_id: str | None = Field(None, alias="project_id")
     temperature: float = Field(1.0, alias="temperature")
+    # Chat-path reasoning effort. Blank = don't send (provider default:
+    # gpt-5.5/5.6 = medium, gpt-5.1 = none). Memory tasks have their own knob.
+    reasoning_effort: str = Field("", alias="reasoning_effort")
 
     _OPENAI_COMPATIBLE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(en="Base URL for the API endpoint", zh="API的URL端点"),
@@ -78,6 +81,12 @@ class OpenAICompatibleConfig(StatelessLLMBaseConfig):
         "temperature": Description(
             en="What sampling temperature to use, between 0 and 2.",
             zh="使用的采样温度，介于 0 和 2 之间。",
+        ),
+        "reasoning_effort": Description(
+            en="Reasoning effort for chat (none/low/medium/high). Blank = don't "
+            "send (provider default: gpt-5.5/5.6=medium, gpt-5.1=none).",
+            zh="聊天推理强度（none/low/medium/high）。留空=不传（走服务端默认："
+            "gpt-5.5/5.6=medium，gpt-5.1=none）。",
         ),
     }
 

@@ -243,6 +243,9 @@ character_config:
         llm_api_key: 'Your Open AI API key' # OpenAI API 密钥
         model: 'gpt-4o' # 使用的模型
         temperature: 1.0 # 温度，介于 0 到 2 之间
+        # 聊天推理强度（none/low/medium/high）。留空=不传（走服务端默认：
+        # gpt-5.5/5.6=medium，gpt-5.1=none）。
+        reasoning_effort: ''
 
       gemini_llm:
         llm_api_key: 'Your Gemini API Key' # Gemini API 密钥
