@@ -94,11 +94,17 @@ class AsyncLLM(StatelessLLMInterface):
 
     @classmethod
     def _log_openai_cache_usage(cls, usage: Any) -> None:
-        """Log OpenAI automatic prompt-cache usage from a stream usage chunk."""
+        """Log OpenAI prompt-cache usage from a stream usage chunk.
+
+        ``cache_write_tokens`` exists from gpt-5.6 (explicit caching era);
+        absent on older models → reported as 0, same as before."""
         prompt_tokens = cls._get_usage_value(usage, "prompt_tokens", 0) or 0
         completion_tokens = cls._get_usage_value(usage, "completion_tokens", 0) or 0
         prompt_details = cls._get_usage_value(usage, "prompt_tokens_details", None)
         cached = cls._get_usage_value(prompt_details, "cached_tokens", 0) or 0
+        cache_write = (
+            cls._get_usage_value(prompt_details, "cache_write_tokens", 0) or 0
+        )
         completion_details = cls._get_usage_value(
             usage, "completion_tokens_details", None
         )
@@ -109,7 +115,7 @@ class AsyncLLM(StatelessLLMInterface):
         fresh = max(prompt_tokens - cached, 0)
         hit_pct = (cached / prompt_tokens * 100) if prompt_tokens else 0
         logger.info(
-            f"[cache] read={cached} write=0 fresh={fresh} "
+            f"[cache] read={cached} write={cache_write} fresh={fresh} "
             f"(hit {hit_pct:.0f}%, input={prompt_tokens}, "
             f"output={completion_tokens}, reasoning={reasoning})"
         )
