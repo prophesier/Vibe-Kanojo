@@ -280,6 +280,10 @@ character_config:
         # Chat reasoning effort (none/low/medium/high). Blank = don't send
         # (provider default: gpt-5.5/5.6=medium, gpt-5.1=none).
         reasoning_effort: ''
+        # Transport endpoint: 'chat' = /v1/chat/completions (default),
+        # 'responses' = /v1/responses — lets function tools + reasoning
+        # coexist on gpt-5.6. Set back to 'chat' to roll back instantly.
+        api_mode: 'chat'
 
       gemini_llm:
         llm_api_key: 'Your Gemini API Key'

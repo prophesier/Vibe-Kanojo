@@ -67,6 +67,10 @@ class OpenAICompatibleConfig(StatelessLLMBaseConfig):
     # Chat-path reasoning effort. Blank = don't send (provider default:
     # gpt-5.5/5.6 = medium, gpt-5.1 = none). Memory tasks have their own knob.
     reasoning_effort: str = Field("", alias="reasoning_effort")
+    # Transport endpoint: "chat" = /v1/chat/completions (default),
+    # "responses" = /v1/responses (stateless). Responses mode lets function
+    # tools and reasoning coexist on gpt-5.6; flip back to "chat" to roll back.
+    api_mode: Literal["chat", "responses"] = Field("chat", alias="api_mode")
 
     _OPENAI_COMPATIBLE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(en="Base URL for the API endpoint", zh="API的URL端点"),
@@ -87,6 +91,13 @@ class OpenAICompatibleConfig(StatelessLLMBaseConfig):
             "send (provider default: gpt-5.5/5.6=medium, gpt-5.1=none).",
             zh="聊天推理强度（none/low/medium/high）。留空=不传（走服务端默认："
             "gpt-5.5/5.6=medium，gpt-5.1=none）。",
+        ),
+        "api_mode": Description(
+            en="Transport endpoint: 'chat' = /v1/chat/completions (default), "
+            "'responses' = /v1/responses (lets tools + reasoning coexist on "
+            "gpt-5.6). Set back to 'chat' to roll back.",
+            zh="传输端点：'chat' = /v1/chat/completions（默认），'responses' = "
+            "/v1/responses（gpt-5.6 上工具与推理可共存）。改回 'chat' 即回滚。",
         ),
     }
 

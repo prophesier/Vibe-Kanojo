@@ -246,6 +246,9 @@ character_config:
         # 聊天推理强度（none/low/medium/high）。留空=不传（走服务端默认：
         # gpt-5.5/5.6=medium，gpt-5.1=none）。
         reasoning_effort: ''
+        # 传输端点：'chat' = /v1/chat/completions（默认），'responses' = /v1/responses
+        # —— gpt-5.6 上函数工具与推理可共存。改回 'chat' 即刻回滚。
+        api_mode: 'chat'
 
       gemini_llm:
         llm_api_key: 'Your Gemini API Key' # Gemini API 密钥

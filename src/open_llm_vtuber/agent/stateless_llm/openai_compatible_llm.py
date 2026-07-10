@@ -33,6 +33,7 @@ class AsyncLLM(StatelessLLMInterface):
         project_id: str = "z",
         temperature: float = 1.0,
         reasoning_effort: str = "",
+        api_mode: str = "chat",
     ):
         """
         Initializes an instance of the `AsyncLLM` class.
@@ -44,15 +45,35 @@ class AsyncLLM(StatelessLLMInterface):
         - project_id (str, optional): The project ID for the OpenAI API. Defaults to "z".
         - llm_api_key (str, optional): The API key for the OpenAI API. Defaults to "z".
         - temperature (float, optional): What sampling temperature to use, between 0 and 2. Defaults to 1.0.
-        - reasoning_effort (str, optional): Default reasoning effort for CHAT
-          completions (none/low/medium/high). Empty = don't send (provider
-          default: gpt-5.5/5.6 = medium, gpt-5.1 = none). Per-call callers
-          (memory tasks) still override by passing the argument explicitly.
+        - reasoning_effort (str, optional): Default reasoning effort
+          (none/low/medium/high; responses mode also xhigh/max). Empty =
+          don't send (provider default: gpt-5.5/5.6 = medium, gpt-5.1 =
+          none). Per-call callers (memory tasks) still override by passing
+          the argument explicitly.
+        - api_mode (str, optional): "chat" (default) = /v1/chat/completions;
+          "responses" = /v1/responses (stateless, store=false). Responses
+          mode is what allows function tools + reasoning to coexist on
+          gpt-5.6 (mutually exclusive on the chat endpoint). Flip back to
+          "chat" for instant rollback; a 404 in responses mode means the
+          endpoint doesn't implement /v1/responses (no auto-fallback —
+          fix the config).
         """
         self.base_url = base_url
         self.model = model
         self.temperature = temperature
         self._reasoning_effort = (reasoning_effort or "").strip()
+        mode = (api_mode or "chat").strip().lower()
+        if mode not in ("chat", "responses"):
+            logger.warning(f"Unknown api_mode {api_mode!r}; falling back to 'chat'.")
+            mode = "chat"
+        self._api_mode = mode
+        # Verbatim output items (reasoning/message/function_call) of recent
+        # responses-mode tool-call rounds, keyed by call_id. Replayed on the
+        # next hop of the SAME turn so encrypted reasoning survives the tool
+        # loop (docs: "keep every output item"). Tool transcripts never enter
+        # persistent memory, so entries die naturally with the turn; the dict
+        # is size-capped as a leak guard.
+        self._responses_replay: Dict[str, List[Dict[str, Any]]] = {}
         # Stable per-character routing hint for OpenAI's prompt cache. Empty
         # until set_prompt_cache_key is called (e.g. with the conf_uid).
         self._prompt_cache_key: str = ""
@@ -208,6 +229,17 @@ class AsyncLLM(StatelessLLMInterface):
         - RateLimitError: When a 429 status code is received
         - APIError: For other API-related errors
         """
+        if self._api_mode == "responses":
+            async for event in self._responses_completion(
+                messages,
+                system=system,
+                tools=tools,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            ):
+                yield event
+            return
+
         stream = None
         # Tool call related state variables
         accumulated_tool_calls = {}
@@ -490,3 +522,352 @@ class AsyncLLM(StatelessLLMInterface):
                 logger.debug("Chat completion finished.")
                 await stream.close()
                 logger.debug("Stream closed.")
+
+    # ------------------------------------------------------------------
+    # /v1/responses transport (api_mode: "responses")
+    #
+    # Same contract as the chat path: yields str text deltas, then one
+    # List[ToolCallObject] when the model requests tools. Everything above
+    # this layer (agent tool loops, memory tasks) is unchanged.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _content_to_text(content: Any) -> str:
+        """Flatten a chat-format content field (str or parts list) to text."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for p in content:
+                if isinstance(p, dict):
+                    text = p.get("text") or p.get("content") or ""
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif isinstance(p, str):
+                    parts.append(p)
+            return "".join(parts)
+        return "" if content is None else str(content)
+
+    @staticmethod
+    def _to_responses_tools(tools: Any) -> List[Dict[str, Any]] | None:
+        """Chat-format nested function tools → responses flat format."""
+        if not tools or isinstance(tools, NotGiven):
+            return None
+        flat = []
+        for t in tools:
+            fn = t.get("function") if isinstance(t, dict) else None
+            if fn:
+                flat.append(
+                    {
+                        "type": "function",
+                        "name": fn.get("name"),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                    }
+                )
+            elif isinstance(t, dict):
+                flat.append(t)  # already flat / non-function tool: pass through
+        return flat or None
+
+    def _to_responses_input(
+        self, messages: List[Dict[str, Any]], system: str = None
+    ) -> List[Dict[str, Any]]:
+        """Chat-format message history → responses input items.
+
+        The system prompt becomes input[0] as a message item (NOT the
+        top-level `instructions` param: instructions is a plain string, so
+        explicit cache breakpoints — which attach to content blocks — could
+        never be placed on it).
+
+        Assistant tool-call messages are replaced by the verbatim output
+        items stashed from the previous hop when available (preserves
+        encrypted reasoning); otherwise reconstructed as function_call items.
+        """
+        items: List[Dict[str, Any]] = []
+        if system:
+            items.append({"role": "system", "content": system})
+        for m in messages:
+            role = m.get("role")
+            if role == "assistant" and m.get("tool_calls"):
+                first_id = (m["tool_calls"][0] or {}).get("id")
+                stashed = self._responses_replay.get(first_id or "")
+                if stashed:
+                    items.extend(stashed)
+                else:
+                    text = self._content_to_text(m.get("content"))
+                    if text:
+                        items.append({"role": "assistant", "content": text})
+                    for tc in m["tool_calls"]:
+                        fn = tc.get("function") or {}
+                        items.append(
+                            {
+                                "type": "function_call",
+                                "call_id": tc.get("id"),
+                                "name": fn.get("name"),
+                                "arguments": fn.get("arguments") or "{}",
+                            }
+                        )
+                continue
+            if role == "tool":
+                items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": m.get("tool_call_id"),
+                        "output": self._content_to_text(m.get("content")),
+                    }
+                )
+                continue
+            content = m.get("content")
+            if content is None:
+                continue
+            if isinstance(content, str):
+                items.append({"role": role, "content": content})
+                continue
+            # Multimodal parts list (user images): convert to responses types.
+            parts = []
+            for p in content:
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "text":
+                    parts.append({"type": "input_text", "text": p.get("text", "")})
+                elif p.get("type") == "image_url":
+                    img = p.get("image_url") or {}
+                    part = {"type": "input_image", "image_url": img.get("url", "")}
+                    if img.get("detail"):
+                        part["detail"] = img["detail"]
+                    parts.append(part)
+            if parts:
+                items.append({"role": role, "content": parts})
+        return items
+
+    def _stash_replay(
+        self, call_ids: List[str], raw_items: List[Dict[str, Any]]
+    ) -> None:
+        """Remember this hop's verbatim output items under each call_id so
+        the next hop of the tool loop can replay them (encrypted reasoning
+        included). Size-capped FIFO; stale entries are simply never looked
+        up again once the turn's transcript is discarded."""
+        for cid in call_ids:
+            if cid:
+                self._responses_replay[cid] = raw_items
+        while len(self._responses_replay) > 128:
+            self._responses_replay.pop(next(iter(self._responses_replay)))
+
+    def _log_responses_usage(self, usage: Any) -> None:
+        """Normalize responses-API usage field names onto the shared
+        [cache] log line (input_tokens ↔ prompt_tokens etc.)."""
+        in_details = self._get_usage_value(usage, "input_tokens_details", None)
+        out_details = self._get_usage_value(usage, "output_tokens_details", None)
+        self._log_openai_cache_usage(
+            {
+                "prompt_tokens": self._get_usage_value(usage, "input_tokens", 0),
+                "completion_tokens": self._get_usage_value(usage, "output_tokens", 0),
+                "prompt_tokens_details": {
+                    "cached_tokens": self._get_usage_value(
+                        in_details, "cached_tokens", 0
+                    ),
+                    "cache_write_tokens": self._get_usage_value(
+                        in_details, "cache_write_tokens", 0
+                    ),
+                },
+                "completion_tokens_details": {
+                    "reasoning_tokens": self._get_usage_value(
+                        out_details, "reasoning_tokens", 0
+                    ),
+                },
+            }
+        )
+
+    async def _responses_completion(
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = None,
+        tools: List[Dict[str, Any]] | NotGiven = NOT_GIVEN,
+        max_tokens: int = None,
+        reasoning_effort: str = None,
+    ) -> AsyncIterator[str | List[ToolCallObject]]:
+        """Streaming completion over /v1/responses (stateless, store=false).
+
+        Yield contract is identical to the chat path. Verified firsthand on
+        gpt-5.6-sol (experiments/_responses_probe*.py): function tools +
+        reasoning coexist here, encrypted reasoning items replay across tool
+        hops, and both implicit cache (prompt_cache_key) and explicit
+        breakpoints work with store=false.
+        """
+        stream = None
+        try:
+            if reasoning_effort is None:
+                reasoning_effort = self._reasoning_effort
+
+            request_kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "input": self._to_responses_input(messages, system),
+                "stream": True,
+                "temperature": self.temperature,
+                "store": False,
+            }
+            flat_tools = self._to_responses_tools(tools if self.support_tools else None)
+            if flat_tools:
+                request_kwargs["tools"] = flat_tools
+            if reasoning_effort:
+                request_kwargs["reasoning"] = {"effort": reasoning_effort}
+                # Without this, reasoning items come back without content and
+                # the chain can't be replayed across tool hops (store=false).
+                request_kwargs["include"] = ["reasoning.encrypted_content"]
+            if max_tokens:
+                # Reasoning tokens count against max_output_tokens, same as
+                # max_completion_tokens on the chat path — give headroom.
+                request_kwargs["max_output_tokens"] = (
+                    max_tokens * self._MAX_COMPLETION_TOKEN_MULTIPLIER
+                )
+            if self._prompt_cache_key:
+                # extra_body keeps this SDK-version-agnostic (see chat path).
+                request_kwargs["extra_body"] = {
+                    "prompt_cache_key": self._prompt_cache_key
+                }
+
+            while True:
+                try:
+                    stream = await self.client.responses.create(**request_kwargs)
+                    break
+                except APIError as e:
+                    msg = str(e).lower()
+                    # Degrade gracefully on partially-compatible providers
+                    # (Ollama/Groq/vLLM implement the stateless subset with
+                    # varying extras). Each drop is logged, never silent.
+                    droppable = [
+                        ("include", "encrypted reasoning replay unavailable"),
+                        ("temperature", "temperature not supported here"),
+                        ("reasoning", "reasoning knob not supported here"),
+                        ("prompt_cache_key", "cache routing key not supported"),
+                    ]
+                    dropped = False
+                    for key, why in droppable:
+                        if key in request_kwargs and key in msg:
+                            if key == "prompt_cache_key":
+                                request_kwargs.pop("extra_body", None)
+                            request_kwargs.pop(key, None)
+                            logger.warning(
+                                f"/v1/responses rejected '{key}' ({why}); "
+                                "retrying without it."
+                            )
+                            dropped = True
+                            break
+                    if dropped:
+                        continue
+                    raise
+
+            served_model_logged = False
+            raw_output_items: List[Dict[str, Any]] = []
+            func_call_items: List[Dict[str, Any]] = []
+            emitted_text_chars = 0
+
+            async for event in stream:
+                etype = getattr(event, "type", "")
+                if etype == "response.created":
+                    served = getattr(getattr(event, "response", None), "model", None)
+                    if not served_model_logged and served:
+                        logger.info(f"[llm] requested={self.model!r} served={served!r}")
+                        served_model_logged = True
+                elif etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    emitted_text_chars += len(delta)
+                    if delta:
+                        yield delta
+                elif etype == "response.output_item.done":
+                    item = getattr(event, "item", None)
+                    if item is None:
+                        continue
+                    item_dict = item.model_dump(exclude_none=True)
+                    raw_output_items.append(item_dict)
+                    if item_dict.get("type") == "function_call":
+                        func_call_items.append(item_dict)
+                elif etype in ("response.completed", "response.incomplete"):
+                    usage = getattr(getattr(event, "response", None), "usage", None)
+                    if usage:
+                        self._log_responses_usage(usage)
+                    if etype == "response.incomplete":
+                        logger.warning(
+                            "/v1/responses stream ended incomplete (likely "
+                            f"max_output_tokens); emitted_text_chars="
+                            f"{emitted_text_chars}."
+                        )
+                elif etype in ("response.failed", "error"):
+                    detail = getattr(
+                        getattr(getattr(event, "response", None), "error", None),
+                        "message",
+                        None,
+                    ) or getattr(event, "message", str(event))
+                    logger.error(f"/v1/responses stream error: {detail}")
+                    yield (
+                        "Error calling the chat endpoint: Error occurred while "
+                        "generating response. See the logs for details."
+                    )
+                    return
+
+            if func_call_items:
+                call_ids = [fc.get("call_id", "") for fc in func_call_items]
+                self._stash_replay(call_ids, raw_output_items)
+                yield [
+                    ToolCallObject.from_dict(
+                        {
+                            "id": fc.get("call_id"),
+                            "type": "function",
+                            "index": i,
+                            "function": {
+                                "name": fc.get("name", ""),
+                                "arguments": fc.get("arguments") or "{}",
+                            },
+                        }
+                    )
+                    for i, fc in enumerate(func_call_items)
+                ]
+
+        except APIConnectionError as e:
+            logger.error(
+                f"Error calling the responses endpoint: Connection error. Failed to connect to the LLM API. \nCheck the configurations and the reachability of the LLM backend. \nSee the logs for details. \n{e.__cause__}"
+            )
+            yield "Error calling the chat endpoint: Connection error. Failed to connect to the LLM API. Check the configurations and the reachability of the LLM backend. See the logs for details."
+
+        except RateLimitError as e:
+            detail = f"{getattr(e, 'code', '') or ''} {e}"
+            logger.error(
+                f"Error calling the responses endpoint: 429 Too Many Requests — {e}"
+            )
+            if "insufficient_quota" in detail:
+                yield (
+                    "Error calling the chat endpoint: OpenAI quota/credit exhausted "
+                    "(insufficient_quota). Check your billing. See the logs for details."
+                )
+            else:
+                yield (
+                    "Error calling the chat endpoint: Rate limit exceeded. "
+                    "Please try again later. See the logs for details."
+                )
+
+        except APIError as e:
+            if getattr(e, "status_code", None) == 404:
+                logger.error(
+                    f"/v1/responses returned 404 — {self.base_url} doesn't "
+                    "implement the responses API. Set api_mode: 'chat' for "
+                    "this provider (no auto-fallback by design)."
+                )
+            elif "does not support tools" in str(e):
+                self.support_tools = False
+                logger.warning(
+                    f"{self.model} does not support tools. Disabling tool support."
+                )
+                yield "__API_NOT_SUPPORT_TOOLS__"
+                return
+            else:
+                logger.error(f"LLM API (responses): Error occurred: {e}")
+                logger.info(f"Base URL: {self.base_url}")
+                logger.info(f"Model: {self.model}")
+                logger.info(f"Messages: {self._summarize_messages(messages)}")
+            yield "Error calling the chat endpoint: Error occurred while generating response. See the logs for details."
+
+        finally:
+            if stream:
+                logger.debug("Responses completion finished.")
+                await stream.close()
+                logger.debug("Responses stream closed.")
