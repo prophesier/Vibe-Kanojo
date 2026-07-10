@@ -5,6 +5,7 @@ model_dict.json
 # local notes (not project documentation)
 handoff.md
 rag_design.md
+PROJECT.md
 
 # local backups (chat history, persona snapshots)
 backup/
