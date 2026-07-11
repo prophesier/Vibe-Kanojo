@@ -98,6 +98,12 @@ class AsyncLLM(StatelessLLMInterface):
         # persistent memory, so entries die naturally with the turn; the dict
         # is size-capped as a leak guard.
         self._responses_replay: Dict[str, List[Dict[str, Any]]] = {}
+        # Text content of user messages that were SENT with an image
+        # attached (explicit cache mode). Their breakpoint entries may live
+        # on a vision-pool machine and be unreadable from later text turns,
+        # so the rotating "previous" breakpoint skips them. Ordered,
+        # size-capped; texts embed a timestamp tag so they're unique enough.
+        self._responses_image_texts: Dict[str, None] = {}
         # Stable per-character routing hint for OpenAI's prompt cache. Empty
         # until set_prompt_cache_key is called (e.g. with the conf_uid).
         self._prompt_cache_key: str = ""
@@ -649,12 +655,29 @@ class AsyncLLM(StatelessLLMInterface):
         # Rotating breakpoints: previous + current user message. The current
         # one is stable across the hops of a tool loop (tool items are
         # appended after it), so hop N reads hop 1's entry.
+        #
+        # The PREVIOUS slot skips user messages that rode with an image:
+        # observed in production (2026-07-11 16:55) that an image-carrying
+        # request can miss ALL breakpoint entries despite a byte-identical
+        # prefix ([sys_fp] unchanged) and re-write everything — most
+        # consistent with vision requests being served/cached on a different
+        # machine pool (OpenAI-side; in-vitro probes with production-shaped
+        # requests do NOT reproduce it). Entries written by such a turn may
+        # be unreadable later, so anchoring the previous slot there would
+        # drop the whole current-session prefix; anchor on the last
+        # image-free user message instead.
         bp_indices: set = set()
         if explicit:
             user_indices = [
                 i for i, m in enumerate(messages) if m.get("role") == "user"
             ]
-            bp_indices.update(user_indices[-2:])
+            if user_indices:
+                bp_indices.add(user_indices[-1])
+                for i in reversed(user_indices[:-1]):
+                    text = self._content_to_text(messages[i].get("content"))
+                    if text not in self._responses_image_texts:
+                        bp_indices.add(i)
+                        break
             bp_indices.update(i for i, m in enumerate(messages) if m.get("_cache_seam"))
         for i, m in enumerate(messages):
             role = m.get("role")
@@ -725,6 +748,19 @@ class AsyncLLM(StatelessLLMInterface):
                         part["detail"] = img["detail"]
                     parts.append(part)
             if parts:
+                if explicit and any(p.get("type") == "input_image" for p in parts):
+                    # Remember this turn carried an image so later turns
+                    # don't anchor their "previous" breakpoint on it.
+                    text = "".join(
+                        p.get("text", "")
+                        for p in parts
+                        if p.get("type") == "input_text"
+                    )
+                    self._responses_image_texts[text] = None
+                    while len(self._responses_image_texts) > 32:
+                        self._responses_image_texts.pop(
+                            next(iter(self._responses_image_texts))
+                        )
                 if want_bp:
                     # Last TEXT block, never an image: keeps the entry equal
                     # to the image-free version the next turn replays.
