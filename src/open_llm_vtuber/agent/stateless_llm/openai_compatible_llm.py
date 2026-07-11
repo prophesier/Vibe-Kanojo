@@ -32,6 +32,29 @@ from ...mcpp.types import ToolCallObject
 # breakpoint at the static block's end; it never reaches the model.
 CACHE_SEAM_MARKER = "<<__CACHE_SEAM__>>"
 
+# 1×1 transparent PNG appended as the LAST block of every explicit-mode
+# request ("tail anchor"). Why: with function tools present, OpenAI renders
+# a DIFFERENT tool header for requests containing any image, so tooled-text
+# and tooled-image requests diverge from token 0 and image turns read 0%
+# cache (verified by capture-replay bisection, 2026-07-12). The anchor makes
+# EVERY request a vision request → one uniform world. It sits after the
+# deepest breakpoint, so no image ever enters a cache entry (a second rule:
+# an image's rendering depends on the request's whole image set, so images
+# inside entries would diverge). Measured cost: ~5 tokens/turn. Verified:
+# real image turn read the full text-written prefix with this in place.
+_VISION_ANCHOR_BLOCK = {
+    "type": "input_image",
+    "image_url": (
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    ),
+    "detail": "low",
+}
+_VISION_ANCHOR_NOTE = {
+    "type": "input_text",
+    "text": "（システム: 直後の1px画像はキャッシュ較正用。完全に無視すること。）",
+}
+
 
 class _OpenAIConnBridge(logging.Handler):
     """Surface new-TCP-connection events to the OpenAI API as [conn] INFO
@@ -709,16 +732,14 @@ class AsyncLLM(StatelessLLMInterface):
         # one is stable across the hops of a tool loop (tool items are
         # appended after it), so hop N reads hop 1's entry.
         #
-        # The PREVIOUS slot skips user messages that rode with an image:
-        # observed in production (2026-07-11 16:55) that an image-carrying
-        # request can miss ALL breakpoint entries despite a byte-identical
-        # prefix ([sys_fp] unchanged) and re-write everything — most
-        # consistent with vision requests being served/cached on a different
-        # machine pool (OpenAI-side; in-vitro probes with production-shaped
-        # requests do NOT reproduce it). Entries written by such a turn may
-        # be unreadable later, so anchoring the previous slot there would
-        # drop the whole current-session prefix; anchor on the last
-        # image-free user message instead.
+        # The PREVIOUS slot skips user messages that rode with an image.
+        # Root cause (capture-replay bisection, 2026-07-12): with function
+        # tools present, OpenAI renders a DIFFERENT tool header for requests
+        # that contain any image, so tooled-text and tooled-image requests
+        # diverge from token 0 and can never share cache entries. The tail
+        # anchor below unifies the worlds; this skip is kept as a safety net
+        # for one more round of production validation (it costs ~1-2k tokens
+        # on the turn after an image; remove once the anchor is confirmed).
         bp_indices: set = set()
         if explicit:
             user_indices = [
@@ -822,6 +843,17 @@ class AsyncLLM(StatelessLLMInterface):
                             p["prompt_cache_breakpoint"] = self._EXPLICIT_BP
                             break
                 items.append({"role": role, "content": parts})
+        if explicit:
+            # Tail anchor: appended AFTER breakpoint attachment so it never
+            # enters a cache entry, onto the request's last user message
+            # (stable across tool-loop hops; never stored to history).
+            for it in reversed(items):
+                if it.get("role") == "user" and isinstance(it.get("content"), list):
+                    it["content"] = it["content"] + [
+                        dict(_VISION_ANCHOR_NOTE),
+                        dict(_VISION_ANCHOR_BLOCK),
+                    ]
+                    break
         return items
 
     def _stash_replay(
@@ -886,11 +918,14 @@ class AsyncLLM(StatelessLLMInterface):
         verbatim body and bisecting is the airtight path). Local file only;
         the body carries no API key. Overwritten per image turn."""
         try:
+            anchor_uri = _VISION_ANCHOR_BLOCK["image_url"]
             has_image = any(
                 isinstance(it, dict)
                 and isinstance(it.get("content"), list)
                 and any(
-                    isinstance(b, dict) and b.get("type") == "input_image"
+                    isinstance(b, dict)
+                    and b.get("type") == "input_image"
+                    and b.get("image_url") != anchor_uri
                     for b in it["content"]
                 )
                 for it in request_kwargs.get("input", [])
