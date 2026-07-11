@@ -173,6 +173,10 @@ character_config:
         # Give up after this many consecutive nudges with no real user message
         # (assume the user left); a user message resets the count. 0 = no limit.
         claude_cache_keepalive_max: 6
+        # Same mechanism for the OpenAI explicit prompt cache (api_mode
+        # 'responses' + cache_mode 'explicit'; ttl 30m). 0 disables.
+        openai_cache_keepalive_minutes: 25
+        openai_cache_keepalive_max: 6
 
       letta_agent:
         host: 'localhost' # Host address
@@ -284,6 +288,10 @@ character_config:
         # 'responses' = /v1/responses — lets function tools + reasoning
         # coexist on gpt-5.6. Set back to 'chat' to roll back instantly.
         api_mode: 'chat'
+        # Prompt caching (responses mode only): 'implicit' (default) or
+        # 'explicit' — 4 breakpoints, image turns no longer bust the cache,
+        # ttl 30m (pair with openai_cache_keepalive_minutes to keep it warm).
+        cache_mode: 'implicit'
 
       gemini_llm:
         llm_api_key: 'Your Gemini API Key'

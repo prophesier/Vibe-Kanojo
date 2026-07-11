@@ -23,7 +23,10 @@ from ...alarms import resolve_fire_at, format_local
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
 from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
-from ..stateless_llm.openai_compatible_llm import AsyncLLM as OpenAICompatibleAsyncLLM
+from ..stateless_llm.openai_compatible_llm import (
+    CACHE_SEAM_MARKER,
+    AsyncLLM as OpenAICompatibleAsyncLLM,
+)
 from ...chat_history_manager import get_history, get_recent_histories
 from ..transformers import (
     sentence_divider,
@@ -567,6 +570,11 @@ class BasicMemoryAgent(AgentInterface):
         # never changed mid-session, so it is as cache-stable as the notes.
         if self._steam_digest:
             parts.append(self._steam_digest)
+        if self._openai_explicit_cache():
+            # Static persona block ends here; the responses transport splits
+            # on this marker and breakpoints the static part, so a facts/
+            # diaries change can only bust the cache from THIS point on.
+            parts.append(CACHE_SEAM_MARKER)
         facts_fp = diaries_fp = "-"
         if self._memory_manager:
             facts_text = self._memory_manager.get_facts_prompt()
@@ -604,6 +612,41 @@ class BasicMemoryAgent(AgentInterface):
 
     def _is_claude_llm(self) -> bool:
         return isinstance(self._llm, ClaudeAsyncLLM)
+
+    def _openai_explicit_cache(self) -> bool:
+        """Whether the active LLM runs /v1/responses with explicit prompt
+        caching — gates the system seam marker and the history seam tag."""
+        return (
+            isinstance(self._llm, OpenAICompatibleAsyncLLM)
+            and getattr(self._llm, "_api_mode", "") == "responses"
+            and getattr(self._llm, "_cache_mode", "") == "explicit"
+        )
+
+    def _tag_explicit_cache_seam(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Tag the last history message BEFORE the current session with
+        ``_cache_seam`` (outgoing copy only — _memory is never mutated).
+
+        The responses transport places an explicit breakpoint there, so the
+        system + past-sessions prefix survives a pure restart (the current
+        session's banner/messages change, everything before doesn't) and
+        RAG/Steam/memory blocks — which live in the current session — can
+        never bust it. Assistant messages can't carry breakpoints (their
+        blocks are output_text), so walk back to the nearest user/system
+        message.
+        """
+        end = len(messages)
+        for i, m in enumerate(messages):
+            content = m.get("content")
+            if isinstance(content, str) and "【現在進行中のセッション開始" in content:
+                end = i
+                break
+        for i in range(end - 1, -1, -1):
+            if messages[i].get("role") != "assistant":
+                messages[i] = {**messages[i], "_cache_seam": True}
+                break
+        return messages
 
     def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
         """Return system prompt in the right shape for the active LLM.
@@ -900,6 +943,8 @@ class BasicMemoryAgent(AgentInterface):
         # up to and including it gets cached by Anthropic, while the fresh
         # user input appended below stays uncached. No-op for non-Claude.
         messages = self._attach_cache_breakpoint(messages)
+        if self._openai_explicit_cache():
+            messages = self._tag_explicit_cache_seam(messages)
         user_content = []
         text_prompt = self._to_text_prompt(input_data)
         # The diary-RAG block (if retrieval fired this turn) rides only on the

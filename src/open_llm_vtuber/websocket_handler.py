@@ -824,9 +824,9 @@ class WebSocketHandler:
             logger.error(f"[proactive] turn failed for {client_uid}: {e}")
             return False
 
-    # ------------------------------------------------- Claude cache keepalive
+    # ------------------------------------------------- prompt-cache keepalive
     _KEEPALIVE_PROMPT = (
-        "【システム】Anthropic のプロンプトキャッシュの保持時間がもうすぐ切れる。"
+        "【システム】プロンプトキャッシュの保持時間がもうすぐ切れる。"
         "キャッシュを維持するため、内容は何でもいいので自由に一言話しかけて。"
     )
 
@@ -836,34 +836,68 @@ class WebSocketHandler:
         except Exception:
             return None
 
-    def _claude_active(self) -> bool:
+    def _keepalive_provider(self) -> Optional[str]:
+        """Which prompt cache needs keepalive nudges: "claude" (Anthropic,
+        1h TTL) or "openai" (explicit responses cache, 30m TTL); None when
+        the active configuration has nothing worth keeping warm."""
         bma = self._bma_cfg()
-        return bool(bma and getattr(bma, "llm_provider", "") == "claude_llm")
+        provider = getattr(bma, "llm_provider", "") if bma else ""
+        if provider == "claude_llm":
+            return "claude"
+        try:
+            llm_cfg = getattr(
+                self.default_context_cache.character_config.agent_config.llm_configs,
+                provider,
+                None,
+            )
+        except Exception:
+            llm_cfg = None
+        if (
+            llm_cfg is not None
+            and getattr(llm_cfg, "api_mode", "chat") == "responses"
+            and getattr(llm_cfg, "cache_mode", "implicit") == "explicit"
+        ):
+            return "openai"
+        return None
 
     def _keepalive_minutes(self) -> int:
         bma = self._bma_cfg()
-        return int(getattr(bma, "claude_cache_keepalive_minutes", 0) or 0) if bma else 0
+        if not bma:
+            return 0
+        kind = self._keepalive_provider()
+        if kind == "claude":
+            return int(getattr(bma, "claude_cache_keepalive_minutes", 0) or 0)
+        if kind == "openai":
+            return int(getattr(bma, "openai_cache_keepalive_minutes", 0) or 0)
+        return 0
 
     def _keepalive_max(self) -> int:
         bma = self._bma_cfg()
-        return int(getattr(bma, "claude_cache_keepalive_max", 0) or 0) if bma else 0
+        if not bma:
+            return 0
+        if self._keepalive_provider() == "openai":
+            return int(getattr(bma, "openai_cache_keepalive_max", 0) or 0)
+        return int(getattr(bma, "claude_cache_keepalive_max", 0) or 0)
 
     def _ensure_keepalive_timer(self) -> None:
-        """Start the Claude prompt-cache keepalive loop once (Claude only)."""
+        """Start the prompt-cache keepalive loop once (Claude, or OpenAI
+        responses mode with explicit caching)."""
         if self._keepalive_task is not None and not self._keepalive_task.done():
             return
-        if not self._claude_active() or self._keepalive_minutes() <= 0:
+        kind = self._keepalive_provider()
+        if kind is None or self._keepalive_minutes() <= 0:
             return
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
-        logger.info("[keepalive] Claude cache keepalive timer started.")
+        logger.info(f"[keepalive] {kind} cache keepalive timer started.")
 
     async def _keepalive_loop(self) -> None:
-        """When the conversation idles toward Claude's 1h cache TTL, nudge the
-        character to speak so the cache is refreshed instead of expiring."""
+        """When the conversation idles toward the cache TTL (Claude 1h /
+        OpenAI explicit 30m), nudge the character to speak so the cache is
+        refreshed instead of expiring."""
         while True:
             try:
                 mins = self._keepalive_minutes()
-                if mins <= 0 or not self._claude_active():
+                if mins <= 0 or self._keepalive_provider() is None:
                     await asyncio.sleep(60)
                     continue
                 if self._last_turn_at is None:

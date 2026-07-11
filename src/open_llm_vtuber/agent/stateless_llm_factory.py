@@ -41,6 +41,7 @@ class LLMFactory:
                 temperature=kwargs.get("temperature"),
                 reasoning_effort=kwargs.get("reasoning_effort") or "",
                 api_mode=kwargs.get("api_mode") or "chat",
+                cache_mode=kwargs.get("cache_mode") or "implicit",
             )
         if llm_provider == "stateless_llm_with_template":
             return StatelessLLMWithTemplate(

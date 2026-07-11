@@ -21,6 +21,13 @@ from .stateless_llm_interface import StatelessLLMInterface
 from ...mcpp.types import ToolCallObject
 
 
+# Seam the agent inserts into the runtime system prompt between the static
+# persona block and the facts/diaries block, ONLY when explicit caching is
+# active. The responses transport splits on it and puts an explicit cache
+# breakpoint at the static block's end; it never reaches the model.
+CACHE_SEAM_MARKER = "<<__CACHE_SEAM__>>"
+
+
 class AsyncLLM(StatelessLLMInterface):
     _MAX_COMPLETION_TOKEN_MULTIPLIER = 4
 
@@ -34,6 +41,7 @@ class AsyncLLM(StatelessLLMInterface):
         temperature: float = 1.0,
         reasoning_effort: str = "",
         api_mode: str = "chat",
+        cache_mode: str = "implicit",
     ):
         """
         Initializes an instance of the `AsyncLLM` class.
@@ -57,6 +65,13 @@ class AsyncLLM(StatelessLLMInterface):
           "chat" for instant rollback; a 404 in responses mode means the
           endpoint doesn't implement /v1/responses (no auto-fallback —
           fix the config).
+        - cache_mode (str, optional): "implicit" (default) or "explicit"
+          prompt caching, responses mode only. Explicit places up to 4
+          breakpoints (static persona | history/current-session seam |
+          previous user msg | current user msg) and makes image turns
+          cache-immune (implicit deterministically misses on them —
+          verified probes 5–7). Requests whose system prompt carries no
+          CACHE_SEAM_MARKER (e.g. memory tasks) stay implicit.
         """
         self.base_url = base_url
         self.model = model
@@ -67,6 +82,15 @@ class AsyncLLM(StatelessLLMInterface):
             logger.warning(f"Unknown api_mode {api_mode!r}; falling back to 'chat'.")
             mode = "chat"
         self._api_mode = mode
+        cmode = (cache_mode or "implicit").strip().lower()
+        if cmode not in ("implicit", "explicit"):
+            logger.warning(
+                f"Unknown cache_mode {cache_mode!r}; falling back to 'implicit'."
+            )
+            cmode = "implicit"
+        self._cache_mode = cmode
+        if cmode == "explicit" and mode == "responses":
+            logger.info("Explicit prompt caching active (ttl 30m, 4 breakpoints).")
         # Verbatim output items (reasoning/message/function_call) of recent
         # responses-mode tool-call rounds, keyed by call_id. Replayed on the
         # next hop of the SAME turn so encrypted reasoning survives the tool
@@ -569,8 +593,13 @@ class AsyncLLM(StatelessLLMInterface):
                 flat.append(t)  # already flat / non-function tool: pass through
         return flat or None
 
+    _EXPLICIT_BP = {"mode": "explicit"}
+
     def _to_responses_input(
-        self, messages: List[Dict[str, Any]], system: str = None
+        self,
+        messages: List[Dict[str, Any]],
+        system: str = None,
+        explicit: bool = False,
     ) -> List[Dict[str, Any]]:
         """Chat-format message history → responses input items.
 
@@ -582,11 +611,52 @@ class AsyncLLM(StatelessLLMInterface):
         Assistant tool-call messages are replaced by the verbatim output
         items stashed from the previous hop when available (preserves
         encrypted reasoning); otherwise reconstructed as function_call items.
+
+        With ``explicit``, up to 4 breakpoints are placed (entries are keyed
+        to EXACT breakpoint positions — no longest-prefix matching, so the
+        previous turn's position must be kept alive each turn):
+          1. static persona block (system split on CACHE_SEAM_MARKER)
+          2. the "_cache_seam"-tagged history message (history | current
+             session boundary — survives a pure restart)
+          3. previous user message  4. current user message (rotating pair
+             → read the full previous-turn entry, write only ~the new turn)
+        Breakpoints go on the last input_text block, never on images, so an
+        image turn's entry stays byte-identical to what the next turn (which
+        never re-sends the image) replays.
         """
         items: List[Dict[str, Any]] = []
         if system:
-            items.append({"role": "system", "content": system})
-        for m in messages:
+            if explicit and CACHE_SEAM_MARKER in system:
+                static_part, _, memory_part = system.partition(CACHE_SEAM_MARKER)
+                content = [
+                    {
+                        "type": "input_text",
+                        "text": static_part,
+                        "prompt_cache_breakpoint": self._EXPLICIT_BP,
+                    }
+                ]
+                if memory_part.strip():
+                    content.append({"type": "input_text", "text": memory_part})
+                items.append({"role": "system", "content": content})
+            else:
+                # Marker never reaches the model in any mode.
+                items.append(
+                    {
+                        "role": "system",
+                        "content": system.replace(CACHE_SEAM_MARKER, ""),
+                    }
+                )
+        # Rotating breakpoints: previous + current user message. The current
+        # one is stable across the hops of a tool loop (tool items are
+        # appended after it), so hop N reads hop 1's entry.
+        bp_indices: set = set()
+        if explicit:
+            user_indices = [
+                i for i, m in enumerate(messages) if m.get("role") == "user"
+            ]
+            bp_indices.update(user_indices[-2:])
+            bp_indices.update(i for i, m in enumerate(messages) if m.get("_cache_seam"))
+        for i, m in enumerate(messages):
             role = m.get("role")
             if role == "assistant" and m.get("tool_calls"):
                 first_id = (m["tool_calls"][0] or {}).get("id")
@@ -620,8 +690,26 @@ class AsyncLLM(StatelessLLMInterface):
             content = m.get("content")
             if content is None:
                 continue
+            # Breakpoints attach only to input_* blocks — assistant content
+            # is output_text, so an assistant message can't carry one (the
+            # agent only tags non-assistant messages).
+            want_bp = i in bp_indices and role != "assistant"
             if isinstance(content, str):
-                items.append({"role": role, "content": content})
+                if want_bp:
+                    items.append(
+                        {
+                            "role": role,
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": content,
+                                    "prompt_cache_breakpoint": self._EXPLICIT_BP,
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    items.append({"role": role, "content": content})
                 continue
             # Multimodal parts list (user images): convert to responses types.
             parts = []
@@ -637,6 +725,13 @@ class AsyncLLM(StatelessLLMInterface):
                         part["detail"] = img["detail"]
                     parts.append(part)
             if parts:
+                if want_bp:
+                    # Last TEXT block, never an image: keeps the entry equal
+                    # to the image-free version the next turn replays.
+                    for p in reversed(parts):
+                        if p.get("type") == "input_text":
+                            p["prompt_cache_breakpoint"] = self._EXPLICIT_BP
+                            break
                 items.append({"role": role, "content": parts})
         return items
 
@@ -699,13 +794,30 @@ class AsyncLLM(StatelessLLMInterface):
             if reasoning_effort is None:
                 reasoning_effort = self._reasoning_effort
 
+            # Explicit caching only for requests whose system prompt carries
+            # the seam marker (= the chat path). Memory tasks and other
+            # one-shot callers stay implicit — explicit writes bill 1.25×
+            # and their prompts are never re-read.
+            explicit_active = self._cache_mode == "explicit" and bool(
+                system and CACHE_SEAM_MARKER in system
+            )
             request_kwargs: Dict[str, Any] = {
                 "model": self.model,
-                "input": self._to_responses_input(messages, system),
+                "input": self._to_responses_input(
+                    messages, system, explicit=explicit_active
+                ),
                 "stream": True,
                 "temperature": self.temperature,
                 "store": False,
             }
+            # extra_body carries fields the installed SDK has no typed param
+            # for yet — version-agnostic, exactly like the chat path.
+            extra_body: Dict[str, Any] = {}
+            if explicit_active:
+                extra_body["prompt_cache_options"] = {
+                    "mode": "explicit",
+                    "ttl": "30m",
+                }
             flat_tools = self._to_responses_tools(tools if self.support_tools else None)
             if flat_tools:
                 request_kwargs["tools"] = flat_tools
@@ -726,10 +838,9 @@ class AsyncLLM(StatelessLLMInterface):
                     max_tokens * self._MAX_COMPLETION_TOKEN_MULTIPLIER
                 )
             if self._prompt_cache_key:
-                # extra_body keeps this SDK-version-agnostic (see chat path).
-                request_kwargs["extra_body"] = {
-                    "prompt_cache_key": self._prompt_cache_key
-                }
+                extra_body["prompt_cache_key"] = self._prompt_cache_key
+            if extra_body:
+                request_kwargs["extra_body"] = extra_body
 
             while True:
                 try:
@@ -752,6 +863,22 @@ class AsyncLLM(StatelessLLMInterface):
                             "[thinking] log lines unavailable."
                         )
                         continue
+                    if (
+                        "prompt_cache_options" in msg or "breakpoint" in msg
+                    ) and "prompt_cache_options" in extra_body:
+                        # Provider without explicit caching: strip options AND
+                        # the per-block breakpoints, fall back to implicit.
+                        extra_body.pop("prompt_cache_options", None)
+                        if not extra_body:
+                            request_kwargs.pop("extra_body", None)
+                        request_kwargs["input"] = self._to_responses_input(
+                            messages, system, explicit=False
+                        )
+                        logger.warning(
+                            "/v1/responses rejected explicit prompt caching; "
+                            "retrying implicit."
+                        )
+                        continue
                     droppable = [
                         ("include", "encrypted reasoning replay unavailable"),
                         ("temperature", "temperature not supported here"),
@@ -760,16 +887,22 @@ class AsyncLLM(StatelessLLMInterface):
                     ]
                     dropped = False
                     for key, why in droppable:
-                        if key in request_kwargs and key in msg:
-                            if key == "prompt_cache_key":
-                                request_kwargs.pop("extra_body", None)
+                        if key not in msg:
+                            continue
+                        if key in request_kwargs:
                             request_kwargs.pop(key, None)
-                            logger.warning(
-                                f"/v1/responses rejected '{key}' ({why}); "
-                                "retrying without it."
-                            )
-                            dropped = True
-                            break
+                        elif key in extra_body:
+                            extra_body.pop(key, None)
+                            if not extra_body:
+                                request_kwargs.pop("extra_body", None)
+                        else:
+                            continue
+                        logger.warning(
+                            f"/v1/responses rejected '{key}' ({why}); "
+                            "retrying without it."
+                        )
+                        dropped = True
+                        break
                     if dropped:
                         continue
                     raise

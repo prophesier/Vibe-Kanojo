@@ -71,6 +71,10 @@ class OpenAICompatibleConfig(StatelessLLMBaseConfig):
     # "responses" = /v1/responses (stateless). Responses mode lets function
     # tools and reasoning coexist on gpt-5.6; flip back to "chat" to roll back.
     api_mode: Literal["chat", "responses"] = Field("chat", alias="api_mode")
+    # Prompt caching flavor, responses mode only. "explicit" places 4
+    # breakpoints (persona | history seam | prev/current user msg) and makes
+    # image turns cache-immune; ttl 30m. "implicit" = provider default.
+    cache_mode: Literal["implicit", "explicit"] = Field("implicit", alias="cache_mode")
 
     _OPENAI_COMPATIBLE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(en="Base URL for the API endpoint", zh="API的URL端点"),
@@ -98,6 +102,13 @@ class OpenAICompatibleConfig(StatelessLLMBaseConfig):
             "gpt-5.6). Set back to 'chat' to roll back.",
             zh="传输端点：'chat' = /v1/chat/completions（默认），'responses' = "
             "/v1/responses（gpt-5.6 上工具与推理可共存）。改回 'chat' 即回滚。",
+        ),
+        "cache_mode": Description(
+            en="Prompt caching flavor (responses mode only): 'implicit' "
+            "(default) or 'explicit' (4 breakpoints, image turns become "
+            "cache-immune, ttl 30m).",
+            zh="缓存方式（仅 responses 模式）：'implicit'（默认）或 'explicit'"
+            "（4 断点，图片回合不再掉缓存，ttl 30 分钟）。",
         ),
     }
 

@@ -63,6 +63,14 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     claude_cache_keepalive_max: Optional[int] = Field(
         6, alias="claude_cache_keepalive_max"
     )
+    # Same mechanism for the OpenAI explicit prompt cache (responses mode +
+    # cache_mode 'explicit', ttl 30m). Only active in that configuration.
+    openai_cache_keepalive_minutes: Optional[int] = Field(
+        25, alias="openai_cache_keepalive_minutes"
+    )
+    openai_cache_keepalive_max: Optional[int] = Field(
+        6, alias="openai_cache_keepalive_max"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "llm_provider": Description(
@@ -164,6 +172,21 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
                 "连续保活提示的最大次数，超过则放弃（判定用户已离开）；任何真实用户"
                 "消息都会清零重新计。（默认：6）"
             ),
+        ),
+        "openai_cache_keepalive_minutes": Description(
+            en=(
+                "OpenAI responses mode with cache_mode 'explicit' only (ttl "
+                "30m). Same nudge mechanism as the Claude keepalive. "
+                "0 disables. (default: 25)"
+            ),
+            zh=(
+                "仅 OpenAI responses 模式 + cache_mode 'explicit'（缓存有效期 "
+                "30 分钟）。与 Claude 保活同机制。0 关闭。（默认：25）"
+            ),
+        ),
+        "openai_cache_keepalive_max": Description(
+            en="Max consecutive OpenAI keepalive nudges (see the Claude one).",
+            zh="OpenAI 保活的连续次数上限（语义同 Claude 项）。",
         ),
     }
 
