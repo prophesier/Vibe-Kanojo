@@ -4,6 +4,7 @@ endpoints for language generation.
 """
 
 from typing import AsyncIterator, List, Dict, Any
+import logging
 import httpx
 from openai import (
     AsyncStream,
@@ -28,6 +29,35 @@ from ...mcpp.types import ToolCallObject
 # active. The responses transport splits on it and puts an explicit cache
 # breakpoint at the static block's end; it never reaches the model.
 CACHE_SEAM_MARKER = "<<__CACHE_SEAM__>>"
+
+
+class _OpenAIConnBridge(logging.Handler):
+    """Surface new-TCP-connection events to the OpenAI API as [conn] INFO
+    lines. Cache routing is per-connection (see the pinning note in
+    AsyncLLM.__init__), so a [conn] line right before a [cache] read=0 on
+    an image turn means the pinned connection was dropped (server-side
+    idle/age/request-count limit) and the request got rerouted — the
+    diagnostic that separates "pin broke" from "pin doesn't work"."""
+
+    def emit(self, record):
+        try:
+            msg = record.getMessage()
+            if "connect_tcp.started" not in msg or "openai" not in msg:
+                return
+            marker = "host='"
+            i = msg.find(marker)
+            host = msg[i + len(marker) :].split("'", 1)[0] if i >= 0 else "?"
+            logger.info(f"[conn] new TCP connection → {host}")
+        except Exception:
+            pass
+
+
+# Child logger level beats the WARNING clamp the Steam client puts on the
+# "httpcore" parent; connect events carry no URLs/keys (host only).
+_conn_logger = logging.getLogger("httpcore.connection")
+_conn_logger.setLevel(logging.DEBUG)
+if not any(isinstance(h, _OpenAIConnBridge) for h in _conn_logger.handlers):
+    _conn_logger.addHandler(_OpenAIConnBridge())
 
 
 class AsyncLLM(StatelessLLMInterface):
