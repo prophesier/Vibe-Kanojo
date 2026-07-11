@@ -860,6 +860,22 @@ class AsyncLLM(StatelessLLMInterface):
             }
         )
 
+    def _log_pool_state(self) -> None:
+        """One [conn] line describing THIS client's connection pool right
+        before a request. The module-level bridge can't tell whose
+        connection a connect event belongs to (embeddings / RAG judge also
+        hit api.openai.com with default 5s-keepalive pools and reconnect
+        every turn by design) — this line disambiguates: the same
+        connection accumulating "Request Count" across turns = the pin
+        holds; an empty pool each turn = the chat connection is being
+        dropped and the image-routing fix is not effective."""
+        try:
+            pool = self.client._client._transport._pool
+            infos = [c.info() for c in pool.connections]
+            logger.info(f"[conn] pool({self.model}): {infos or 'empty'}")
+        except Exception:
+            pass
+
     async def _responses_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -929,6 +945,7 @@ class AsyncLLM(StatelessLLMInterface):
             if extra_body:
                 request_kwargs["extra_body"] = extra_body
 
+            self._log_pool_state()
             while True:
                 try:
                     stream = await self.client.responses.create(**request_kwargs)
