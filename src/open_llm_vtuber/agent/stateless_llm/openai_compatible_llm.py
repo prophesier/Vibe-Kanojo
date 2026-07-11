@@ -4,7 +4,9 @@ endpoints for language generation.
 """
 
 from typing import AsyncIterator, List, Dict, Any
+import json
 import logging
+from pathlib import Path
 import httpx
 from openai import (
     AsyncStream,
@@ -876,6 +878,33 @@ class AsyncLLM(StatelessLLMInterface):
         except Exception:
             pass
 
+    @staticmethod
+    def _maybe_dump_image_request(request_kwargs: Dict[str, Any]) -> None:
+        """Dump the exact body of image-carrying requests for capture-replay
+        debugging of the image-turn cache miss (in-vitro synthesis of the
+        production shape failed to reproduce it four times — replaying the
+        verbatim body and bisecting is the airtight path). Local file only;
+        the body carries no API key. Overwritten per image turn."""
+        try:
+            has_image = any(
+                isinstance(it, dict)
+                and isinstance(it.get("content"), list)
+                and any(
+                    isinstance(b, dict) and b.get("type") == "input_image"
+                    for b in it["content"]
+                )
+                for it in request_kwargs.get("input", [])
+            )
+            if not has_image:
+                return
+            path = Path("cache") / "debug_last_image_request.json"
+            path.parent.mkdir(exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(request_kwargs, f, ensure_ascii=False)
+            logger.info(f"[cache] image request body dumped → {path}")
+        except Exception as e:
+            logger.debug(f"image request dump failed: {e}")
+
     async def _responses_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -946,6 +975,7 @@ class AsyncLLM(StatelessLLMInterface):
                 request_kwargs["extra_body"] = extra_body
 
             self._log_pool_state()
+            self._maybe_dump_image_request(request_kwargs)
             while True:
                 try:
                     stream = await self.client.responses.create(**request_kwargs)
