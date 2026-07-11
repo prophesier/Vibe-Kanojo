@@ -4,12 +4,14 @@ endpoints for language generation.
 """
 
 from typing import AsyncIterator, List, Dict, Any
+import httpx
 from openai import (
     AsyncStream,
     AsyncOpenAI,
     APIError,
     APIConnectionError,
     RateLimitError,
+    DefaultAsyncHttpxClient,
     NotGiven,
     NOT_GIVEN,
 )
@@ -113,11 +115,30 @@ class AsyncLLM(StatelessLLMInterface):
             if self._uses_official_openai_endpoint(base_url)
             else "max_tokens"
         )
+        # Keep ONE TCP connection alive indefinitely instead of httpx's
+        # 5-second keepalive default. OpenAI's LB pins a connection to one
+        # backend, and the prompt cache is per-machine — with a fresh
+        # connection per turn, image-carrying requests get routed to a
+        # separate vision pool and miss the whole cache (probe15: 3/3
+        # deterministic). A surviving connection keeps text AND image turns
+        # on the same machine (probe16: image turn read the full text-written
+        # cache after 150s and 400s idle, no heartbeat needed). Exactly one
+        # keepalive connection: two idle connections could round-robin turns
+        # across two backends and split the cache. If the server closes an
+        # idle connection, the SDK reconnects transparently and the next
+        # turn re-pins — self-healing, worst case is one image-turn miss.
         self.client = AsyncOpenAI(
             base_url=base_url,
             organization=organization_id,
             project=project_id,
             api_key=llm_api_key,
+            http_client=DefaultAsyncHttpxClient(
+                limits=httpx.Limits(
+                    max_connections=20,
+                    max_keepalive_connections=1,
+                    keepalive_expiry=None,
+                ),
+            ),
         )
         self.support_tools = True
 
