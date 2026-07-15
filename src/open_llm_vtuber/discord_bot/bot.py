@@ -24,6 +24,7 @@ from loguru import logger
 from PIL import Image
 
 from .bridge import OLVBridge, TurnResult
+from ..chat_history_manager import get_recent_histories
 
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 # Longest side (px) of the expression face sent to Discord. Downscaled from the
@@ -237,6 +238,49 @@ class DiscordVTuberBot(discord.Client):
                 )
 
         @self._tree.command(
+            name="clip",
+            description="上の会話を切り取って excerpts.json に保存 (両端含む; 0=直上のメッセージ)",
+        )
+        @app_commands.describe(
+            start="近い端: 0 = すぐ上のメッセージ（含む）",
+            end="遠い端: 1 = さらに1つ上（含む）。(0,1)=直近2件, (0,2)=直近3件",
+        )
+        async def clip_cmd(
+            interaction: discord.Interaction,
+            start: int,
+            end: int,
+        ) -> None:
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                record = self._save_clip(start, end, requested_by=str(interaction.user))
+            except ValueError as e:
+                await interaction.followup.send(f"❌ {e}", ephemeral=True)
+                return
+            except Exception as e:
+                logger.exception("clip failed")
+                await interaction.followup.send(f"❌ clip 失败: {e}", ephemeral=True)
+                return
+
+            def _preview(m: dict) -> str:
+                text = (m.get("content") or "").replace("\n", " ")
+                return f"[{m.get('role')}] {text[:60]}{'…' if len(text) > 60 else ''}"
+
+            msgs = record["messages"]
+            lines = [
+                f"✂️ 已保存 **{len(msgs)}** 条 → `chat_history/excerpts.json`",
+                f"id: `{record['id']}`  范围: ({record['requested_range'][0]}, "
+                f"{record['requested_range'][1]})"
+                + ("（超出历史长度,已截到最早一条）" if record["clamped"] else ""),
+                f"首条: {_preview(msgs[0])}",
+            ]
+            if len(msgs) > 1:
+                lines.append(f"末条: {_preview(msgs[-1])}")
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+        @self._tree.command(
             name="status",
             description="Show OLV + Discord bot status (admin only)",
         )
@@ -291,7 +335,9 @@ class DiscordVTuberBot(discord.Client):
             if interaction.user.id != self._admin_user_id:
                 await interaction.response.send_message("Unauthorized.", ephemeral=True)
                 return
-            await interaction.response.defer()  # public: print the report to the channel
+            await (
+                interaction.response.defer()
+            )  # public: print the report to the channel
             target = None if (not model or model == "__all__") else model
             try:
                 embed = await self._build_model_status_embed(target)
@@ -482,6 +528,92 @@ class DiscordVTuberBot(discord.Client):
             **llm_kwargs,
         )
         return await mem.consolidate_facts_to_staged(llm)
+
+    # How many recent sessions /clip flattens into one continuous stream.
+    # Discord shows the conversation without session boundaries, so "count
+    # upward from here" must cross them too.
+    _CLIP_SESSIONS_SPAN = 5
+
+    def _save_clip(self, start: int, end: int, requested_by: str) -> dict:
+        """Cut messages[start..end] out of the recent conversation and append
+        them to the shared excerpts file.
+
+        BOTH ends inclusive, 0 = the message right above, counting upward /
+        back in time — natural-language semantics, deliberately unlike
+        Python slicing: (0,1) = the last two messages, (0,2) = the last
+        three. Role-agnostic by design. Each save is one self-contained
+        record with meta, so entries from different saves never blend.
+
+        The file lives at chat_history/excerpts.json — OUTSIDE the conf_uid
+        directory on purpose: any *.json inside it gets parsed as a session
+        by get_history_list (a known pit).
+        """
+        if start < 0 or end < 0:
+            raise ValueError("参数必须 ≥ 0（0 = 紧邻上面那条）")
+        if start > end:
+            start, end = end, start
+
+        conf_uid = self._full_config.character_config.conf_uid
+        sessions = get_recent_histories(conf_uid, self._CLIP_SESSIONS_SPAN)
+        flat: list[tuple[str, dict]] = [
+            (uid, m) for uid, messages in sessions for m in messages
+        ]
+        total = len(flat)
+        if total == 0:
+            raise ValueError("没有可用的聊天历史")
+        if start >= total:
+            raise ValueError(
+                f"范围超出历史（最近 {self._CLIP_SESSIONS_SPAN} 个会话共 {total} 条）"
+            )
+        requested = [start, end]
+        clamped = end >= total
+        end = min(end, total - 1)
+        picked = flat[total - 1 - end : total - start]
+
+        record = {
+            "id": f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}",
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "requested_range": requested,
+            "clamped": clamped,
+            "requested_by": requested_by,
+            "conf_uid": conf_uid,
+            "sessions": sorted({uid for uid, _ in picked}),
+            "messages": [
+                {
+                    "session": uid,
+                    "role": m.get("role"),
+                    "timestamp": m.get("timestamp"),
+                    "name": m.get("name"),
+                    "content": m.get("content"),
+                }
+                for uid, m in picked
+            ],
+        }
+
+        path = self._project_root / "chat_history" / "excerpts.json"
+        data: dict = {"excerpts": []}
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded.get("excerpts"), list):
+                    data = loaded
+                else:
+                    raise ValueError("unexpected structure")
+            except Exception:
+                # Never overwrite an unreadable file silently — shelve it.
+                backup = path.with_name(f"excerpts.corrupt-{int(time.time())}.json")
+                path.rename(backup)
+                logger.warning(f"excerpts.json unreadable; moved to {backup.name}")
+        data["excerpts"].append(record)
+        path.parent.mkdir(exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        logger.info(
+            f"[clip] saved {len(picked)} message(s) as {record['id']} "
+            f"(range=({start},{end}), sessions={len(record['sessions'])})"
+        )
+        return record
 
     def _find_latest_log(self, prefix: str) -> Optional[Path]:
         logs_dir = self._project_root / "logs"
@@ -880,10 +1012,14 @@ class DiscordVTuberBot(discord.Client):
         if self._monitor_started:
             return
         if cfg is None:
-            logger.info("[model_health] monitor NOT started: no model_health_config in conf.yaml")
+            logger.info(
+                "[model_health] monitor NOT started: no model_health_config in conf.yaml"
+            )
             return
         if not getattr(cfg, "monitor_enabled", False):
-            logger.info("[model_health] monitor NOT started: monitor_enabled=false in conf.yaml")
+            logger.info(
+                "[model_health] monitor NOT started: monitor_enabled=false in conf.yaml"
+            )
             return
         try:
             from ..model_health.monitor import DegradationMonitor, MonitorConfig
@@ -999,7 +1135,9 @@ class DiscordVTuberBot(discord.Client):
                 value=report_block(a.axes, a.status, a.official, floor, cur_drop),
                 inline=False,
             )
-        embed.set_footer(text=f"aistupidlevel + status.claude.com · {datetime.now().strftime('%H:%M:%S')}")
+        embed.set_footer(
+            text=f"aistupidlevel + status.claude.com · {datetime.now().strftime('%H:%M:%S')}"
+        )
         return embed
 
     async def _maybe_send_face(
