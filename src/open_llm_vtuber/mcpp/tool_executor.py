@@ -160,7 +160,7 @@ class ToolExecutor:
         """Execute tools and yield status updates."""
         tool_results_for_llm = []
 
-        logger.info(f"Executing {len(tool_calls)} tool(s) for {caller_mode} caller.")
+        logger.debug(f"Executing {len(tool_calls)} tool(s) for {caller_mode} caller.")
         for call in tool_calls:
             (
                 tool_name,
@@ -171,7 +171,7 @@ class ToolExecutor:
                 parse_error,
             ) = self.parse_tool_call(call)
 
-            logger.info(f"Executing tool: {call}")
+            logger.debug(f"Executing tool: {call}")
 
             if parse_error:
                 logger.warning(
@@ -295,7 +295,7 @@ class ToolExecutor:
             if formatted_result:
                 tool_results_for_llm.append(formatted_result)
 
-        logger.info(
+        logger.debug(
             f"Finished executing tools with {len(tool_results_for_llm)} results."
         )
         yield {"type": "final_tool_results", "results": tool_results_for_llm}
@@ -308,7 +308,7 @@ class ToolExecutor:
         Returns:
             tuple: (is_error, text_content, metadata, content_items)
         """
-        logger.info(f"Executing tool: {tool_name} (ID: {tool_id})")
+        logger.debug(f"Executing tool: {tool_name} (ID: {tool_id})")
         tool_info = self._tool_manager.get_tool(tool_name)
 
         is_error = False
@@ -353,10 +353,10 @@ class ToolExecutor:
                 if not is_error:
                     logger.info(f"Tool '{tool_name}' executed successfully.")
                     if content_items:
-                        logger.info(f"Content items from tool '{tool_name}':")
+                        logger.debug(f"Content items from tool '{tool_name}':")
                         for item in content_items:
                             item_type = item.get("type", "unknown")
-                            logger.info(f"  Type: {item_type}")
+                            logger.debug(f"  Type: {item_type}")
                             for key, value in item.items():
                                 if (
                                     key != "type" and key != "data"
@@ -366,7 +366,7 @@ class ToolExecutor:
                                         if isinstance(value, str) and len(value) > 100
                                         else value
                                     )
-                                    logger.info(f"    {key}: {log_value}")
+                                    logger.debug(f"    {key}: {log_value}")
 
             except (ValueError, RuntimeError, ConnectionError) as e:
                 logger.exception(f"Error executing tool '{tool_name}': {e}")

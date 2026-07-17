@@ -1193,8 +1193,10 @@ class BasicMemoryAgent(AgentInterface):
                 self._pending_rag_block = self._format_diary_rag_block(new_hits)
                 self._session_injected_uids.update(h["uid"] for h in new_hits)
 
-            logger.info(
-                "[diary_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s judged=%s inserted=%s session_total=%d"
+            # Full scored shortlist to the DEBUG file (threshold tuning data);
+            # the console gets only the compact counts line below.
+            logger.debug(
+                "[diary_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s judged=%s inserted=%s"
                 % (
                     query[:30],
                     keywords,
@@ -1211,10 +1213,12 @@ class BasicMemoryAgent(AgentInterface):
                         )
                         for h in hits
                     ],
-                    # what was actually newly injected this turn
                     [h["uid"][:19] for h in new_hits],
-                    len(self._session_injected_uids),
                 )
+            )
+            logger.info(
+                f"[diary_rag] 候補{len(candidates)} → 採用{len(new_hits)} | "
+                f"セッション内日記 {len(self._session_injected_uids)}件"
             )
         except Exception as e:
             logger.warning(f"[diary_rag] retrieval skipped: {e}")
@@ -1304,8 +1308,8 @@ class BasicMemoryAgent(AgentInterface):
                 self._pending_facts_block = self._format_facts_rag_block(new_hits)
                 self._session_injected_fact_ids.update(h["id"] for h in new_hits)
 
-            logger.info(
-                "[facts_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s judged=%s inserted=%s session_total=%d"
+            logger.debug(
+                "[facts_rag] q=%r kw=%s candidates(date,hyb,v,lx)=%s judged=%s inserted=%s"
                 % (
                     query[:30],
                     keywords,
@@ -1321,8 +1325,11 @@ class BasicMemoryAgent(AgentInterface):
                         for h in hits
                     ],
                     [h["id"][:8] for h in new_hits],
-                    len(self._session_injected_fact_ids),
                 )
+            )
+            logger.info(
+                f"[facts_rag] 候補{len(candidates)} → 採用{len(new_hits)} | "
+                f"セッション内facts {len(self._session_injected_fact_ids)}件"
             )
         except Exception as e:
             logger.warning(f"[facts_rag] retrieval skipped: {e}")

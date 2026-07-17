@@ -39,7 +39,7 @@ class ProxyMessageQueue:
         """
         # Store the message along with its sender ID
         queue_item = {"message": message, "sender_id": sender_id}
-        logger.info(
+        logger.debug(
             f"Queuing message: {message.get('text', '')} (active conversation: {self._conversation_active})"
         )
         self.message_queue.append(queue_item)
@@ -103,7 +103,7 @@ class ProxyMessageQueue:
                         message = queue_item["message"]
                         sender_id = queue_item["sender_id"]
 
-                        logger.info(
+                        logger.debug(
                             f"Consumer processing message: {message.get('text', '')}"
                         )
 

@@ -47,7 +47,7 @@ class MCPClient:
         if server_name in self.active_sessions:
             return self.active_sessions[server_name]
 
-        logger.info(f"MCPC: Starting and connecting to server '{server_name}'...")
+        logger.debug(f"MCPC: Starting and connecting to server '{server_name}'...")
         server = self.server_registery.get_server(server_name)
         if not server:
             raise ValueError(
@@ -72,7 +72,7 @@ class MCPClient:
             await session.initialize()
 
             self.active_sessions[server_name] = session
-            logger.info(f"MCPC: Successfully connected to server '{server_name}'.")
+            logger.debug(f"MCPC: Successfully connected to server '{server_name}'.")
             return session
         except Exception as e:
             logger.exception(f"MCPC: Failed to connect to server '{server_name}': {e}")
@@ -107,7 +107,7 @@ class MCPClient:
             Dict containing the metadata and content_items from the tool response.
         """
         session = await self._ensure_server_running_and_get_session(server_name)
-        logger.info(f"MCPC: Calling tool '{tool_name}' on server '{server_name}'...")
+        logger.debug(f"MCPC: Calling tool '{tool_name}' on server '{server_name}'...")
         response = await session.call_tool(tool_name, tool_args)
 
         if response.isError:
@@ -156,14 +156,14 @@ class MCPClient:
 
     async def aclose(self) -> None:
         """Closes all active server connections."""
-        logger.info(
+        logger.debug(
             f"MCPC: Closing client instance and {len(self.active_sessions)} active connections..."
         )
         await self.exit_stack.aclose()
         self.active_sessions.clear()
         self._list_tools_cache.clear()  # Clear cache on close
         self.exit_stack = AsyncExitStack()
-        logger.info("MCPC: Client instance closed.")
+        logger.debug("MCPC: Client instance closed.")
 
     async def __aenter__(self) -> "MCPClient":
         """Enter the async context manager."""

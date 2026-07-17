@@ -228,7 +228,7 @@ class ProxyHandler:
                                 data.get("type") == "control"
                                 and data.get("text") == "conversation-chain-end"
                             ):
-                                logger.info("Received conversation end signal")
+                                logger.debug("Received conversation end signal")
                                 self.message_queue.conversation_active = False
 
                             # Broadcast the message to all clients
@@ -272,7 +272,9 @@ class ProxyHandler:
             if "audio" not in message
             else {
                 **{k: v for k, v in message.items() if k != "audio"},
-                "audio": f"[Audio data, {len(message['audio'])} bytes truncated]" if message.get('audio') is not None else "[silent audio]",
+                "audio": f"[Audio data, {len(message['audio'])} bytes truncated]"
+                if message.get("audio") is not None
+                else "[silent audio]",
             }
         )
 

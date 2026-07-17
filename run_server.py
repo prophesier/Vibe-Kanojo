@@ -26,13 +26,49 @@ def get_version() -> str:
     return pyproject["project"]["version"]
 
 
+# Content-based console highlighting: (substring match → color tag, ruler).
+# First match wins. Colors apply ONLY to the console sink — the mirror and
+# debug file sinks keep their plain formats, so /logs and grepping stay
+# clean. {message} is substituted AFTER markup parsing, so message content
+# can safely contain < > { }.
+_CONSOLE_HIGHLIGHTS = [
+    ("New Conversation Chain", "light-magenta", True),  # turn boundary + ruler
+    ("Conversation Chain", "light-magenta", False),  # ...completed
+    ("User input:", "light-magenta", False),
+    ("[cache]", "yellow", False),
+    ("[thinking]", "cyan", False),
+    ("AI response:", "green", False),
+    ("Tool request:", "light-red", False),
+    ("executed successfully", "light-red", False),
+    ("[diary_rag]", "light-blue", False),
+    ("[facts_rag]", "light-blue", False),
+]
+_TURN_RULER = "─" * 110
+
+
+def _console_format(record) -> str:
+    base = (
+        "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | "
+    )
+    msg = record["message"]
+    for needle, color, ruler in _CONSOLE_HIGHLIGHTS:
+        if needle in msg:
+            prefix = (
+                f"\n<light-magenta>{_TURN_RULER}</light-magenta>\n" if ruler else ""
+            )
+            return f"{prefix}{base}<{color}><b>{{message}}</b></{color}>\n{{exception}}"
+    return base + "{message}\n{exception}"
+
+
 def init_logger(console_log_level: str = "INFO") -> None:
     logger.remove()
     # Console output
     logger.add(
         sys.stderr,
         level=console_log_level,
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> | {message}",
+        format=_console_format,
         colorize=True,
     )
 
