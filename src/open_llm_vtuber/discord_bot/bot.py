@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import subprocess
@@ -78,6 +79,33 @@ def _allowed(value: object, whitelist: Iterable[int]) -> bool:
         return int(value) in whitelist  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return False
+
+
+@contextlib.asynccontextmanager
+async def _tolerant_typing(channel: discord.abc.Messageable):
+    """``channel.typing()`` that never kills the turn.
+
+    The typing indicator is cosmetic, but its FIRST post happens in
+    ``__aenter__`` — 2026-07-17 a Cloudflare 500 on /typing (Discord-side
+    hiccup, retried ~26s by discord.py) aborted a message BEFORE it ever
+    reached OLV. Enter failures downgrade to a warning and the turn
+    proceeds without the indicator; exit failures are swallowed.
+    """
+    cm = channel.typing()
+    entered = False
+    try:
+        await cm.__aenter__()
+        entered = True
+    except Exception as e:
+        logger.warning(f"typing indicator unavailable ({e}); continuing without it")
+    try:
+        yield
+    finally:
+        if entered:
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
 
 
 def _chunk_for_discord(text: str, limit: int = 1900) -> list[str]:
@@ -902,7 +930,7 @@ class DiscordVTuberBot(discord.Client):
             await self._post_reply(message, result)
 
         try:
-            async with message.channel.typing():
+            async with _tolerant_typing(message.channel):
                 await self._bridge.send_text(
                     content,
                     request_id=request_id,
