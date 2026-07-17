@@ -202,8 +202,11 @@ class BasicMemoryAgent(AgentInterface):
         # disk record at startup, then datetime.now() on every _add_message.
         # Drives the 【…経過】/【日付が変わった】time-event banners; message
         # time on purpose, so a client sitting open without messages never
-        # counts as activity.
+        # counts as activity. The user-only baseline exists because date
+        # rollovers must be judged on the model-visible (user-tagged)
+        # timeline — see _time_banner_between.
         self._last_message_dt: Optional[datetime] = None
+        self._last_user_message_dt: Optional[datetime] = None
 
         self._formatted_tools_openai = []
         self._formatted_tools_claude = []
@@ -355,6 +358,8 @@ class BasicMemoryAgent(AgentInterface):
 
         self._memory.append(message_data)
         self._last_message_dt = datetime.now()
+        if role == "user":
+            self._last_user_message_dt = self._last_message_dt
 
     def set_memory_manager(self, manager) -> None:
         """Attach a PersistentMemoryManager for fact extraction and diary injection."""
@@ -418,24 +423,35 @@ class BasicMemoryAgent(AgentInterface):
     _TIME_GAP_BANNER_HOURS = 3
 
     @classmethod
-    def _time_banner_between(cls, prev: datetime, now: datetime) -> str:
-        """One-line time-event banner between two message times, or "".
+    def _time_banner_between(
+        cls, prev: datetime, prev_user: Optional[datetime], now: datetime
+    ) -> str:
+        """One-line time-event banner between message times, or "".
 
         Every message already carries a timestamp tag, but the model tends
         to ignore them; a loud structural banner (the same trick as the
         session banner) is the countermeasure against time hallucinations.
-        Fires when the date rolled over between the messages and/or the gap
-        exceeds _TIME_GAP_BANNER_HOURS. Wording is deliberately 「現在は」
-        (anchored to the message's own moment), not 「今日は」 — the banner
-        is replayed inside history later, where an absolute "today" would
-        become a lie.
+        Wording is deliberately 「現在は」 (anchored to the message's own
+        moment), not 「今日は」 — the banner is replayed inside history
+        later, where an absolute "today" would become a lie.
+
+        TWO baselines on purpose (hiro herself caught the single-baseline
+        bug by inspecting her own history): the gap is measured from the
+        previous message of ANY role, so 「前回のメッセージから」 stays
+        literally true — but the date rollover is judged against the
+        previous USER message. Assistant entries carry no timestamp the
+        model can see, and an assistant reply (or an overnight keepalive
+        nudge) landing just after midnight would otherwise swallow the
+        crossing: the next user message would compare against a
+        post-midnight time and the 【日付が変わった】 banner would never
+        appear anywhere.
 
         Used both live (previous message → the incoming one) and at history
         load (between consecutive disk records), so replayed history keeps
         its banners across restarts.
         """
         gap_hit = (now - prev) >= timedelta(hours=cls._TIME_GAP_BANNER_HOURS)
-        date_changed = now.date() != prev.date()
+        date_changed = prev_user is not None and now.date() != prev_user.date()
         if not (gap_hit or date_changed):
             return ""
         weekdays = ["月", "火", "水", "木", "金", "土", "日"]
@@ -459,7 +475,9 @@ class BasicMemoryAgent(AgentInterface):
         (stored == sent, append-only → cache-safe)."""
         if self._last_message_dt is None:
             return ""
-        return self._time_banner_between(self._last_message_dt, datetime.now())
+        return self._time_banner_between(
+            self._last_message_dt, self._last_user_message_dt, datetime.now()
+        )
 
     # Minimal note that stays bundled with the persona (cache-friendly,
     # rarely changes). Just declares the tag format and that replies must
@@ -891,11 +909,13 @@ class BasicMemoryAgent(AgentInterface):
         # when the first user message of a fresh session comes in.
         self._current_session_banner_added = False
         loaded_uids = []
-        # Previous record's time, carried ACROSS session boundaries — the
-        # time-event banners (date rollover / long gap) are re-derived from
-        # disk timestamps at load, because payload banners live only in
-        # _memory and the on-disk history is clean.
+        # Previous record's time (any role) + previous USER record's time,
+        # carried ACROSS session boundaries — the time-event banners (date
+        # rollover / long gap) are re-derived from disk timestamps at load,
+        # because payload banners live only in _memory and the on-disk
+        # history is clean. Dual baseline: see _time_banner_between.
         prev_dt: Optional[datetime] = None
+        prev_user_dt: Optional[datetime] = None
 
         def _record_dt(msg: Dict[str, Any]) -> Optional[datetime]:
             try:
@@ -910,9 +930,15 @@ class BasicMemoryAgent(AgentInterface):
             # time metadata at all, so the model can't imitate the format).
             if entry["role"] != "user" or prev_dt is None or cur_dt is None:
                 return
-            banner = self._time_banner_between(prev_dt, cur_dt)
+            banner = self._time_banner_between(prev_dt, prev_user_dt, cur_dt)
             if banner:
                 entry["content"] = f"{banner}\n{entry['content']}"
+
+        def _advance(msg: Dict[str, Any], cur_dt: Optional[datetime]) -> None:
+            nonlocal prev_dt, prev_user_dt
+            prev_dt = cur_dt or prev_dt
+            if msg.get("role") == "human":
+                prev_user_dt = cur_dt or prev_user_dt
 
         for uid, messages in sessions:
             loaded_uids.append(uid)
@@ -921,10 +947,10 @@ class BasicMemoryAgent(AgentInterface):
                 entry = self._msg_from_history_record(msg)
                 cur_dt = _record_dt(msg)
                 if not entry:
-                    prev_dt = cur_dt or prev_dt
+                    _advance(msg, cur_dt)
                     continue
                 _with_time_banner(entry, cur_dt)
-                prev_dt = cur_dt or prev_dt
+                _advance(msg, cur_dt)
                 if first_in_session:
                     # Prepend a session-boundary banner so the LLM can tell
                     # where one past session ends and the next begins.
@@ -948,10 +974,10 @@ class BasicMemoryAgent(AgentInterface):
                     entry = self._msg_from_history_record(msg)
                     cur_dt = _record_dt(msg)
                     if not entry:
-                        prev_dt = cur_dt or prev_dt
+                        _advance(msg, cur_dt)
                         continue
                     _with_time_banner(entry, cur_dt)
-                    prev_dt = cur_dt or prev_dt
+                    _advance(msg, cur_dt)
                     if first_in_session:
                         banner = self._session_header_text(current_uid, is_current=True)
                         entry["content"] = f"{banner}\n{entry['content']}"
@@ -960,9 +986,10 @@ class BasicMemoryAgent(AgentInterface):
                     self._memory.append(entry)
             loaded_uids.append(current_uid)
 
-        # Seed the live-path baseline from the newest loaded record, so the
+        # Seed the live-path baselines from the newest loaded records, so the
         # first message after a restart still gets a correct banner.
         self._last_message_dt = prev_dt
+        self._last_user_message_dt = prev_user_dt
 
         # Sessions whose full history is in the sliding window — their diaries
         # are excluded from RAG retrieval (the content is already in context).
