@@ -27,7 +27,11 @@ from ..stateless_llm.openai_compatible_llm import (
     CACHE_SEAM_MARKER,
     AsyncLLM as OpenAICompatibleAsyncLLM,
 )
-from ...chat_history_manager import get_history, get_recent_histories
+from ...chat_history_manager import (
+    get_history,
+    get_recent_histories,
+    search_history,
+)
 from ..transformers import (
     sentence_divider,
     actions_extractor,
@@ -533,13 +537,16 @@ class BasicMemoryAgent(AgentInterface):
     # schemas and are enforced mechanically by the handlers regardless.
     _MEMORY_CAPABILITY_NOTE = (
         "【記憶の管理】自動想起とは別に、過去を自分から調べたい時は "
-        "memory_search（日記全文は memory_read_diary）。検索結果はその"
-        "ターン限りで消える——続けて参照したい分は memory_inject で文脈に"
-        "固定する。会話で判明した事実の保存・訂正は memory_add / "
-        "memory_update（本人の依頼かはっきりした訂正だけ、書き換えは慎重に）。"
-        "削除は本人同意制の memory_delete。追加・修正は検索に即時反映、"
-        "常駐リストへは次回起動から。user印の記憶は本人管理"
-        "（新規作成・削除は不可、内容の修正は可）。"
+        "memory_search（日記全文は memory_read_diary）。記憶に残っていない"
+        "具体的なやりとり・固有名詞は history_search で会話ログ全文を"
+        "キーワード検索できる。どちらも、日付・期間で絞る時は "
+        "date_from/date_to 引数を使い、クエリやキーワードに日付を"
+        "混ぜないこと。検索結果はそのターン限りで消える——続けて参照したい分は "
+        "memory_inject で文脈に固定する。会話で判明した事実の保存・訂正は "
+        "memory_add / memory_update（本人の依頼かはっきりした訂正だけ、"
+        "書き換えは慎重に）。削除は本人同意制の memory_delete。"
+        "追加・修正は検索に即時反映、常駐リストへは次回起動から。"
+        "user印の記憶は本人管理（新規作成・削除は不可、内容の修正は可）。"
     )
 
     # Trailing system block placed right before the message history.
@@ -632,7 +639,8 @@ class BasicMemoryAgent(AgentInterface):
         "「取り消した」「セットした」などと言うことは虚偽報告であり禁止する。\n"
         "- ユーザーに「覚えておいて」と頼まれた、または自分が「覚えておく」と"
         "言いたくなった → 先に memory_add を呼ぶ\n"
-        "- 過去の詳細があいまいなまま語りそうになった → 先に memory_search で調べる\n"
+        "- 過去の詳細があいまいなまま語りそうになった → 先に memory_search か "
+        "history_search（会話ログ全文検索）で調べる\n"
         "- アラームの確認・取消も設定と同様、口頭ではなくツールで行う"
     )
 
@@ -2320,13 +2328,18 @@ class BasicMemoryAgent(AgentInterface):
                         "で文脈に固定すること。importance の意味：user=本人が手動"
                         "管理（毎セッション常駐）/ high=重要（毎セッション常駐）/ "
                         "low=検索・想起された時だけ文脈に入る。"
+                        "日付・期間で絞る時は date_from/date_to を指定し、"
+                        "query 本文に日付を書かないこと。"
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "検索したい内容（自然文でよい）。",
+                                "description": (
+                                    "検索したい内容（自然文でよい。"
+                                    "日付・期間は書かず date_from/to へ）。"
+                                ),
                             },
                             "target": {
                                 "type": "string",
@@ -2337,8 +2350,62 @@ class BasicMemoryAgent(AgentInterface):
                                 "type": "integer",
                                 "description": "対象ごとの最大件数。既定5。",
                             },
+                            "date_from": {
+                                "type": "string",
+                                "description": (
+                                    "YYYY-MM-DD。この日以降に限定"
+                                    "（日記の日付・事実の更新日）。"
+                                ),
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "description": "YYYY-MM-DD。この日以前に限定。",
+                            },
                         },
                         "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "history_search",
+                    "description": (
+                        "過去の会話ログ全文をキーワードで直接検索する"
+                        "（記憶factsや日記に残っていない具体的なやりとり・"
+                        "固有名詞・「言った言わない」の確認はこちら。"
+                        "意味検索ではなく全ログ走査）。"
+                        "複数キーワードは OR——さらに各キーワードは自動で"
+                        "2文字ずつの断片に分解され、会話中の部分的な言及"
+                        "（店名の一部だけ等）にもヒットし、断片の一致率が"
+                        "高いものから順に返る。だから店名・固有名詞は分割せず"
+                        "そのまま1キーワードとして渡してよく、1回の呼び出しで"
+                        "広く当たる。日付・期間で絞る時は date_from/date_to を"
+                        "指定し、キーワードに日付を書かないこと。"
+                        "結果はこのターン限りで消える——残したい内容は"
+                        "返答の中で言及すること。"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "keywords": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "検索語（1〜8個、OR）。固有名詞・フレーズは"
+                                    "そのまま入れる（自動で断片化される）。"
+                                ),
+                            },
+                            "date_from": {
+                                "type": "string",
+                                "description": "YYYY-MM-DD。この日以降のログに限定。",
+                            },
+                            "date_to": {
+                                "type": "string",
+                                "description": "YYYY-MM-DD。この日以前のログに限定。",
+                            },
+                        },
+                        "required": ["keywords"],
                     },
                 },
             },
@@ -2622,6 +2689,7 @@ class BasicMemoryAgent(AgentInterface):
     }
     _MEMORY_TOOL_NAMES = (
         "memory_search",
+        "history_search",
         "memory_add",
         "memory_update",
         "memory_delete",
@@ -3321,7 +3389,11 @@ class BasicMemoryAgent(AgentInterface):
                     str(args.get("query", "")),
                     target=str(args.get("target", "both") or "both"),
                     n=args.get("n", 5),
+                    date_from=str(args.get("date_from", "") or ""),
+                    date_to=str(args.get("date_to", "") or ""),
                 )
+            elif name == "history_search":
+                result = await self._history_search_query(args)
             elif name == "memory_add":
                 result = await mgr.add_fact_manual(
                     str(args.get("fact", "")),
@@ -3363,6 +3435,11 @@ class BasicMemoryAgent(AgentInterface):
         status = result.get("status")
         if name == "memory_search":
             label = f"記憶検索: {_clip(args.get('query'))}"
+        elif name == "history_search":
+            kws = "、".join(
+                str(k).strip() for k in (args.get("keywords") or []) if str(k).strip()
+            )
+            label = f"記憶検索(履歴): {_clip(kws)}"
         elif name == "memory_add":
             label = f"記憶追加: {_clip(args.get('fact'))}"
         elif name == "memory_update":
@@ -3381,6 +3458,25 @@ class BasicMemoryAgent(AgentInterface):
         if status not in ("ok", "pending_approval"):
             label += "(失敗)"
         return f"\n📝 *{label}*\n"
+
+    async def _history_search_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """history_search — keyword full-scan over the chat log (no RAG).
+
+        The scan is synchronous file IO over every stored session, so it runs
+        in a worker thread to keep the event loop responsive."""
+        conf_uid = str(getattr(self._memory_manager, "_conf_uid", "") or "")
+        if not conf_uid:
+            return {"status": "error", "message": "会話ログの場所が特定できない。"}
+        keywords = [
+            str(k).strip() for k in (args.get("keywords") or []) if str(k).strip()
+        ]
+        return await asyncio.to_thread(
+            search_history,
+            conf_uid,
+            keywords,
+            date_from=str(args.get("date_from", "") or "").strip(),
+            date_to=str(args.get("date_to", "") or "").strip(),
+        )
 
     def _memory_read_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Full diary view — read-only, this-turn-only (pin via memory_inject)."""

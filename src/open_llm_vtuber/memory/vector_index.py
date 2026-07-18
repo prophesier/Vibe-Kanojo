@@ -62,11 +62,53 @@ _JA_TOKENIZER = None
 # Common framing / content-light words to drop from extracted keywords. The
 # query "…の記憶を思い出してみて" should reduce to its actual content terms.
 _KW_STOP = {
-    "する", "ある", "いる", "なる", "できる", "みる", "見る", "思う", "思い出す",
-    "覚える", "くる", "来る", "いく", "行く", "言う", "話す", "やる", "くれる",
-    "こと", "もの", "ため", "よう", "とき", "ところ", "今", "私", "あなた", "君",
-    "それ", "これ", "あれ", "どれ", "記憶", "話", "件", "感じ", "気",
-    "今日", "昨日", "明日", "日", "時", "最近", "前", "後", "何", "の",
+    "する",
+    "ある",
+    "いる",
+    "なる",
+    "できる",
+    "みる",
+    "見る",
+    "思う",
+    "思い出す",
+    "覚える",
+    "くる",
+    "来る",
+    "いく",
+    "行く",
+    "言う",
+    "話す",
+    "やる",
+    "くれる",
+    "こと",
+    "もの",
+    "ため",
+    "よう",
+    "とき",
+    "ところ",
+    "今",
+    "私",
+    "あなた",
+    "君",
+    "それ",
+    "これ",
+    "あれ",
+    "どれ",
+    "記憶",
+    "話",
+    "件",
+    "感じ",
+    "気",
+    "今日",
+    "昨日",
+    "明日",
+    "日",
+    "時",
+    "最近",
+    "前",
+    "後",
+    "何",
+    "の",
 }
 
 
@@ -98,7 +140,9 @@ def extract_keywords(text: str) -> List[str]:
                 continue
             if sub in ("非自立", "代名詞", "接尾", "数"):
                 continue
-            base = tok.base_form if tok.base_form and tok.base_form != "*" else tok.surface
+            base = (
+                tok.base_form if tok.base_form and tok.base_form != "*" else tok.surface
+            )
             if len(base) <= 1 or base in _KW_STOP:
                 continue
             out.append(base)
@@ -164,7 +208,9 @@ class VectorIndex:
             with open(self._store_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
         except Exception as e:
-            logger.warning(f"[vector_index] Corrupt index {self._store_path}, rebuilding: {e}")
+            logger.warning(
+                f"[vector_index] Corrupt index {self._store_path}, rebuilding: {e}"
+            )
             self._rebuild_matrix([])
             return
 
@@ -276,9 +322,13 @@ class VectorIndex:
                 f"text-filled {filled} ({self._store_path}, total {len(self._ids)})"
             )
         except Exception as e:
-            logger.warning(f"[vector_index] ensure_indexed failed ({self._store_path}): {e}")
+            logger.warning(
+                f"[vector_index] ensure_indexed failed ({self._store_path}): {e}"
+            )
 
-    async def add(self, uid: str, text: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    async def add(
+        self, uid: str, text: str, meta: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Embed and append a single item (e.g. a freshly written diary)."""
         if not uid or not text or uid in self._meta:
             return
@@ -293,7 +343,8 @@ class VectorIndex:
         """Embed and append several items at once (e.g. all chunks of one new
         diary), in a single batched embedding call. Skips ids already present."""
         new = [
-            it for it in items
+            it
+            for it in items
             if it.get("id") and it.get("text") and it["id"] not in self._meta
         ]
         if not new:
@@ -318,8 +369,15 @@ class VectorIndex:
         group_by: Optional[str] = None,
         lexical_weight: float = 0.5,
         keywords: Optional[List[str]] = None,
+        date_range: Optional[tuple] = None,
     ) -> tuple:
         """Return ``(picked, candidates)`` for ``query`` using hybrid scoring.
+
+        ``date_range=(date_from, date_to)`` (each "YYYY-MM-DD" or "") prefilters
+        entries by their ``meta.date`` BEFORE scoring — entries outside the
+        range (or without a date, when a range is active) are skipped entirely,
+        so the top-n comes from in-range entries instead of being filtered
+        after selection.
 
         Score per entry = ``cosine + lexical_weight · lexical``, where lexical is
         the query↔text character-bigram overlap (0..1). Dense embeddings barely
@@ -349,7 +407,9 @@ class VectorIndex:
         try:
             qvec = (await self._embed([query]))[0]
         except Exception as e:
-            logger.warning(f"[vector_index] query embed failed ({self._store_path}): {e}")
+            logger.warning(
+                f"[vector_index] query embed failed ({self._store_path}): {e}"
+            )
             return [], []
 
         qnorm = float(np.linalg.norm(qvec)) or 1.0
@@ -381,6 +441,14 @@ class VectorIndex:
             key = meta.get(group_by, uid) if group_by else uid
             if key in exclude_ids:
                 continue
+            if date_range is not None:
+                day = str(meta.get("date", ""))[:10]
+                if not day:
+                    continue
+                if (date_range[0] and day < date_range[0]) or (
+                    date_range[1] and day > date_range[1]
+                ):
+                    continue
             v = float(scores[i])
             if not lexical_weight:
                 lx = 0.0
@@ -474,7 +542,9 @@ class VectorIndex:
         self._texts[uid] = text
         n = float(np.linalg.norm(vec)) or 1.0
         normed = vec / n
-        self._normed = normed if self._normed.size == 0 else np.vstack([self._normed, normed])
+        self._normed = (
+            normed if self._normed.size == 0 else np.vstack([self._normed, normed])
+        )
 
     def _drop(self, ids: set) -> None:
         keep = [i for i, uid in enumerate(self._ids) if uid not in ids]
@@ -482,5 +552,9 @@ class VectorIndex:
         for uid in ids:
             self._meta.pop(uid, None)
             self._texts.pop(uid, None)
-        self._vectors = self._vectors[keep] if keep else np.zeros((0, 0), dtype=np.float32)
-        self._normed = self._normed[keep] if keep else np.zeros((0, 0), dtype=np.float32)
+        self._vectors = (
+            self._vectors[keep] if keep else np.zeros((0, 0), dtype=np.float32)
+        )
+        self._normed = (
+            self._normed[keep] if keep else np.zeros((0, 0), dtype=np.float32)
+        )

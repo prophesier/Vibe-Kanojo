@@ -2,6 +2,7 @@ import os
 import re
 import json
 import uuid
+import unicodedata
 from datetime import datetime
 from typing import Literal, List, TypedDict, Optional
 from loguru import logger
@@ -401,6 +402,225 @@ def get_latest_history_uid(conf_uid: str) -> str:
     """
     recent = get_recent_histories(conf_uid, 1)
     return recent[-1][0] if recent else ""
+
+
+# ---------------------------------------------------------------------------
+# history_search — keyword full-scan over the chat log (memory-tool family).
+#
+# Deliberately NOT RAG: the corpus is too large to embed and the use case is
+# exact recall ("did we talk about X"), so a plain scan wins. Matching is
+# OR + automatic bigram fragmentation: each keyword is split into contiguous
+# 2-char fragments and a message containing ANY fragment is a candidate,
+# ranked by fragment coverage. This is what makes a single call with the full
+# shop name hit conversations that only ever mentioned part of it — the
+# calling model is lazy with tools and won't retry with sub-strings itself.
+# ---------------------------------------------------------------------------
+
+_SEARCH_BUDGET_CHARS = 2800
+_SEARCH_MAX_BLOCKS = 8
+_SEARCH_MAX_KEYWORDS = 8
+_SEARCH_BLOCK_MAX_MSGS = 7  # merged-block span cap (common-word searches)
+_HIT_WINDOW = 160  # chars shown for the matched message, centered on the hit
+_NEIGHBOR_WINDOW = 120  # chars shown for ±1 neighbor messages
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _search_norm(text: str) -> str:
+    """Normalize for matching: NFKC (full/half-width) + lowercase."""
+    return unicodedata.normalize("NFKC", text or "").lower()
+
+
+def _search_fragments(keyword_norm: str) -> set:
+    """Contiguous 2-char fragments of a normalized keyword (whitespace removed).
+    Single-char keywords return an empty set — handled as whole-substring."""
+    compact = "".join(keyword_norm.split())
+    return {compact[i : i + 2] for i in range(len(compact) - 1)}
+
+
+def _search_coverage(
+    msg_norm: str, msg_fragments: set, kw_norm: str, kw_fragments: set
+) -> float:
+    """Fraction of the keyword's fragments present in the message (0..1)."""
+    if not kw_fragments:  # single-char keyword
+        compact = "".join(kw_norm.split())
+        return 1.0 if compact and compact in msg_norm else 0.0
+    return len(kw_fragments & msg_fragments) / len(kw_fragments)
+
+
+def _search_snippet(
+    content: str, keywords_norm: List[str], width: int, is_hit: bool
+) -> str:
+    """One-line excerpt of a message. Hit messages get a window centered on the
+    first keyword (or keyword-fragment) occurrence; neighbors get the head."""
+    text = content or ""
+    pos = 0
+    if is_hit:
+        # Position search on .lower() (length-preserving in practice, unlike
+        # NFKC) so the window indexes the original text. Best-effort: a
+        # full-width-only match falls back to the message head.
+        low = text.lower()
+        found = -1
+        for kw in keywords_norm:
+            compact = "".join(kw.split())
+            if compact:
+                found = low.find(compact)
+                if found >= 0:
+                    break
+        if found < 0:
+            for kw in keywords_norm:
+                compact = "".join(kw.split())
+                for i in range(len(compact) - 1):
+                    found = low.find(compact[i : i + 2])
+                    if found >= 0:
+                        break
+                if found >= 0:
+                    break
+        if found >= 0:
+            pos = max(0, found - width // 2)
+    start, end = pos, pos + width
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    return prefix + " ".join(text[start:end].split()) + suffix
+
+
+def search_history(
+    conf_uid: str,
+    keywords: List[str],
+    date_from: str = "",
+    date_to: str = "",
+) -> dict:
+    """Keyword search over ALL stored sessions of a conf (full scan, no index).
+
+    Returns ``{"status", "total_hits", "shown_hits", "text"}`` where ``text``
+    is the ready-to-read report: header (全N件中 K件表示 + narrowing hint),
+    then blocks newest-first. A block is a matched message ±1 neighbor
+    (overlapping/adjacent blocks in the same session are merged), each message
+    clipped to a short excerpt, hit lines prefixed with ►. Budgets: max
+    ``_SEARCH_MAX_BLOCKS`` blocks / ~``_SEARCH_BUDGET_CHARS`` chars — blocks
+    are SELECTED by coverage score (then recency) but DISPLAYED newest-first,
+    with whole oldest blocks dropped when over budget.
+    """
+    keywords = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    if not keywords:
+        return {"status": "error", "message": "keywords が空。"}
+    keywords = keywords[:_SEARCH_MAX_KEYWORDS]
+    for d, label in ((date_from, "date_from"), (date_to, "date_to")):
+        if d and not _DATE_RE.match(d):
+            return {
+                "status": "error",
+                "message": f"{label} は YYYY-MM-DD 形式で指定すること: {d!r}",
+            }
+
+    kw_norm = [_search_norm(k)[:40] for k in keywords]
+    kw_frags = [_search_fragments(k) for k in kw_norm]
+
+    # ---- scan: flatten all sessions, score every message -------------------
+    # sessions: uid -> list of raw messages; hits: (score, ts, uid, index)
+    sessions: dict = {}
+    hits: List[tuple] = []
+    for entry in get_history_list(conf_uid):  # newest-first
+        uid = entry["uid"]
+        messages = get_history(conf_uid, uid, quiet=True)
+        if not messages:
+            continue
+        sessions[uid] = messages
+        for idx, msg in enumerate(messages):
+            content = str(msg.get("content", ""))
+            if not content:
+                continue
+            ts = str(msg.get("timestamp", ""))
+            day = ts[:10]
+            if date_from and (not day or day < date_from):
+                continue
+            if date_to and (not day or day > date_to):
+                continue
+            msg_norm = _search_norm(content)
+            msg_frags = _search_fragments(msg_norm)
+            score = 0.0
+            for kn, kf in zip(kw_norm, kw_frags):
+                score += _search_coverage(msg_norm, msg_frags, kn, kf)
+            if score > 0.0:
+                hits.append((score, ts, uid, idx))
+
+    total_hits = len(hits)
+    if total_hits == 0:
+        hint = "ヒットなし。別の語・より特徴的な語で試すこと。"
+        if date_from or date_to:
+            hint += "期間指定（date_from/date_to）を外すか広げるのも有効。"
+        return {"status": "ok", "total_hits": 0, "shown_hits": 0, "text": hint}
+
+    # ---- select blocks by (coverage desc, recency desc) --------------------
+    hits.sort(key=lambda h: (h[0], h[1]), reverse=True)  # score desc, ts desc
+    # blocks: per session, list of [start, end, set(hit_indexes)]
+    blocks: dict = {}
+    n_blocks = 0
+    for _score, _ts, uid, idx in hits:
+        last = len(sessions[uid]) - 1
+        start, end = max(0, idx - 1), min(last, idx + 1)
+        merged = False
+        for blk in blocks.get(uid, []):
+            if start <= blk[1] + 1 and end >= blk[0] - 1:
+                new_start, new_end = min(blk[0], start), max(blk[1], end)
+                if new_end - new_start + 1 <= _SEARCH_BLOCK_MAX_MSGS:
+                    blk[0], blk[1] = new_start, new_end
+                    blk[2].add(idx)
+                elif blk[0] <= idx <= blk[1]:
+                    # already inside a full block — mark as hit, don't grow
+                    blk[2].add(idx)
+                # else: adjacent to a full block — drop from display (a
+                # separate block would duplicate lines); still in total_hits
+                merged = True
+                break
+        if not merged:
+            if n_blocks >= _SEARCH_MAX_BLOCKS:
+                continue
+            blocks.setdefault(uid, []).append([start, end, {idx}])
+            n_blocks += 1
+
+    # ---- render newest-first under the char budget -------------------------
+    rendered: List[tuple] = []  # (block_ts, text, n_hit_msgs)
+    for uid, blks in blocks.items():
+        for start, end, hit_idxs in blks:
+            msgs = sessions[uid]
+            ts = str(msgs[start].get("timestamp", ""))
+            header = f"〔{ts[:16].replace('T', ' ')}〕"
+            lines = [header]
+            for i in range(start, end + 1):
+                m = msgs[i]
+                name = m.get("name") or (
+                    "ユーザー" if m.get("role") == "human" else "AI"
+                )
+                is_hit = i in hit_idxs
+                width = _HIT_WINDOW if is_hit else _NEIGHBOR_WINDOW
+                snippet = _search_snippet(
+                    str(m.get("content", "")), kw_norm, width, is_hit
+                )
+                lines.append(f"{'► ' if is_hit else ''}{name}: {snippet}")
+            rendered.append((ts, "\n".join(lines), len(hit_idxs)))
+    rendered.sort(key=lambda b: b[0], reverse=True)
+
+    shown_blocks: List[str] = []
+    shown_hits = 0
+    used = 0
+    for _ts, text, n_hit in rendered:
+        if shown_blocks and used + len(text) > _SEARCH_BUDGET_CHARS:
+            break
+        shown_blocks.append(text)
+        shown_hits += n_hit
+        used += len(text)
+
+    header = f"全{total_hits}件ヒット中 {shown_hits}件を表示（新しい順）。"
+    if shown_hits < total_hits:
+        header += (
+            "表示しきれない分がある——date_from/date_to で期間を絞るか、"
+            "より特徴的な語で検索し直すと精度が上がる。"
+        )
+    return {
+        "status": "ok",
+        "total_hits": total_hits,
+        "shown_hits": shown_hits,
+        "text": header + "\n\n" + "\n\n".join(shown_blocks),
+    }
 
 
 def rename_history_file(

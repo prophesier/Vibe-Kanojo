@@ -847,7 +847,12 @@ class PersistentMemoryManager:
         return {"status": "error", "message": f"id {fact_id} の記憶が見つからない。"}
 
     async def search_memory_tool(
-        self, query: str, target: str = "both", n: int = 5
+        self,
+        query: str,
+        target: str = "both",
+        n: int = 5,
+        date_from: str = "",
+        date_to: str = "",
     ) -> Dict[str, Any]:
         """Explicit memory search for the memory_search tool.
 
@@ -855,6 +860,10 @@ class PersistentMemoryManager:
         tuned thresholds (thresholds -1 → always return the top-n): an
         explicit lookup wants recall, and the character judges relevance
         itself. Fact hits carry the id used by memory_update/memory_delete.
+
+        ``date_from``/``date_to`` ("YYYY-MM-DD") prefilter candidates by date
+        metadata (diary date / fact updated-date) BEFORE ranking, so the model
+        can scope a period without polluting the semantic query with dates.
         """
         query = (query or "").strip()
         if not query:
@@ -863,9 +872,20 @@ class PersistentMemoryManager:
             n = max(1, min(int(n or 5), 10))
         except (TypeError, ValueError):
             n = 5
+        date_from = (date_from or "").strip()
+        date_to = (date_to or "").strip()
+        for d, label in ((date_from, "date_from"), (date_to, "date_to")):
+            if d and not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+                return {
+                    "status": "error",
+                    "message": f"{label} は YYYY-MM-DD 形式で指定すること: {d!r}",
+                }
+        date_range = (date_from, date_to) if (date_from or date_to) else None
         keywords = extract_keywords(query)
         embed_q = " ".join(keywords) if keywords else query
         out: Dict[str, Any] = {"status": "ok", "query": query}
+        if date_range:
+            out["date_filter"] = f"{date_from or '...'} 〜 {date_to or '...'}"
 
         if target in ("facts", "both"):
             if self._facts_index is None:
@@ -886,6 +906,7 @@ class PersistentMemoryManager:
                     debug_k=n,
                     lexical_weight=getattr(self._facts_rag_cfg, "lexical_weight", 0.5),
                     keywords=keywords,
+                    date_range=date_range,
                 )
                 out["facts"] = [
                     {
@@ -914,6 +935,7 @@ class PersistentMemoryManager:
                     debug_k=n,
                     lexical_weight=getattr(self._rag_cfg, "lexical_weight", 0.5),
                     keywords=keywords,
+                    date_range=date_range,
                 )
                 diaries = []
                 for h in hits:
