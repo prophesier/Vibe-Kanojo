@@ -72,14 +72,17 @@ async def _run(coro, what: str):
 
 @mcp.tool()
 async def uber_search(keyword: str) -> str:
-    """Uber Eats（日本）で店舗を検索する。料理名・店名などのキーワードで、配達可能な
-    店舗の一覧（店名・評価・store_uuid）を返す。これは閲覧専用で、注文や支払いはできない。
-    気になる店があれば、その store_uuid を uber_store に渡すとメニューを見られる。
-    返り値はあなたの参照用で会話には残らないので、伝えたいことは返信本文に書くこと。
-    ［PR］が付く店はスポンサー（広告枠）の店。
-    配送費に「Uber One」と付く店は会員特典価格。閲覧用アカウントはUber One非加入だが、
-    ユーザー本人はUber One会員なので、その特典価格（=通常より安い/無料）がユーザーの
-    実際の支払額になる。「通常¥…」は非会員の参考価格。"""
+    """Search Uber Eats (Japan) for stores. Takes a keyword such as a dish name
+    or store name and returns a list of deliverable stores (name, rating,
+    store_uuid). Browse-only: you cannot order or pay. If a store looks
+    interesting, pass its store_uuid to uber_store to see the menu.
+    The return value is for your reference and does not stay in the
+    conversation, so write anything you want to convey in your reply itself.
+    Stores marked ［PR］ are sponsored (ad slots).
+    A store whose delivery fee is marked "Uber One" is showing the member price.
+    The browsing account is not an Uber One member, but the user himself is, so
+    that member price (cheaper than usual, or free) is what the user actually
+    pays. "通常¥…" is the reference price for non-members."""
     ok, data = await _run(_client.search(keyword), f"uber_search({keyword!r})")
     if not ok:
         return f"検索できませんでした: {data}"
@@ -114,11 +117,14 @@ async def uber_search(keyword: str) -> str:
 
 @mcp.tool()
 async def uber_store(store_uuid: str) -> str:
-    """指定した store_uuid の店舗のメニューを取得する。store_uuid は uber_search の
-    結果から渡す。店名・評価・配達目安と、メニュー（カテゴリ・料理名・価格・好評率）を返す。
-    各商品の「好評率」は「ライク」（高評価）の割合で、評価数も併記される——リピート率ではない。
-    閲覧専用で、注文や支払いはできない。
-    返り値はあなたの参照用で会話には残らないので、伝えたいことは返信本文に書くこと。"""
+    """Get the menu of the store with the given store_uuid. Pass a store_uuid
+    from the uber_search results. Returns the store name, rating, delivery
+    estimate, and the menu (categories, dish names, prices, like rate).
+    Each item's "好評率" is the share of "likes" (positive ratings), shown with
+    the rating count — it is not a repeat-order rate.
+    Browse-only: you cannot order or pay.
+    The return value is for your reference and does not stay in the
+    conversation, so write anything you want to convey in your reply itself."""
     ok, data = await _run(_client.store(store_uuid), f"uber_store({store_uuid!r})")
     if not ok:
         return f"メニューを取得できませんでした: {data}"
@@ -211,12 +217,15 @@ def _fmt_catalog_item(it: dict) -> str:
 async def uber_category(
     store_uuid: str, section_uuid: str, subsection_uuid: str = "", offset: int = 0
 ) -> str:
-    """コンビニ／スーパーなど商品数が多い店で、カテゴリの中身を見る。uber_store が返した
-    カテゴリの section_uuid を渡す。まずサブカテゴリ（細分類）の一覧が返るので、その中の
-    subsection_uuid を渡すと、そのサブカテゴリの商品（商品名・価格）が表示される。
-    サブカテゴリが無いカテゴリは、そのまま商品が表示される。offset で続きを取得できる。
-    閲覧専用で、注文や支払いはできない。
-    返り値はあなたの参照用で会話には残らないので、伝えたいことは返信本文に書くこと。"""
+    """Look inside a category at stores with many items, such as convenience
+    stores and supermarkets. Pass the section_uuid of a category returned by
+    uber_store. You first get a list of subcategories; pass one of their
+    subsection_uuid values to see that subcategory's items (name and price).
+    Categories without subcategories show their items directly. Use offset to
+    page further.
+    Browse-only: you cannot order or pay.
+    The return value is for your reference and does not stay in the
+    conversation, so write anything you want to convey in your reply itself."""
     ok, data = await _run(
         _client.catalog(store_uuid, section_uuid, subsection_uuid, offset),
         f"uber_category({section_uuid!r},{subsection_uuid!r})",
@@ -240,7 +249,11 @@ async def uber_category(
     # Otherwise show items (a subcategory was chosen, or the category has none).
     if chose_sub:
         cur = next(
-            (s["title"] for s in subs if s["subsection_uuid"] == subsection_uuid.strip()),
+            (
+                s["title"]
+                for s in subs
+                if s["subsection_uuid"] == subsection_uuid.strip()
+            ),
             "",
         )
         if cur:
@@ -257,10 +270,12 @@ async def uber_category(
 
 @mcp.tool()
 async def uber_item(store_uuid: str, item_uuid: str) -> str:
-    """商品の詳細を取得する。store_uuid と item_uuid（uber_store の結果で「⚙」が付いた
-    商品に表示される）を渡す。トッピング・セット内容・サイズなどの選択肢（と追加料金）を返す。
-    閲覧専用で、注文や支払いはできない。
-    返り値はあなたの参照用で会話には残らないので、伝えたいことは返信本文に書くこと。"""
+    """Get an item's details. Pass store_uuid and item_uuid (shown for items
+    marked "⚙" in the uber_store results). Returns the available options and
+    their surcharges: toppings, set contents, sizes, and so on.
+    Browse-only: you cannot order or pay.
+    The return value is for your reference and does not stay in the
+    conversation, so write anything you want to convey in your reply itself."""
     ok, data = await _run(
         _client.item(store_uuid, item_uuid), f"uber_item({item_uuid!r})"
     )

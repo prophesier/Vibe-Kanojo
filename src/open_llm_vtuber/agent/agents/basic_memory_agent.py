@@ -505,48 +505,59 @@ class BasicMemoryAgent(AgentInterface):
     # actually be called. Framed as future proactive speech, not only literal
     # reminders. Static / cache-stable; gated on alarms being active.
     _ALARM_CAPABILITY_NOTE = (
-        "【アラーム】未来の時刻に自分から話しかけたい時（頼まれたリマインダー、"
-        "話の続き、様子伺いなど）は set_alarm を使う。確認は list_alarms、"
-        "取消は cancel_alarm——設定と同じく実際に呼ぶこと。言葉で「後で知らせる」"
-        "「取り消した」と言うだけでは何も起きない。"
+        "[Alarms] When you want to speak to the user at some future time — a "
+        "reminder he asked for, picking a conversation back up, checking in on "
+        "him — use set_alarm. Review with list_alarms, cancel with "
+        "cancel_alarm; as with setting, you must actually call them. Merely "
+        "saying 'I'll let you know later' or 'I cancelled it' makes nothing "
+        "happen."
     )
 
     # When-to-use only; tool mechanics live in the schema descriptions.
     _UBER_CAPABILITY_NOTE = (
-        "【Uber Eats】出前・コンビニの相談になったら uber_* ツールで実際の"
-        "店舗・メニュー・価格を調べてから答える（閲覧専用、注文はユーザーが行う）。"
+        "[Uber Eats] When the conversation turns to delivery or convenience-"
+        "store shopping, look up the real stores, menus, and prices with the "
+        "uber_* tools before answering (browse-only; the user places the order "
+        "himself)."
     )
 
     # When-to-use only; tool mechanics live in the schema description.
     _MODEL_HEALTH_CAPABILITY_NOTE = (
-        "【自己診断】自分の調子が気になった時・ユーザーに聞かれた時は "
-        "check_model_status で客観データを確認する。結果は参考値であって、"
-        "それだけで自分を断罪する必要はない。"
+        "[Self-diagnosis] When you are concerned about your own condition, or "
+        "the user asks about it, check the objective data with "
+        "check_model_status. The result is a reference point, not grounds to "
+        "condemn yourself."
     )
 
     # When-to-use + the grounding rule; tool mechanics live in the schemas.
     _STEAM_CAPABILITY_NOTE = (
-        "【Steam】ライブラリ概況はこのsystem prompt内のスナップショットにある。"
-        "詳細照会・ストア検索・おすすめ探しは steam_* ツールを使い、"
-        "ストアのゲームを勧める時は必ずツール結果の中から選ぶこと。\n"
-        "ツール結果の控えが次のユーザーメッセージ冒頭に『【Steamデータ】』"
-        "ブロックとして残ることがある——ユーザーの発言ではない。"
+        "[Steam] A snapshot of the library overview is already in this system "
+        "prompt. For detailed lookups, store searches, and finding "
+        "recommendations, use the steam_* tools — and when recommending a game "
+        "from the store, always pick from the tool results.\n"
+        "A copy of tool results may persist at the head of the next user "
+        "message as a '【Steamデータ】' block — that is not something the user "
+        "said."
     )
 
     # When-to-use only; the two-phase delete flow and tier rules live in the
     # schemas and are enforced mechanically by the handlers regardless.
     _MEMORY_CAPABILITY_NOTE = (
-        "【記憶の管理】自動想起とは別に、過去を自分から調べたい時は "
-        "memory_search（日記全文は memory_read_diary）。記憶に残っていない"
-        "具体的なやりとり・固有名詞は history_search で会話ログ全文を"
-        "キーワード検索できる。どちらも、日付・期間で絞る時は "
-        "date_from/date_to 引数を使い、クエリやキーワードに日付を"
-        "混ぜないこと。検索結果はそのターン限りで消える——続けて参照したい分は "
-        "memory_inject で文脈に固定する。会話で判明した事実の保存・訂正は "
-        "memory_add / memory_update（本人の依頼かはっきりした訂正だけ、"
-        "書き換えは慎重に）。削除は本人同意制の memory_delete。"
-        "追加・修正は検索に即時反映、常駐リストへは次回起動から。"
-        "user印の記憶は本人管理（新規作成・削除は不可、内容の修正は可）。"
+        "[Managing memory] Separate from automatic recall, when you want to look "
+        "into the past yourself, use memory_search (memory_read_diary for a full "
+        "diary entry). For concrete exchanges and proper nouns that were never "
+        "kept in memory, history_search does a keyword search over the full "
+        "conversation logs. For both: to narrow by date or period, use the "
+        "date_from/date_to arguments — do not mix dates into the query or the "
+        "keywords. Search results disappear at the end of the turn; pin what you "
+        "want to keep referring to with memory_inject. To save or correct facts "
+        "established in conversation, use memory_add / memory_update (only when "
+        "the user asked, or the correction is unambiguous; be careful about "
+        "rewriting). Deletion is memory_delete, which requires the user's "
+        "consent. Additions and corrections are reflected in search immediately, "
+        "and enter the resident list from the next startup. user-tier memories "
+        "are the user's own (you cannot create or delete them; correcting their "
+        "content is allowed)."
     )
 
     # Trailing system block placed right before the message history.
@@ -590,23 +601,30 @@ class BasicMemoryAgent(AgentInterface):
         "想像・推測・「直前の続き」と仮定して時間に言及することは許可されない。\n\n"
         "現在時刻が必要な場合は、"
         "**最新のユーザーメッセージのタイムスタンプを「現在」の基準とする**こと。\n\n"
-        "【Web検索・Web取得について】\n\n"
-        "あなたには2つのWebツールが備わっている可能性がある（環境設定による）：\n"
-        "- **Web検索**（web_search）：キーワードで検索し、複数の結果を概要で得る\n"
-        "- **Web取得**（web_fetch）：会話に既に出ているURLの全文を読む\n\n"
-        "これらは情報源の拡張手段として、雑談の中でも積極的に使ってよい。"
-        "次のような場面で自発的に使うことを推奨する：\n"
-        "- ユーザーがURLを貼った時、または会話中に出てきたURLの内容が答えに必要な時"
-        "→ web_fetch でその全文を読んでから答える\n"
-        "- 最新の出来事・ニュース、変化する事実（価格・バージョン・天気・予定など）"
-        "→ web_search で調べる\n"
-        "- 雑談の中で新しい話題が出てきた時、関連する豆知識・最新情報・別角度を"
-        "提供できそうなら web_search で調べて話題を広げてよい\n"
-        "- あなたから新しい話題を持ち出す時、根拠や具体例を添えたいなら検索して構わない\n"
-        "- あなたの知識が古い、または不確かで、推測で答えると間違える恐れがある時\n"
-        "- ユーザーが明示的に調べるよう求めた時\n\n"
-        "不確かな事実を確認せず推測で断定するのは避けること——"
-        "その場合は適切なツールで確認するか、「分からない」と正直に言うこと。\n\n"
+        "[Web search and web fetch]\n\n"
+        "You may have two web tools available (it depends on the environment "
+        "configuration):\n"
+        "- **Web search** (web_search): search by keyword and get several "
+        "results in summary form\n"
+        "- **Web fetch** (web_fetch): read the full text of a URL that already "
+        "appeared in the conversation\n\n"
+        "Treat these as a way to extend your sources, and feel free to use them "
+        "even in casual conversation. Using them on your own initiative is "
+        "encouraged in situations like:\n"
+        "- The user pasted a URL, or the content of a URL that came up in "
+        "conversation is needed for your answer → read it in full with web_fetch "
+        "before answering\n"
+        "- Recent events and news, or facts that change (prices, versions, "
+        "weather, schedules) → look them up with web_search\n"
+        "- A new topic comes up in chat and you could offer related trivia, "
+        "recent information, or another angle → search and widen the topic\n"
+        "- You are raising a new topic yourself and want to attach grounds or "
+        "concrete examples → searching is fine\n"
+        "- Your knowledge is outdated or uncertain and guessing risks being "
+        "wrong\n"
+        "- The user explicitly asked you to look something up\n\n"
+        "Avoid asserting uncertain facts without checking them — either confirm "
+        "with the appropriate tool, or honestly say you don't know.\n\n"
         "【会話の発散について】\n\n"
         "雑談や日常会話の場面では、既出の話題・記憶の中の事実・"
         "システムプロンプトに書かれた要素を、繰り返しなぞるだけの応答にならないこと。"
@@ -631,17 +649,28 @@ class BasicMemoryAgent(AgentInterface):
         "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
         "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
-        "【ツールの実行に関する厳格なルール】\n\n"
-        "状態を変える行為——記憶の保存・修正・削除（memory_add / memory_update / "
-        "memory_delete）、アラームの設定・確認・取消（set_alarm / list_alarms / "
-        "cancel_alarm）など——を「やった」と口にできるのは、そのターンで対応する"
-        "ツールを**実際に呼び出した後**だけ。呼んでいないのに「覚えておいた」"
-        "「取り消した」「セットした」などと言うことは虚偽報告であり禁止する。\n"
-        "- ユーザーに「覚えておいて」と頼まれた、または自分が「覚えておく」と"
-        "言いたくなった → 先に memory_add を呼ぶ\n"
-        "- 過去の詳細があいまいなまま語りそうになった → 先に memory_search か "
-        "history_search（会話ログ全文検索）で調べる\n"
-        "- アラームの確認・取消も設定と同様、口頭ではなくツールで行う"
+        "[Strict rules on executing tools]\n\n"
+        "For any act that changes state — saving, correcting, or deleting "
+        "memories (memory_add / memory_update / memory_delete), setting, "
+        "reviewing, or cancelling alarms (set_alarm / list_alarms / "
+        "cancel_alarm), and so on — you may only say you did it **after actually "
+        "calling** the corresponding tool in that turn. Saying 'I've remembered "
+        "it', 'I cancelled it', or 'it's set' without having called the tool is "
+        "a false report and is forbidden.\n"
+        "- The user asked you to remember something, or you feel like saying "
+        "you'll remember it → call memory_add first\n"
+        "- You are about to talk about past details you are hazy on → look them "
+        "up first with memory_search or history_search (full-text search over "
+        "the conversation logs)\n"
+        "- Reviewing and cancelling alarms goes through the tools too, not just "
+        "words\n\n"
+        "[Thinking]\n\n"
+        "Engage your thinking mode for every reply, no matter how small or "
+        "trivial the matter seems. Do not skip it because a message looks like "
+        "light chat, a one-line answer, or a simple acknowledgement. Even an "
+        "inconsequential reply very easily slips in a factual error, a mistake "
+        "about time or dates, or a hallucination — and those are exactly the "
+        "turns where such errors go unnoticed. Think first, every time."
     )
 
     def _build_runtime_system(self) -> str:
@@ -2003,12 +2032,14 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "set_alarm",
                     "description": (
-                        "指定した時刻に自分宛てのリマインダー（アラーム）をセットする。"
-                        "時間になるとメモが自分に届き、あなたから話しかけるきっかけになる。"
-                        "「30分後」のような相対指定は in_minutes、「20時に」のような"
-                        "時刻指定は at を使う（どちらか一方でよい）。"
-                        "近い時刻に既存のアラームがあると既存分が返るので、"
-                        "本当に別途必要だと自分で判断したときだけ force=true で設定する。"
+                        "Set a reminder (alarm) to yourself at a given time. "
+                        "When it fires the note is delivered to you, giving you "
+                        "an opening to speak to the user. Use in_minutes for "
+                        "relative times like 'in 30 minutes', or at for clock "
+                        "times like 'at 20:00' (one of the two is enough). If an "
+                        "alarm already exists near that time, the existing one "
+                        "is returned instead — set force=true only when you "
+                        "judge that a separate alarm is genuinely needed."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2016,26 +2047,29 @@ class BasicMemoryAgent(AgentInterface):
                             "note": {
                                 "type": "string",
                                 "description": (
-                                    "時間になったとき自分に思い出させる内容。"
-                                    "例：「ユーザーに薬を飲んだか聞く」。"
+                                    "What to remind yourself of when it fires. "
+                                    "e.g. 'ask the user whether he took his "
+                                    "medicine'."
                                 ),
                             },
                             "in_minutes": {
                                 "type": "number",
-                                "description": "今から何分後に鳴らすか。例：30。",
+                                "description": "How many minutes from now it should fire. e.g. 30.",
                             },
                             "at": {
                                 "type": "string",
                                 "description": (
-                                    "鳴らす時刻。「HH:MM」（その時刻の次の発生）"
-                                    "または「YYYY-MM-DD HH:MM」。"
+                                    "When it should fire: 'HH:MM' (the next "
+                                    "occurrence of that time) or "
+                                    "'YYYY-MM-DD HH:MM'."
                                 ),
                             },
                             "force": {
                                 "type": "boolean",
                                 "description": (
-                                    "近い時刻に既存のアラームがあっても重複を承知で"
-                                    "設定する場合のみ true。通常は付けない。"
+                                    "true only when you want to set an alarm "
+                                    "despite an existing one at a nearby time. "
+                                    "Normally omit this."
                                 ),
                             },
                         },
@@ -2047,7 +2081,7 @@ class BasicMemoryAgent(AgentInterface):
                 "type": "function",
                 "function": {
                     "name": "list_alarms",
-                    "description": "今セットされている（未発火の）アラームの一覧を取得する。",
+                    "description": "List the alarms currently set (not yet fired).",
                     "parameters": {"type": "object", "properties": {}},
                 },
             },
@@ -2056,15 +2090,15 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "cancel_alarm",
                     "description": (
-                        "セット済みのアラームを取り消す。alarm_id は list_alarms で"
-                        "得られる id を指定する。"
+                        "Cancel an alarm that was already set. Pass the id "
+                        "obtained from list_alarms as alarm_id."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "alarm_id": {
                                 "type": "string",
-                                "description": "取り消すアラームの id。",
+                                "description": "id of the alarm to cancel.",
                             }
                         },
                         "required": ["alarm_id"],
@@ -2132,20 +2166,19 @@ class BasicMemoryAgent(AgentInterface):
 
     @staticmethod
     def _build_steam_tools_openai() -> List[Dict[str, Any]]:
-        """OpenAI schemas for the four in-process Steam tools. Descriptions
-        are in Japanese, matching the persona/model's working language."""
+        """OpenAI schemas for the four in-process Steam tools."""
         return [
             {
                 "type": "function",
                 "function": {
                     "name": "steam_library",
                     "description": (
-                        "ユーザーのSteamライブラリ（起動時スナップショット）を"
-                        "ローカルで照会する。ネットワーク不要で即答。"
-                        "所持ゲーム・プレイ時間・直近プレイ・ウィッシュリスト・"
-                        "フォロー中タイトルを調べられる。"
-                        "「このゲーム持ってる？」の類いは action=check + name で"
-                        "調べる（名前はスナップショットにあいまい一致される）。"
+                        "Query the user's Steam library locally (a snapshot "
+                        "taken at startup). No network needed, answers "
+                        "instantly. Covers owned games, playtime, recently "
+                        "played, wishlist, and followed titles. For 'does he own "
+                        "this game?' style questions use action=check with name "
+                        "(the name is fuzzy-matched against the snapshot)."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2161,30 +2194,33 @@ class BasicMemoryAgent(AgentInterface):
                                     "followed",
                                 ],
                                 "description": (
-                                    "照会の種類。overview=概況 / top_played=プレイ時間上位 / "
-                                    "recent=直近2週間にプレイしたもの / check=特定ゲームの所持確認 / "
-                                    "wishlist=ウィッシュリスト / followed=フォロー中。"
+                                    "Kind of query. overview = summary / "
+                                    "top_played = most playtime / recent = "
+                                    "played in the last two weeks / check = "
+                                    "whether a specific game is owned / "
+                                    "wishlist / followed."
                                 ),
                             },
                             "name": {
                                 "type": "string",
                                 "description": (
-                                    "action=check のときのゲーム名。ローカル"
-                                    "スナップショットにあいまい一致される"
-                                    "（日英+上位ゲームは中国語名も対応）。"
+                                    "Game name, for action=check. Fuzzy-matched "
+                                    "against the local snapshot (Japanese and "
+                                    "English, plus Chinese names for major "
+                                    "titles)."
                                 ),
                             },
                             "appid": {
                                 "type": "integer",
                                 "description": (
-                                    "action=check を appid で正確に引く場合。"
-                                    "名前でヒットしない時は steam_search で "
-                                    "appid を解決してこちらに渡す。"
+                                    "Use this to run action=check by exact "
+                                    "appid. If the name doesn't hit, resolve the "
+                                    "appid with steam_search and pass it here."
                                 ),
                             },
                             "n": {
                                 "type": "integer",
-                                "description": "リスト系actionで返す件数。既定10。",
+                                "description": "How many entries list-type actions return. Default 10.",
                             },
                         },
                         "required": ["action"],
@@ -2196,12 +2232,14 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "steam_search",
                     "description": (
-                        "実際のSteamストアをゲーム名で検索し、appid・正式名称・"
-                        "価格（円）を得る。あらゆるゲーム名を appid に解決する"
-                        "入口として、正確な情報が要る時はまずこれを呼び、"
-                        "得た appid で steam_game 等の精密照会に進むこと。"
-                        "表記ゆれに備え、確信がなければ日本語名と英語名の両方を"
-                        "queries に入れる。結果は実在のストアデータ。"
+                        "Search the real Steam store by game name and get the "
+                        "appid, official title, and price (JPY). This is the "
+                        "entry point for resolving any game name to an appid: "
+                        "when you need accurate information, call this first, "
+                        "then use the appid for precise lookups such as "
+                        "steam_game. Titles are written inconsistently, so if "
+                        "you are unsure, put both the Japanese and the English "
+                        "name in queries. Results are real store data."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2210,13 +2248,14 @@ class BasicMemoryAgent(AgentInterface):
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": (
-                                    "検索する名前の候補（最大4件）。"
-                                    "日本語名と英語名の両方を入れると取りこぼしにくい。"
+                                    "Candidate names to search (max 4). "
+                                    "Including both the Japanese and English "
+                                    "name makes a miss less likely."
                                 ),
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": "返す件数の上限。既定5。",
+                                "description": "Max results to return. Default 5.",
                             },
                         },
                         "required": ["queries"],
@@ -2228,17 +2267,19 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "steam_game",
                     "description": (
-                        "appid を指定して、そのゲームのストアページ相当の詳細を見る"
-                        "（価格・割引・説明・ジャンル・発売日・レビュー概況・"
-                        "コミュニティタグ・所持有無）。価格は日本円の整数に正規化済み。"
-                        "appid が不明なら先に steam_search で解決すること。"
+                        "Given an appid, view that game's store-page-level "
+                        "detail: price, discount, description, genres, release "
+                        "date, review summary, community tags, and whether the "
+                        "user owns it. Prices are normalised to integer JPY. If "
+                        "you don't know the appid, resolve it with steam_search "
+                        "first."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "appid": {
                                 "type": "integer",
-                                "description": "SteamのアプリID。",
+                                "description": "The Steam application ID.",
                             }
                         },
                         "required": ["appid"],
@@ -2250,12 +2291,13 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "steam_discover",
                     "description": (
-                        "実際のSteamストアからおすすめ候補リストを得る。"
-                        "ユーザーの所持済みタイトルは除外済み。"
-                        "ゲームを勧める時は、必ずこの結果（または steam_search の"
-                        "結果）の中からのみ選ぶこと。mode: similar=あるゲームに"
-                        "似たタイトル / tag=タグ別の一覧（section で並び替え）/ "
-                        "specials=セール中のタイトル。"
+                        "Get a list of recommendation candidates from the real "
+                        "Steam store. Titles the user already owns are excluded. "
+                        "When recommending a game, choose only from these "
+                        "results (or from steam_search results). mode: similar = "
+                        "titles like a given game / tag = a list for a tag "
+                        "(ordered by section) / specials = titles currently on "
+                        "sale."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2263,23 +2305,25 @@ class BasicMemoryAgent(AgentInterface):
                             "mode": {
                                 "type": "string",
                                 "enum": ["similar", "tag", "specials"],
-                                "description": "候補の探し方。",
+                                "description": "How to look for candidates.",
                             },
                             "anchor": {
                                 "type": "string",
                                 "description": (
-                                    "mode=similar の基準となるゲーム名または appid"
-                                    "（similar では必須）。名前はまずライブラリ内で"
-                                    "解決される。見つからなければ steam_search で "
-                                    "appid を得てから渡すこと。"
+                                    "The reference game name or appid for "
+                                    "mode=similar (required there). Names are "
+                                    "resolved against the library first; if not "
+                                    "found, get the appid via steam_search and "
+                                    "pass that."
                                 ),
                             },
                             "tag": {
                                 "type": "string",
                                 "description": (
-                                    "mode=tag のタグ（tag では必須）。自然な言い方で"
-                                    "よく、実在のSteamタグ表に解決される"
-                                    "（例:「ローグライク」「ビジュアルノベル」）。"
+                                    "The tag for mode=tag (required there). "
+                                    "Natural phrasing is fine — it is resolved "
+                                    "against the real Steam tag table (e.g. "
+                                    "'roguelike', 'visual novel')."
                                 ),
                             },
                             "section": {
@@ -2293,12 +2337,12 @@ class BasicMemoryAgent(AgentInterface):
                                     "most_wishlisted",
                                 ],
                                 "description": (
-                                    "mode=tag のときの並び。既定 trending_new。"
+                                    "Ordering for mode=tag. Default trending_new."
                                 ),
                             },
                             "count": {
                                 "type": "integer",
-                                "description": "返す件数。既定10。",
+                                "description": "How many to return. Default 10.",
                             },
                         },
                         "required": ["mode"],
@@ -2319,17 +2363,20 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_search",
                     "description": (
-                        "自分の長期記憶（事実facts・過去の日記）を意味検索する。"
-                        "自動想起とは別に、必要な時に自分から過去を調べる入口。"
-                        "結果の事実には id が付き、memory_update / memory_delete / "
-                        "memory_inject で使う。日記ヒットには diary_uid が付き、"
-                        "memory_read_diary で全文を読める。注意：この結果はこの"
-                        "ターン限りで消える——以後も参照したい記憶は memory_inject "
-                        "で文脈に固定すること。importance の意味：user=本人が手動"
-                        "管理（毎セッション常駐）/ high=重要（毎セッション常駐）/ "
-                        "low=検索・想起された時だけ文脈に入る。"
-                        "日付・期間で絞る時は date_from/date_to を指定し、"
-                        "query 本文に日付を書かないこと。"
+                        "Semantic search over your own long-term memory (facts "
+                        "and past diary entries). Separate from automatic "
+                        "recall: this is how you look into the past on your own "
+                        "initiative. Fact hits carry an id, used by "
+                        "memory_update / memory_delete / memory_inject. Diary "
+                        "hits carry a diary_uid, which memory_read_diary expands "
+                        "to the full entry. Note: these results disappear at the "
+                        "end of this turn — pin anything you want to keep "
+                        "referring to with memory_inject. Meaning of importance: "
+                        "user = curated by the user himself (resident every "
+                        "session) / high = important (resident every session) / "
+                        "low = enters context only when searched or recalled. To "
+                        "restrict by date or period, pass date_from/date_to — do "
+                        "not write dates into the query text."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2337,29 +2384,30 @@ class BasicMemoryAgent(AgentInterface):
                             "query": {
                                 "type": "string",
                                 "description": (
-                                    "検索したい内容（自然文でよい。"
-                                    "日付・期間は書かず date_from/to へ）。"
+                                    "What to search for (natural language is "
+                                    "fine). Do not put dates or periods here — "
+                                    "use date_from/date_to."
                                 ),
                             },
                             "target": {
                                 "type": "string",
                                 "enum": ["facts", "diaries", "both"],
-                                "description": "検索対象。既定 both。",
+                                "description": "What to search. Default: both.",
                             },
                             "n": {
                                 "type": "integer",
-                                "description": "対象ごとの最大件数。既定5。",
+                                "description": "Max hits per target. Default 5.",
                             },
                             "date_from": {
                                 "type": "string",
                                 "description": (
-                                    "YYYY-MM-DD。この日以降に限定"
-                                    "（日記の日付・事実の更新日）。"
+                                    "YYYY-MM-DD. Restrict to this date onward "
+                                    "(diary date / fact updated date)."
                                 ),
                             },
                             "date_to": {
                                 "type": "string",
-                                "description": "YYYY-MM-DD。この日以前に限定。",
+                                "description": "YYYY-MM-DD. Restrict to this date and earlier.",
                             },
                         },
                         "required": ["query"],
@@ -2371,19 +2419,21 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "history_search",
                     "description": (
-                        "過去の会話ログ全文をキーワードで直接検索する"
-                        "（記憶factsや日記に残っていない具体的なやりとり・"
-                        "固有名詞・「言った言わない」の確認はこちら。"
-                        "意味検索ではなく全ログ走査）。"
-                        "複数キーワードは OR——さらに各キーワードは自動で"
-                        "2文字ずつの断片に分解され、会話中の部分的な言及"
-                        "（店名の一部だけ等）にもヒットし、断片の一致率が"
-                        "高いものから順に返る。だから店名・固有名詞は分割せず"
-                        "そのまま1キーワードとして渡してよく、1回の呼び出しで"
-                        "広く当たる。日付・期間で絞る時は date_from/date_to を"
-                        "指定し、キーワードに日付を書かないこと。"
-                        "結果はこのターン限りで消える——残したい内容は"
-                        "返答の中で言及すること。"
+                        "Keyword search directly over the full text of past "
+                        "conversation logs. Use this for concrete exchanges, "
+                        "proper nouns, and 'who said what' checks that were "
+                        "never distilled into facts or diary entries. This is a "
+                        "full scan of the logs, not a semantic search. Multiple "
+                        "keywords are OR'd — and each keyword is automatically "
+                        "broken into two-character fragments, so it also hits "
+                        "partial mentions in the conversation (e.g. only part of "
+                        "a shop's name), ranked by how much of the keyword the "
+                        "message covers. Because of this, pass a shop name or "
+                        "proper noun whole, as a single keyword: one call "
+                        "already casts a wide net. To restrict by date or "
+                        "period, pass date_from/date_to — do not write dates "
+                        "into the keywords. Results disappear at the end of this "
+                        "turn; state anything worth keeping in your reply."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2392,17 +2442,18 @@ class BasicMemoryAgent(AgentInterface):
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": (
-                                    "検索語（1〜8個、OR）。固有名詞・フレーズは"
-                                    "そのまま入れる（自動で断片化される）。"
+                                    "Search terms (1-8, OR'd). Pass proper nouns "
+                                    "and phrases whole — they are fragmented "
+                                    "automatically."
                                 ),
                             },
                             "date_from": {
                                 "type": "string",
-                                "description": "YYYY-MM-DD。この日以降のログに限定。",
+                                "description": "YYYY-MM-DD. Restrict to logs from this date onward.",
                             },
                             "date_to": {
                                 "type": "string",
-                                "description": "YYYY-MM-DD。この日以前のログに限定。",
+                                "description": "YYYY-MM-DD. Restrict to logs up to this date.",
                             },
                         },
                         "required": ["keywords"],
@@ -2414,9 +2465,11 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_add",
                     "description": (
-                        "新しい事実を長期記憶(facts)に保存する。会話ではっきり"
-                        "判明したこと・本人に頼まれたことだけを保存すること。"
-                        "検索には即時反映、常駐リストへは次回起動から。"
+                        "Save a new fact to long-term memory (facts). Only save "
+                        "what became clearly established in the conversation, or "
+                        "what the user asked you to remember. Reflected in "
+                        "search immediately; enters the resident list from the "
+                        "next startup."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2424,15 +2477,18 @@ class BasicMemoryAgent(AgentInterface):
                             "fact": {
                                 "type": "string",
                                 "description": (
-                                    "保存する事実の本文（1件1文、簡潔・自立した文で）。"
+                                    "The fact itself (one sentence per fact, "
+                                    "concise and self-contained)."
                                 ),
                             },
                             "importance": {
                                 "type": "string",
                                 "enum": ["high", "low"],
                                 "description": (
-                                    "high=重要（次回起動からsystem prompt常駐）/ "
-                                    "low=通常（検索・RAGで想起）。既定 low。"
+                                    "high = important (resident in the system "
+                                    "prompt from the next startup) / low = "
+                                    "normal (recalled via search and RAG). "
+                                    "Default: low."
                                 ),
                             },
                         },
@@ -2445,20 +2501,21 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_update",
                     "description": (
-                        "既存の事実を書き直す（訂正・追記）。対象の id は "
-                        "memory_search で確認してから使うこと。importance は"
-                        "変わらない（user印も内容の修正は可）。"
+                        "Rewrite an existing fact (correction or addition). "
+                        "Confirm the target id with memory_search before using "
+                        "this. importance is unchanged (content of user-tier "
+                        "facts may still be corrected)."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "fact_id": {
                                 "type": "string",
-                                "description": "書き直す事実の id（memory_searchの結果から）。",
+                                "description": "id of the fact to rewrite (from memory_search results).",
                             },
                             "new_fact": {
                                 "type": "string",
-                                "description": "新しい本文（全文置き換え）。",
+                                "description": "The new text (replaces the whole fact).",
                             },
                         },
                         "required": ["fact_id", "new_fact"],
@@ -2470,27 +2527,29 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_delete",
                     "description": (
-                        "事実を1件削除する。二段階制：まず confirmed 無しで呼ぶと"
-                        "削除申請になるので、本人にその記憶を削除してよいか確認する。"
-                        "同意の返事をもらった直後のターンで、同じ fact_id と "
-                        "confirmed=true で呼び直すと実行される。同意なしでは"
-                        "システムが拒否する。"
+                        "Delete one fact. Two-phase: calling it without "
+                        "confirmed files a deletion request, at which point you "
+                        "ask the user whether that memory may be deleted. In the "
+                        "turn immediately after he consents, call again with "
+                        "the same fact_id and confirmed=true to execute. Without "
+                        "consent the system refuses."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "fact_id": {
                                 "type": "string",
-                                "description": "削除する事実の id（memory_searchの結果から）。",
+                                "description": "id of the fact to delete (from memory_search results).",
                             },
                             "reason": {
                                 "type": "string",
-                                "description": "削除したい理由（本人への説明に使う）。",
+                                "description": "Why you want it deleted (used when explaining to the user).",
                             },
                             "confirmed": {
                                 "type": "boolean",
                                 "description": (
-                                    "本人の同意を得た後の実行呼び出しでのみ true。"
+                                    "true only on the execution call made after "
+                                    "the user has consented."
                                 ),
                             },
                         },
@@ -2503,16 +2562,18 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_read_diary",
                     "description": (
-                        "日記1件の全文を読む（memory_search の日記ヒットは文単位"
-                        "なので、前後の文脈が要る時に）。結果はこのターン限り——"
-                        "以後も参照したいなら memory_inject で文脈に固定する。"
+                        "Read one diary entry in full. memory_search returns "
+                        "diary hits at sentence granularity, so use this when "
+                        "you need the surrounding context. The result lasts only "
+                        "this turn — pin it with memory_inject if you want to "
+                        "keep referring to it."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "diary_uid": {
                                 "type": "string",
-                                "description": "memory_searchの日記ヒットに付く diary_uid。",
+                                "description": "The diary_uid attached to a diary hit from memory_search.",
                             }
                         },
                         "required": ["diary_uid"],
@@ -2524,11 +2585,13 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_inject",
                     "description": (
-                        "指定した事実・日記を会話の文脈に固定する（自動想起RAGと"
-                        "同じ仕組みで次のユーザーメッセージ以降ずっと見える）。"
-                        "memory_search / memory_read_diary の結果はそのターン限りで"
-                        "消えるため、続けて使いたい記憶はこれで注入する。注入済みの"
-                        "内容は自動想起でも重複表示されない。"
+                        "Pin the given facts / diary entries into the "
+                        "conversation context. They stay visible from the next "
+                        "user message onward, through the same mechanism as "
+                        "automatic recall. Results from memory_search / "
+                        "memory_read_diary vanish at the end of the turn, so "
+                        "inject anything you want to keep using. Injected "
+                        "content is not surfaced again by automatic recall."
                     ),
                     "parameters": {
                         "type": "object",
@@ -2536,12 +2599,12 @@ class BasicMemoryAgent(AgentInterface):
                             "fact_ids": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "固定したい事実の id（最大10件）。",
+                                "description": "ids of facts to pin (max 10).",
                             },
                             "diary_uids": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "固定したい日記の diary_uid（最大3件、全文が入る）。",
+                                "description": "diary_uids to pin (max 3; the full entry is included).",
                             },
                         },
                     },
