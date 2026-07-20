@@ -85,6 +85,7 @@ class LLMFactory:
                 thinking_effort=kwargs.get("thinking_effort", "medium"),
                 thinking_force=kwargs.get("thinking_force", False),
                 thinking_budget=kwargs.get("thinking_budget", 4096),
+                max_tokens=kwargs.get("max_tokens", 8000),
             )
         else:
             raise ValueError(f"Unsupported LLM provider: {llm_provider}")

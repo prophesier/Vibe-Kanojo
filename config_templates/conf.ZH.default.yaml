@@ -231,6 +231,13 @@ character_config:
         # 按**请求**计而非按对话回合：一个回合走 N 轮工具就要付 N+1 次，
         # 且思考 token 按 output 计费。
         thinking_budget: 4096
+        # 单个对话回合的输出上限，思考和回复共用。开启思考时会被抬到 8000 下限
+        # （thinking_force 下是 thinking_budget + 4000），所以思考开着时调小它
+        # 并不会让回复变短。日文约 1 字/token，中文约 0.9 字/token。
+        # 记忆/日记调用自带数值，不受影响。
+        # 回复过长要付两次代价：长回复还会在滑动历史窗口里停留好几个 session，
+        # 把之后每一轮的 prompt 都撑大。
+        max_tokens: 8000
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>' # GGUF 模型文件路径

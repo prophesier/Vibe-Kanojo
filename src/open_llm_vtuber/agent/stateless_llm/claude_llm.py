@@ -4,7 +4,7 @@ for language generation.
 """
 
 import json
-from typing import AsyncIterator, List, Dict, Any, Union
+from typing import AsyncIterator, List, Dict, Any, Optional, Union
 
 import anthropic
 import httpx
@@ -57,9 +57,16 @@ def _budget_tokens_removed(model: str) -> bool:
 
 
 class AsyncLLM(StatelessLLMInterface):
+    # Output ceiling for a chat turn when the caller doesn't specify one
+    # (overridable per config via max_tokens). The old signature default of
+    # 1024 was too small for a real reply and only ever went unnoticed because
+    # the thinking floor below silently raised it.
+    _DEFAULT_MAX_TOKENS = 8000
     # When thinking is on, the reply shares the max_tokens budget with the
     # (billed) thinking tokens. Raise the ceiling so reasoning doesn't truncate
-    # a normal-length reply.
+    # a normal-length reply. Kept as a floor on top of the configured value:
+    # a small configured max_tokens still gets lifted to this when thinking is
+    # active, so reasoning can never eat the whole reply.
     _THINKING_MAX_TOKENS_FLOOR = 8000
     # Forced (always-on) extended thinking: the default budget (overridable per
     # config via thinking_budget), plus the reply headroom kept above it
@@ -89,6 +96,7 @@ class AsyncLLM(StatelessLLMInterface):
         thinking_effort: str = "medium",
         thinking_force: bool = False,
         thinking_budget: int = _THINKING_FORCED_BUDGET,
+        max_tokens: int = _DEFAULT_MAX_TOKENS,
     ):
         """
         Initialize Claude LLM.
@@ -117,6 +125,11 @@ class AsyncLLM(StatelessLLMInterface):
                 thinking is unavailable. Note this is per REQUEST, not per user
                 turn: a turn that goes N rounds through the tool loop pays it
                 N+1 times. Clamped up to the API's 1024 minimum.
+            max_tokens (int): Output ceiling for a chat turn when the caller
+                does not pass one. Covers thinking + reply together, so when
+                thinking is on the reply gets whatever reasoning leaves. One-
+                shot utility calls (memory, diary, fact extraction) pass their
+                own value and are unaffected.
         """
         self.model = model
         self.system = system
@@ -129,6 +142,8 @@ class AsyncLLM(StatelessLLMInterface):
         self._thinking_effort = thinking_effort
         self._thinking_force = thinking_force
         self._thinking_budget = self._resolve_thinking_budget(thinking_budget)
+        self._max_tokens = self._resolve_max_tokens(max_tokens)
+        logger.info(f"Claude reply ceiling: max_tokens={self._max_tokens}.")
         if enable_web_search:
             logger.info(
                 f"Claude native web search enabled (max {max_web_searches}/reply)."
@@ -170,6 +185,25 @@ class AsyncLLM(StatelessLLMInterface):
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
         logger.debug(f"Base URL: {base_url}")
+
+    @classmethod
+    def _resolve_max_tokens(cls, value: Any) -> int:
+        """Validate the configured reply ceiling. Never raises — a bad value
+        falls back to the default rather than killing startup."""
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"max_tokens {value!r} is not an integer; "
+                f"using {cls._DEFAULT_MAX_TOKENS}."
+            )
+            return cls._DEFAULT_MAX_TOKENS
+        if n <= 0:
+            logger.warning(
+                f"max_tokens {n} is not positive; using {cls._DEFAULT_MAX_TOKENS}."
+            )
+            return cls._DEFAULT_MAX_TOKENS
+        return n
 
     @classmethod
     def _resolve_thinking_budget(cls, value: Any) -> int:
@@ -260,7 +294,7 @@ class AsyncLLM(StatelessLLMInterface):
         messages: List[Dict[str, Any]],
         system: Union[str, List[Dict[str, Any]]] = None,
         tools: List[Dict[str, Any]] = None,
-        max_tokens: int = 1024,
+        max_tokens: Optional[int] = None,
         disable_server_tools: bool = False,
         reasoning_effort: str = None,  # noqa: ARG002 — accepted for signature parity (OpenAI-only); ignored here
     ) -> AsyncIterator[Dict[str, Any]]:
@@ -274,6 +308,9 @@ class AsyncLLM(StatelessLLMInterface):
           Pass a list of content blocks to enable prompt caching via
           ``cache_control`` markers; pass a plain string for a normal request.
         - tools (List[Dict[str, Any]], optional): List of tools available.
+        - max_tokens (int, optional): Output ceiling for this call. ``None``
+          (the chat path) uses the configured value; one-shot utility callers
+          pass their own. Thinking, when active, floors this further.
 
         Yields:
         - Dict[str, Any]: Events representing text deltas, tool use, or errors.
@@ -288,6 +325,11 @@ class AsyncLLM(StatelessLLMInterface):
             - {"type": "message_stop"}
             - {"type": "error", "message": "..."}
         """
+        # Resolve before anything reads it: the thinking branches below treat
+        # max_tokens as a floor to raise, so it has to hold the configured
+        # value by then, not None.
+        if max_tokens is None:
+            max_tokens = self._max_tokens
         text_emitted = False
         try:
             # Filter out system messages and convert message format

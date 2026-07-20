@@ -266,6 +266,14 @@ character_config:
         # not per turn — a turn taking N tool rounds pays it N+1 times, and
         # thinking tokens bill as output.
         thinking_budget: 4096
+        # Output ceiling for one chat turn — thinking and reply share it.
+        # With thinking on this is floored at 8000 (or thinking_budget + 4000
+        # under thinking_force), so lowering it won't shorten replies while
+        # thinking is active. Roughly 1 token per Japanese character, 0.9 per
+        # Chinese character. Memory/diary calls pass their own value.
+        # Long replies cost twice: a single long turn then sits in the sliding
+        # history window for several sessions, inflating every later prompt.
+        max_tokens: 8000
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>'

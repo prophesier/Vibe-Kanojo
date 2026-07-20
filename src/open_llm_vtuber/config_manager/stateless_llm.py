@@ -232,6 +232,7 @@ class ClaudeConfig(StatelessLLMBaseConfig):
     thinking_effort: str = Field("medium", alias="thinking_effort")
     thinking_force: bool = Field(False, alias="thinking_force")
     thinking_budget: int = Field(4096, alias="thinking_budget")
+    max_tokens: int = Field(8000, alias="max_tokens")
 
     _CLAUDE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(
@@ -343,6 +344,27 @@ class ClaudeConfig(StatelessLLMBaseConfig):
                 "建议复杂任务 16k 以上，超过 32k 建议改用批处理。注意是按**请求**"
                 "计，不是按对话回合：一个回合走 N 轮工具就要付 N+1 次，"
                 "且思考 token 按 output 计费。"
+            ),
+        ),
+        "max_tokens": Description(
+            en=(
+                "Output ceiling for one chat turn, covering thinking + reply "
+                "together. When thinking is on it is floored at 8000 (or at "
+                "thinking_budget + 4000 under thinking_force), so setting this "
+                "lower does not shorten replies while thinking is active. "
+                "Roughly 1 token per Japanese character, 0.9 per Chinese "
+                "character. Memory/diary/fact-extraction calls pass their own "
+                "value and ignore this. Long replies are not free downstream: "
+                "one long turn sits in the sliding history window for several "
+                "sessions and inflates every later prompt."
+            ),
+            zh=(
+                "单个对话回合的输出上限，思考和回复共用这一份额度。开启思考时会被"
+                "抬到 8000 下限（thinking_force 下是 thinking_budget + 4000），"
+                "所以思考开着的时候把它调小并不会让回复变短。日文约 1 字/token，"
+                "中文约 0.9 字/token。记忆/日记/事实抽取调用自带数值，不受此项影响。"
+                "回复过长的代价在后面：一条长回复会在滑动历史窗口里停留好几个 "
+                "session，把之后每一轮的 prompt 都撑大。"
             ),
         ),
     }
