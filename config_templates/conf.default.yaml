@@ -258,6 +258,13 @@ character_config:
         # adaptive skips turns it judges simple — where coherence errors slip in.
         # Opus 4.6/older only; on 4.7/4.8/Fable it auto-falls back to adaptive.
         thinking_force: false
+        # Thinking tokens per request on the thinking_force path (becomes
+        # budget_tokens). No effect unless thinking_force is on. API minimum is
+        # 1024; lower values are raised to it. Anthropic suggests 16k+ for
+        # complex work, and batch processing above 32k. Counted per REQUEST,
+        # not per turn — a turn taking N tool rounds pays it N+1 times, and
+        # thinking tokens bill as output.
+        thinking_budget: 4096
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>'

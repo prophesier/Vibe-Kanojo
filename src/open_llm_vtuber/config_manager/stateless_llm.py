@@ -231,6 +231,7 @@ class ClaudeConfig(StatelessLLMBaseConfig):
     thinking: bool = Field(False, alias="thinking")
     thinking_effort: str = Field("medium", alias="thinking_effort")
     thinking_force: bool = Field(False, alias="thinking_force")
+    thinking_budget: int = Field(4096, alias="thinking_budget")
 
     _CLAUDE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(
@@ -320,6 +321,25 @@ class ClaudeConfig(StatelessLLMBaseConfig):
                 "它自认为简单的回合，而恰恰那些回合最容易出连贯性错误。"
                 "仅 Opus 4.6 及更早；4.7/4.8/Fable 会自动回退到 adaptive。"
                 "每一回合都会增加延迟。"
+            ),
+        ),
+        "thinking_budget": Description(
+            en=(
+                "Thinking tokens per request on the thinking_force path "
+                "(becomes budget_tokens). Ignored when thinking_force is off, "
+                "and on models where manual thinking is unavailable. API "
+                "minimum 1024 (lower values are raised). Anthropic suggests "
+                "16k+ for complex work and batch processing above 32k. This is "
+                "per REQUEST, not per turn: a turn that takes N tool rounds "
+                "pays it N+1 times, and thinking tokens bill as output."
+            ),
+            zh=(
+                "thinking_force 路径下每次请求的思考 token 预算（即 "
+                "budget_tokens）。thinking_force 关闭时无效，manual 思考不可用的"
+                "模型上也无效。API 最小值 1024（更小会被抬到 1024）。Anthropic "
+                "建议复杂任务 16k 以上，超过 32k 建议改用批处理。注意是按**请求**"
+                "计，不是按对话回合：一个回合走 N 轮工具就要付 N+1 次，"
+                "且思考 token 按 output 计费。"
             ),
         ),
     }

@@ -224,6 +224,12 @@ character_config:
         # adaptive 会跳过它自认为简单的回合，而那些回合最容易出连贯性错误。
         # 仅 Opus 4.6 及更早；4.7/4.8/Fable 会自动回退到 adaptive。
         thinking_force: false
+        # thinking_force 路径下每次请求的思考 token 预算（即 budget_tokens）。
+        # thinking_force 关闭时无效。API 最小值 1024，更小会被抬到 1024。
+        # Anthropic 建议复杂任务 16k 以上，超过 32k 建议改用批处理。
+        # 按**请求**计而非按对话回合：一个回合走 N 轮工具就要付 N+1 次，
+        # 且思考 token 按 output 计费。
+        thinking_budget: 4096
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>' # GGUF 模型文件路径

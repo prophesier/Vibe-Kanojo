@@ -47,10 +47,18 @@ class AsyncLLM(StatelessLLMInterface):
     # (billed) thinking tokens. Raise the ceiling so reasoning doesn't truncate
     # a normal-length reply.
     _THINKING_MAX_TOKENS_FLOOR = 8000
-    # Forced (always-on) extended thinking: the fixed budget, plus the reply
-    # headroom kept above it (budget_tokens must stay under max_tokens).
+    # Forced (always-on) extended thinking: the default budget (overridable per
+    # config via thinking_budget), plus the reply headroom kept above it
+    # (budget_tokens must stay under max_tokens).
     _THINKING_FORCED_BUDGET = 4096
     _THINKING_FORCED_REPLY_ROOM = 4000
+    # API floor: budget_tokens must be >= 1024 or the request 400s. Anything
+    # lower in the config is raised to this, loudly.
+    _THINKING_BUDGET_MIN = 1024
+    # Not a limit, just where Anthropic's docs stop recommending interactive
+    # use ("for thinking budgets above 32k, use batch processing to avoid
+    # networking issues"). Above this we warn but still send it.
+    _THINKING_BUDGET_WARN = 32000
 
     def __init__(
         self,
@@ -66,6 +74,7 @@ class AsyncLLM(StatelessLLMInterface):
         thinking: bool = False,
         thinking_effort: str = "medium",
         thinking_force: bool = False,
+        thinking_budget: int = _THINKING_FORCED_BUDGET,
     ):
         """
         Initialize Claude LLM.
@@ -84,6 +93,16 @@ class AsyncLLM(StatelessLLMInterface):
             max_web_fetches (int): Cap on URL fetches per reply when enabled.
             max_fetch_tokens (int): Truncate any single fetched page above
                 this many tokens to bound per-turn input cost.
+            thinking (bool): Enable extended thinking.
+            thinking_effort (str): Effort level for the adaptive path.
+            thinking_force (bool): Reason on every turn via manual
+                budget_tokens, instead of letting adaptive skip turns.
+            thinking_budget (int): Thinking tokens allowed per request on the
+                FORCED path only — it becomes budget_tokens. Ignored on the
+                adaptive path (which has no budget) and on models where manual
+                thinking is unavailable. Note this is per REQUEST, not per user
+                turn: a turn that goes N rounds through the tool loop pays it
+                N+1 times. Clamped up to the API's 1024 minimum.
         """
         self.model = model
         self.system = system
@@ -95,6 +114,7 @@ class AsyncLLM(StatelessLLMInterface):
         self._thinking = thinking
         self._thinking_effort = thinking_effort
         self._thinking_force = thinking_force
+        self._thinking_budget = self._resolve_thinking_budget(thinking_budget)
         if enable_web_search:
             logger.info(
                 f"Claude native web search enabled (max {max_web_searches}/reply)."
@@ -105,8 +125,12 @@ class AsyncLLM(StatelessLLMInterface):
                 f"(max {max_web_fetches}/reply, max {max_fetch_tokens} tokens/page)."
             )
         if thinking:
+            # Always name the resolved budget on the forced path: a typo in the
+            # conf key is silently ignored (pydantic drops unknown keys), so
+            # this log line is the only way to catch a setting that never
+            # took effect.
             mode = (
-                "forced/every-turn"
+                f"forced/every-turn, budget={self._thinking_budget}"
                 if thinking_force and not _budget_tokens_removed(model)
                 else f"adaptive, effort={thinking_effort}"
             )
@@ -132,6 +156,39 @@ class AsyncLLM(StatelessLLMInterface):
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
         logger.debug(f"Base URL: {base_url}")
+
+    @classmethod
+    def _resolve_thinking_budget(cls, value: Any) -> int:
+        """Validate the configured forced-thinking budget, warning on anything
+        the API or the docs would object to.
+
+        Never raises: a bad value falls back to the default rather than killing
+        startup, because this knob is not worth losing the whole server over.
+        """
+        try:
+            budget = int(value)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"thinking_budget {value!r} is not an integer; "
+                f"using {cls._THINKING_FORCED_BUDGET}."
+            )
+            return cls._THINKING_FORCED_BUDGET
+        if budget < cls._THINKING_BUDGET_MIN:
+            # The API rejects budget_tokens < 1024 outright, so silently
+            # honouring a smaller number would break every forced turn.
+            logger.warning(
+                f"thinking_budget {budget} is below the API minimum "
+                f"({cls._THINKING_BUDGET_MIN}); raising it to the minimum."
+            )
+            return cls._THINKING_BUDGET_MIN
+        if budget > cls._THINKING_BUDGET_WARN:
+            logger.warning(
+                f"thinking_budget {budget} is above {cls._THINKING_BUDGET_WARN}; "
+                "Anthropic recommends batch processing beyond that (long "
+                "requests, connection limits). Sending it anyway — expect slow "
+                "turns and higher output-token cost."
+            )
+        return budget
 
     def _convert_message_format(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Convert message format to Claude's expected format."""
@@ -277,8 +334,10 @@ class AsyncLLM(StatelessLLMInterface):
                     # skips turns it judges simple — which is exactly where
                     # coherence errors slip through (e.g. delivering an alarm's
                     # content inline instead of at fire time). budget_tokens must
-                    # stay under max_tokens, so lift the reply ceiling.
-                    budget = self._THINKING_FORCED_BUDGET
+                    # stay under max_tokens, so lift the reply ceiling — this
+                    # max() is what keeps the API's budget < max_tokens rule
+                    # satisfied for any configured budget.
+                    budget = self._thinking_budget
                     max_tokens = max(
                         max_tokens, budget + self._THINKING_FORCED_REPLY_ROOM
                     )
