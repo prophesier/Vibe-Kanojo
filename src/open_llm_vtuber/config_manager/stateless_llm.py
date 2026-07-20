@@ -310,24 +310,16 @@ class ClaudeConfig(StatelessLLMBaseConfig):
         ),
         "thinking_force": Description(
             en=(
-                "Force thinking on EVERY turn instead of letting adaptive skip "
-                "turns it judges simple — exactly where coherence errors slip "
-                "in. HOW it is forced depends on the model. On Opus 4.6 / "
-                "Sonnet 4.6 and on 4.7/4.8/Fable it uses adaptive with "
-                "effort=max (the level documented as always thinking), because "
-                "manual budget_tokens costs interleaved thinking there — i.e. "
-                "no reasoning between tool calls, which suppresses multi-round "
-                "tool use. Only older models still use manual budget_tokens. "
-                "Overrides thinking_effort. Adds latency to every turn."
+                "Force thinking on EVERY turn (extended thinking) instead of "
+                "adaptive, which skips turns it judges simple — exactly where "
+                "coherence errors slip in. Opus 4.6 and older only; on 4.7/4.8/"
+                "Fable it auto-falls back to adaptive. Adds latency to every turn."
             ),
             zh=(
-                "强制每一回合都思考，而非让 adaptive 跳过它自认为简单的回合"
-                "——恰恰那些回合最容易出连贯性错误。**怎么强制**取决于模型："
-                "Opus 4.6 / Sonnet 4.6 以及 4.7/4.8/Fable 走 adaptive + "
-                "effort=max（文档中唯一保证每轮都思考的档位），因为在这些模型上"
-                "manual budget_tokens 会失去 interleaved thinking，也就是工具"
-                "调用之间没有推理，会压制多轮工具调用。只有更老的模型仍走 "
-                "manual budget_tokens。会覆盖 thinking_effort。每回合增加延迟。"
+                "强制每一回合都思考（扩展思考），而非 adaptive——adaptive 会跳过"
+                "它自认为简单的回合，而恰恰那些回合最容易出连贯性错误。"
+                "仅 Opus 4.6 及更早；4.7/4.8/Fable 会自动回退到 adaptive。"
+                "每一回合都会增加延迟。"
             ),
         ),
     }

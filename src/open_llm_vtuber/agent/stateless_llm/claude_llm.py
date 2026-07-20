@@ -42,36 +42,6 @@ def _budget_tokens_removed(model: str) -> bool:
     return any(x in m for x in ("opus-4-7", "opus-4-8", "fable", "mythos"))
 
 
-def _no_interleaved_thinking_in_manual(model: str) -> bool:
-    """Whether manual thinking on this model costs interleaved thinking.
-
-    Anthropic's docs, verbatim: "Manual mode on Opus 4.6: Interleaved thinking
-    is not available. If your agentic workflow requires thinking between tool
-    calls on Opus 4.6, use adaptive mode." Without it the model gets no
-    reasoning step between receiving a tool result and deciding whether to call
-    again — which is exactly where multi-round tool use is decided. Adaptive
-    mode enables interleaved thinking automatically on these models, and
-    ``effort: "max"`` restores the every-turn guarantee that manual
-    ``budget_tokens`` was chosen for ("Claude always thinks with no constraints
-    on thinking depth"). Manual mode is also deprecated on both.
-    https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
-    """
-    m = (model or "").lower()
-    return any(x in m for x in ("opus-4-6", "sonnet-4-6"))
-
-
-def _use_manual_thinking(model: str, force: bool) -> bool:
-    """Whether to send manual ``{type: enabled, budget_tokens}`` for forced
-    thinking. False when the model rejects it outright, and false when manual
-    would silently cost interleaved thinking — adaptive+max is strictly better
-    there. Older models keep manual: it is the only mode they support."""
-    return (
-        force
-        and not _budget_tokens_removed(model)
-        and not _no_interleaved_thinking_in_manual(model)
-    )
-
-
 class AsyncLLM(StatelessLLMInterface):
     # When thinking is on, the reply shares the max_tokens budget with the
     # (billed) thinking tokens. Raise the ceiling so reasoning doesn't truncate
@@ -81,10 +51,6 @@ class AsyncLLM(StatelessLLMInterface):
     # headroom kept above it (budget_tokens must stay under max_tokens).
     _THINKING_FORCED_BUDGET = 4096
     _THINKING_FORCED_REPLY_ROOM = 4000
-    # Forced thinking on the adaptive path (effort=max): thinking depth is
-    # unbounded and shares max_tokens with the reply, so the ceiling has to be
-    # generous or a long reasoning pass truncates the reply.
-    _THINKING_FORCED_MAX_TOKENS_FLOOR = 16000
 
     def __init__(
         self,
@@ -139,12 +105,11 @@ class AsyncLLM(StatelessLLMInterface):
                 f"(max {max_web_fetches}/reply, max {max_fetch_tokens} tokens/page)."
             )
         if thinking:
-            if _use_manual_thinking(model, thinking_force):
-                mode = "forced/every-turn, manual budget (no interleaved thinking)"
-            elif thinking_force:
-                mode = "forced/every-turn via adaptive, effort=max, interleaved"
-            else:
-                mode = f"adaptive, effort={thinking_effort}"
+            mode = (
+                "forced/every-turn"
+                if thinking_force and not _budget_tokens_removed(model)
+                else f"adaptive, effort={thinking_effort}"
+            )
             logger.info(f"Claude extended thinking enabled ({mode}).")
 
         # Initialize Claude client. The extended-cache-ttl beta header lets us
@@ -307,7 +272,7 @@ class AsyncLLM(StatelessLLMInterface):
             think_kwargs: Dict[str, Any] = {}
             if self._thinking and not disable_server_tools:
                 extra_body: Dict[str, Any] = {}
-                if _use_manual_thinking(self.model, self._thinking_force):
+                if self._thinking_force and not _budget_tokens_removed(self.model):
                     # Forced extended thinking: reason on EVERY turn. Adaptive
                     # skips turns it judges simple — which is exactly where
                     # coherence errors slip through (e.g. delivering an alarm's
@@ -326,24 +291,10 @@ class AsyncLLM(StatelessLLMInterface):
                         "type": "adaptive",
                         "display": "summarized",
                     }
-                    # thinking_force on the adaptive path means effort="max" —
-                    # the only level documented as "always thinks", so the
-                    # every-turn guarantee survives the switch away from manual
-                    # budget_tokens.
-                    effort = "max" if self._thinking_force else self._thinking_effort
-                    if effort:
-                        extra_body["output_config"] = {"effort": effort}
-                    # max effort has no cap on thinking depth and shares
-                    # max_tokens with the reply, so give the reply real room —
-                    # the manual path could bound thinking at budget_tokens,
-                    # this one cannot. max_tokens is a ceiling, not a spend.
-                    floor = (
-                        self._THINKING_FORCED_MAX_TOKENS_FLOOR
-                        if self._thinking_force
-                        else self._THINKING_MAX_TOKENS_FLOOR
-                    )
-                    if max_tokens < floor:
-                        max_tokens = floor
+                    if self._thinking_effort:
+                        extra_body["output_config"] = {"effort": self._thinking_effort}
+                    if max_tokens < self._THINKING_MAX_TOKENS_FLOOR:
+                        max_tokens = self._THINKING_MAX_TOKENS_FLOOR
                 think_kwargs["extra_body"] = extra_body
 
             async with self.client.messages.stream(
