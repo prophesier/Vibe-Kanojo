@@ -222,7 +222,10 @@ character_config:
         thinking_effort: 'medium'
         # 强制每一回合都思考（扩展思考），而非 adaptive。
         # adaptive 会跳过它自认为简单的回合，而那些回合最容易出连贯性错误。
-        # 仅 Opus 4.6 及更早；4.7/4.8/Fable 会自动回退到 adaptive。
+        # 怎么强制取决于模型：Opus/Sonnet 4.6 与 4.7/4.8/Fable 走 adaptive +
+        # effort=max（文档中唯一保证每轮都思考的档位），因为这些模型上 manual
+        # budget_tokens 会失去 interleaved thinking——工具调用之间没有推理，
+        # 会压制多轮工具调用。只有更老的模型仍走 manual。会覆盖 thinking_effort。
         thinking_force: false
 
       llama_cpp_llm:

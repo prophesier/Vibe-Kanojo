@@ -256,7 +256,11 @@ character_config:
         thinking_effort: 'medium'
         # Force thinking on EVERY turn (extended thinking) instead of adaptive.
         # adaptive skips turns it judges simple — where coherence errors slip in.
-        # Opus 4.6/older only; on 4.7/4.8/Fable it auto-falls back to adaptive.
+        # HOW it forces depends on the model: Opus/Sonnet 4.6 and 4.7/4.8/Fable
+        # use adaptive with effort=max (documented as always thinking), because
+        # manual budget_tokens loses interleaved thinking there — no reasoning
+        # between tool calls, which suppresses multi-round tool use. Only older
+        # models still use manual budget_tokens. Overrides thinking_effort.
         thinking_force: false
 
       llama_cpp_llm:
