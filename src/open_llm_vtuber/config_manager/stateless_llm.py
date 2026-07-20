@@ -313,13 +313,16 @@ class ClaudeConfig(StatelessLLMBaseConfig):
             en=(
                 "Force thinking on EVERY turn (extended thinking) instead of "
                 "adaptive, which skips turns it judges simple — exactly where "
-                "coherence errors slip in. Opus 4.6 and older only; on 4.7/4.8/"
-                "Fable it auto-falls back to adaptive. Adds latency to every turn."
+                "coherence errors slip in. Opus 4.6 and older only; on models "
+                "that dropped manual thinking (Opus 4.7/4.8/5, Sonnet 5, Fable, "
+                "Mythos) it auto-falls back to adaptive. Adds latency to every "
+                "turn."
             ),
             zh=(
                 "强制每一回合都思考（扩展思考），而非 adaptive——adaptive 会跳过"
                 "它自认为简单的回合，而恰恰那些回合最容易出连贯性错误。"
-                "仅 Opus 4.6 及更早；4.7/4.8/Fable 会自动回退到 adaptive。"
+                "仅 Opus 4.6 及更早；已取消 manual 思考的模型"
+                "（Opus 4.7/4.8/5、Sonnet 5、Fable、Mythos）会自动回退到 adaptive。"
                 "每一回合都会增加延迟。"
             ),
         ),

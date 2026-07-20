@@ -256,7 +256,8 @@ character_config:
         thinking_effort: 'medium'
         # Force thinking on EVERY turn (extended thinking) instead of adaptive.
         # adaptive skips turns it judges simple — where coherence errors slip in.
-        # Opus 4.6/older only; on 4.7/4.8/Fable it auto-falls back to adaptive.
+        # Opus 4.6/older only; models that dropped manual thinking
+        # (Opus 4.7/4.8/5, Sonnet 5, Fable, Mythos) auto-fall back to adaptive.
         thinking_force: false
         # Thinking tokens per request on the thinking_force path (becomes
         # budget_tokens). No effect unless thinking_force is on. API minimum is

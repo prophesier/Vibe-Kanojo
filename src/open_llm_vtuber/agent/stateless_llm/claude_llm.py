@@ -37,9 +37,23 @@ def _sniff_image_media_type(base64_data: str, declared: str) -> str:
 def _budget_tokens_removed(model: str) -> bool:
     """Whether manual extended thinking (``budget_tokens``) is removed for this
     model. Still functional on Opus 4.6 and older, but 400s on Opus 4.7/4.8,
-    Fable 5, and Mythos 5 — so forced thinking must fall back to adaptive there."""
+    Sonnet 5, Fable 5, and Mythos 5 — so forced thinking must fall back to
+    adaptive there.
+
+    ``opus-5`` is listed pre-emptively: no such model exists yet, so unlike the
+    others it is a guess, not a verified 400. It costs nothing to carry — the
+    fallback is adaptive, which every recent model supports.
+
+    Matching is by substring, so version suffixes are covered
+    (``claude-fable-5``, ``claude-sonnet-5-20260101``, ...). The 4.x ids are
+    safe from false positives: ``claude-opus-4-5`` contains ``opus-4-5``, never
+    ``opus-5``; ``claude-sonnet-4-5`` never contains ``sonnet-5``.
+    """
     m = (model or "").lower()
-    return any(x in m for x in ("opus-4-7", "opus-4-8", "fable", "mythos"))
+    return any(
+        x in m
+        for x in ("opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable", "mythos")
+    )
 
 
 class AsyncLLM(StatelessLLMInterface):
