@@ -301,6 +301,7 @@ class BasicMemoryAgent(AgentInterface):
         role: str,
         display_text: DisplayText | None = None,
         skip_memory: bool = False,
+        thinking_blocks: Optional[List[Dict[str, Any]]] = None,
     ):
         """Add message to memory."""
         if skip_memory:
@@ -352,6 +353,16 @@ class BasicMemoryAgent(AgentInterface):
                 message_data["name"] = display_text.name
             if display_text.avatar:
                 message_data["avatar"] = display_text.avatar
+
+        if role == "assistant" and thinking_blocks:
+            # Claude-path side field: preserved thinking blocks (summary text +
+            # signature, or redacted data) from the turn that produced this
+            # reply. claude_llm._convert_message_format replays them verbatim
+            # ahead of the text on later requests, so Opus keeps its prior
+            # reasoning in context across turns (preserved thinking). Lives in
+            # _memory only — on-disk history stays clean, so a restart drops
+            # them by design.
+            message_data["thinking_blocks"] = list(thinking_blocks)
 
         if (
             self._memory
@@ -1391,6 +1402,10 @@ class BasicMemoryAgent(AgentInterface):
         pending_tool_calls = []
         current_assistant_message_content = []
         emitted_markers: set = set()  # inline tool tags shown once per turn
+        # Thinking blocks produced this turn but not yet attached to a _memory
+        # entry — flushed into the next assistant _add_message so later turns
+        # replay them (preserved thinking).
+        uncommitted_thinking: List[Dict[str, Any]] = []
 
         while True:
             stream = self._llm.chat_completion(
@@ -1444,8 +1459,12 @@ class BasicMemoryAgent(AgentInterface):
                     # Keep the thinking block (text + signature) in the assistant
                     # turn so it's replayed ahead of any tool_use when we echo
                     # this turn back — Anthropic requires that when thinking is
-                    # on. Not yielded to the user, not stored to memory.
+                    # on. Also queued for _memory (via _add_message below) so
+                    # later TURNS replay it too — Opus 4.5+ keeps replayed
+                    # thinking from all prior turns in context. Not yielded to
+                    # the user.
                     current_assistant_message_content.append(event["data"])
+                    uncommitted_thinking.append(event["data"])
                 # elif event["type"] == "message_delta":
                 #     if event["data"]["delta"].get("stop_reason"):
                 #         stop_reason = event["data"]["delta"].get("stop_reason")
@@ -1478,7 +1497,12 @@ class BasicMemoryAgent(AgentInterface):
                         ]
                     ).strip()
                     if assistant_text_for_memory:
-                        self._add_message(assistant_text_for_memory, "assistant")
+                        self._add_message(
+                            assistant_text_for_memory,
+                            "assistant",
+                            thinking_blocks=uncommitted_thinking or None,
+                        )
+                        uncommitted_thinking = []
 
                 # Split: in-process tools (alarms + self-check + steam) are
                 # handled here, provider-agnostic; everything else goes to the
@@ -1566,7 +1590,11 @@ class BasicMemoryAgent(AgentInterface):
                 continue
             else:
                 if current_turn_text:
-                    self._add_message(current_turn_text, "assistant")
+                    self._add_message(
+                        current_turn_text,
+                        "assistant",
+                        thinking_blocks=uncommitted_thinking or None,
+                    )
                 return
 
     async def _openai_tool_interaction_loop(

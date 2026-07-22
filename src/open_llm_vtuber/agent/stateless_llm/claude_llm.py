@@ -3,6 +3,7 @@ This class is responsible for handling asynchronous interaction with Claude API 
 for language generation.
 """
 
+import asyncio
 import json
 from typing import AsyncIterator, List, Dict, Any, Optional, Union
 
@@ -182,9 +183,73 @@ class AsyncLLM(StatelessLLMInterface):
             timeout=httpx.Timeout(120.0, connect=10.0),
             max_retries=4,
         )
+        # Fire-and-forget [usage]-log tasks (count_tokens is off the reply's
+        # critical path). Strong refs so the event loop can't GC them mid-run.
+        self._bg_tasks: set = set()
+        # Message-framing overhead of count_tokens (the wrapper around the
+        # counted text), calibrated once per process via a 1-token probe:
+        # count("x") - 1. None = not yet calibrated (retried on next use).
+        self._count_overhead: Optional[int] = None
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
         logger.debug(f"Base URL: {base_url}")
+
+    def _spawn_usage_log(
+        self, out_toks: int, think_toks: Any, visible_text: str
+    ) -> None:
+        """Emit the per-request [usage] line, counting the visible (summary)
+        thinking text in TOKENS via the free count_tokens endpoint so it
+        compares directly against the billed thinking_tokens. Runs as a
+        fire-and-forget task — one extra round-trip that must not delay the
+        reply's message_stop. Never raises; a failed count logs "?".
+
+        count_tokens wraps the text in a user message, so the raw count
+        includes a constant framing overhead. That constant is calibrated
+        once per process (count("x") - 1 — the API rejects empty content, so
+        a 1-token probe stands in for an empty one) and subtracted; BPE
+        merges at the role boundary can wobble it by ±1 token, which is
+        noise at the scale we compare. An uncalibrated line (probe failed)
+        logs the raw count."""
+        billed = think_toks if think_toks is not None else "n/a"
+        if not visible_text:
+            logger.info(
+                f"[usage] output_tokens={out_toks} thinking_tokens={billed} "
+                "visible_thinking_tokens=0 chars=0"
+            )
+            return
+
+        async def _count(text: str) -> int:
+            counted = await self.client.with_options(
+                timeout=15.0, max_retries=1
+            ).messages.count_tokens(
+                model=self.model,
+                messages=[{"role": "user", "content": text}],
+            )
+            return counted.input_tokens
+
+        async def _count_and_log() -> None:
+            if self._count_overhead is None:
+                try:
+                    self._count_overhead = max(0, await _count("x") - 1)
+                except Exception as e:
+                    logger.debug(f"count_tokens overhead probe failed: {e}")
+            try:
+                raw = await _count(visible_text)
+                if self._count_overhead is not None:
+                    visible = str(max(0, raw - self._count_overhead))
+                else:
+                    visible = str(raw)
+            except Exception as e:
+                logger.debug(f"count_tokens for [usage] failed: {e}")
+                visible = "?"
+            logger.info(
+                f"[usage] output_tokens={out_toks} thinking_tokens={billed} "
+                f"visible_thinking_tokens={visible} chars={len(visible_text)}"
+            )
+
+        task = asyncio.create_task(_count_and_log())
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     @classmethod
     def _resolve_max_tokens(cls, value: Any) -> int:
@@ -240,6 +305,26 @@ class AsyncLLM(StatelessLLMInterface):
 
     def _convert_message_format(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Convert message format to Claude's expected format."""
+        # Assistant entries may carry preserved thinking blocks from the turn
+        # that produced them (side field set by basic_memory_agent._add_message).
+        # Rebuild them into ordered content blocks — thinking first, then the
+        # visible text — and drop the side field so only valid API fields go on
+        # the wire. Opus 4.5+ keeps replayed thinking from ALL prior turns in
+        # context (reconstructed server-side from the signature). A
+        # cache_control tag attached by the agent rides on the text block,
+        # which stays last, so the breakpoint still covers the thinking blocks
+        # ahead of it.
+        thinking_blocks = message.get("thinking_blocks")
+        if message.get("role") == "assistant" and thinking_blocks:
+            new_content: List[Dict[str, Any]] = [dict(b) for b in thinking_blocks]
+            content = message.get("content")
+            if isinstance(content, str):
+                if content:
+                    new_content.append({"type": "text", "text": content})
+            elif isinstance(content, list):
+                new_content.extend(dict(c) for c in content)
+            return {"role": "assistant", "content": new_content}
+
         # Handle potential tool_result content blocks
         if isinstance(message.get("content"), list):
             new_content = []
@@ -438,6 +523,12 @@ class AsyncLLM(StatelessLLMInterface):
                 thinking_text = ""
                 thinking_signature = ""
                 thinking_redacted_data = None
+                # Per-REQUEST visible (summary) thinking text, across all
+                # thinking blocks. Counted in tokens at the end (via
+                # count_tokens, off-path) and logged next to the billed
+                # thinking_tokens so "is the log text a summary or verbatim?"
+                # is answerable per turn from two like-for-like numbers.
+                visible_thinking_parts: List[str] = []
 
                 async for event in stream:
                     if event.type == "message_start":
@@ -591,6 +682,8 @@ class AsyncLLM(StatelessLLMInterface):
                                 summary = thinking_text.strip()
                                 if summary:
                                     logger.info(f"[thinking] {summary}")
+                                if thinking_text:
+                                    visible_thinking_parts.append(thinking_text)
                             yield {"type": "thinking_complete", "data": block}
                             thinking_index = None
                             thinking_text = ""
@@ -688,6 +781,27 @@ class AsyncLLM(StatelessLLMInterface):
                                     f"[web_fetch] this reply used {n_fetches} "
                                     "web fetch request(s)"
                                 )
+                        # Per-request usage line, emitted on the delta that
+                        # carries stop_reason (the final one). thinking_tokens
+                        # is the BILLED raw reasoning (0 = the model skipped
+                        # thinking this request — grep-friendly signal for
+                        # trigger-rate stats). The visible summary text is
+                        # token-counted off-path so both sides use the same
+                        # unit; see _spawn_usage_log.
+                        if getattr(event.delta, "stop_reason", None):
+                            out_toks = getattr(event.usage, "output_tokens", 0) or 0
+                            details = getattr(
+                                event.usage, "output_tokens_details", None
+                            )
+                            if isinstance(details, dict):
+                                think_toks = details.get("thinking_tokens")
+                            else:
+                                think_toks = getattr(details, "thinking_tokens", None)
+                            self._spawn_usage_log(
+                                out_toks,
+                                think_toks,
+                                "\n".join(visible_thinking_parts),
+                            )
                         yield {
                             "type": "message_delta",
                             "data": {
