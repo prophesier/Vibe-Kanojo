@@ -7,6 +7,7 @@ class DiaryRagConfig(I18nMixin):
     """Configuration for diary retrieval-augmented recall (long-tail memory)."""
 
     enabled: bool = Field(True, alias="enabled")
+    auto_inject: bool = Field(True, alias="auto_inject")
     openai_api_key: str = Field("", alias="openai_api_key")
     base_url: str = Field("", alias="base_url")
     embedding_model: str = Field("text-embedding-3-small", alias="embedding_model")
@@ -24,6 +25,10 @@ class DiaryRagConfig(I18nMixin):
         "enabled": Description(
             en="Enable semantic recall of older diaries via embeddings",
             zh="启用基于向量的旧日记语义召回",
+        ),
+        "auto_inject": Description(
+            en="Inject retrieved diaries into the outgoing user message automatically each turn. Set false to keep the index and the memory_search tool available while stopping per-turn auto-injection (the character can still recall on her own initiative)",
+            zh="每轮自动把召回的日记注入到发出的用户消息里。设为 false 则保留索引和 memory_search 工具（角色仍可主动检索），只停掉逐轮自动注入",
         ),
         "openai_api_key": Description(
             en="OpenAI API key for embeddings. Leave blank to reuse the openai_llm provider's key",
@@ -85,6 +90,7 @@ class FactsRagConfig(I18nMixin):
     """
 
     enabled: bool = Field(False, alias="enabled")
+    auto_inject: bool = Field(True, alias="auto_inject")
     similarity_threshold: float = Field(0.55, alias="similarity_threshold")
     topn_threshold: float = Field(0.70, alias="topn_threshold")
     max_retrievals_per_turn: int = Field(3, alias="max_retrievals_per_turn")
@@ -99,6 +105,10 @@ class FactsRagConfig(I18nMixin):
         "enabled": Description(
             en="Enable semantic recall of low-importance facts via embeddings",
             zh="启用基于向量的低优先级事实语义召回",
+        ),
+        "auto_inject": Description(
+            en="Inject retrieved facts into the outgoing user message automatically each turn. Set false to keep the index, the tier-filtered header, and the memory_search tool while stopping per-turn auto-injection (the character can still recall on her own initiative)",
+            zh="每轮自动把召回的事实注入到发出的用户消息里。设为 false 则保留索引、按重要度过滤的 header 和 memory_search 工具（角色仍可主动检索），只停掉逐轮自动注入",
         ),
         "similarity_threshold": Description(
             en="Minimum cosine similarity for any fact to be inserted (gate)",

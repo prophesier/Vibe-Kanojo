@@ -55,6 +55,10 @@ system_config:
     # need OpenAI; retrieval degrades gracefully if unavailable.
     diary_rag:
       enabled: false
+      # Auto-inject retrieved diaries into the outgoing user message each turn.
+      # false = keep the index and the memory_search tool (the character can
+      # still recall on her own initiative) but stop per-turn auto-injection.
+      auto_inject: true
       # OpenAI key/endpoint for embeddings. Leave blank to reuse the openai_llm
       # provider's credentials (these are a separate service from chat).
       openai_api_key: ""
@@ -88,6 +92,9 @@ system_config:
     # `low`, so the header empties until you promote the ones you want kept).
     facts_rag:
       enabled: false
+      # Same switch as diary_rag.auto_inject: false stops per-turn injection
+      # while the index, the tier-filtered header and memory_search stay live.
+      auto_inject: true
       similarity_threshold: 0.55
       topn_threshold: 0.70
       max_retrievals_per_turn: 3

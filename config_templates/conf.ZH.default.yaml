@@ -48,6 +48,9 @@ system_config:
     # 语义检索并临时插入。嵌入需要 OpenAI；不可用时优雅降级、不影响对话。
     diary_rag:
       enabled: false
+      # 每轮自动把召回的日记注入发出的用户消息。false=保留索引和 memory_search
+      # 工具（角色仍可主动检索），只停掉逐轮自动注入。
+      auto_inject: true
       # 嵌入用的 OpenAI key/端点。留空则复用 openai_llm 的凭据（与聊天是不同服务）。
       openai_api_key: ""
       base_url: ""
@@ -66,6 +69,8 @@ system_config:
     # 启用前请先给事实分层：所有现有事实会迁移成 low，开头会先清空，需手动把要保留的提级。
     facts_rag:
       enabled: false
+      # 同 diary_rag.auto_inject：false=停逐轮注入，索引/分层 header/memory_search 照常。
+      auto_inject: true
       similarity_threshold: 0.55
       topn_threshold: 0.70
       max_retrievals_per_turn: 3

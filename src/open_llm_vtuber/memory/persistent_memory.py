@@ -337,7 +337,13 @@ class PersistentMemoryManager:
                         diary_rag_config, "embedding_model", "text-embedding-3-small"
                     ),
                 )
-                logger.info("[memory] Diary RAG enabled.")
+                # Echo auto_inject so a typo'd conf key (silently dropped by
+                # pydantic) is visible at startup.
+                logger.info(
+                    "[memory] Diary RAG enabled (auto_inject={}).".format(
+                        getattr(diary_rag_config, "auto_inject", True)
+                    )
+                )
             else:
                 logger.warning(
                     "[memory] diary_rag enabled but no embedding API key resolved "
@@ -380,7 +386,11 @@ class PersistentMemoryManager:
                         diary_rag_config, "embedding_model", "text-embedding-3-small"
                     ),
                 )
-                logger.info("[memory] Facts RAG enabled.")
+                logger.info(
+                    "[memory] Facts RAG enabled (auto_inject={}).".format(
+                        getattr(facts_rag_config, "auto_inject", True)
+                    )
+                )
                 if getattr(facts_rag_config, "rerank_enabled", False):
                     from .reranker import MemoryReranker
 

@@ -1205,6 +1205,10 @@ class BasicMemoryAgent(AgentInterface):
         mgr = self._memory_manager
         if not mgr or not getattr(mgr, "diary_rag_active", False):
             return
+        # auto_inject=false decouples: index + memory_search stay live, but
+        # nothing is pushed per turn (see FactsRagConfig.auto_inject).
+        if not getattr(mgr.diary_rag_config, "auto_inject", True):
+            return
         try:
             query = " ".join(
                 t.content for t in input_data.texts if t.source == TextSource.INPUT
@@ -1324,6 +1328,11 @@ class BasicMemoryAgent(AgentInterface):
         self._pending_facts_block = ""
         mgr = self._memory_manager
         if not mgr or not getattr(mgr, "facts_rag_active", False):
+            return
+        # auto_inject=false decouples: index + tier-filtered header +
+        # memory_search stay live, but nothing is pushed per turn — the
+        # character reaches facts only through her own tool calls.
+        if not getattr(mgr.facts_rag_config, "auto_inject", True):
             return
         try:
             query = " ".join(
