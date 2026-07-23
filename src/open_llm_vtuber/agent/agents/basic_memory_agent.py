@@ -15,6 +15,7 @@ import hashlib
 import re
 import time
 import unicodedata
+from copy import deepcopy
 from datetime import datetime, timedelta
 from loguru import logger
 from .agent_interface import AgentInterface
@@ -301,7 +302,7 @@ class BasicMemoryAgent(AgentInterface):
         role: str,
         display_text: DisplayText | None = None,
         skip_memory: bool = False,
-        thinking_blocks: Optional[List[Dict[str, Any]]] = None,
+        claude_protocol: Optional[List[Dict[str, Any]]] = None,
     ):
         """Add message to memory."""
         if skip_memory:
@@ -354,15 +355,18 @@ class BasicMemoryAgent(AgentInterface):
             if display_text.avatar:
                 message_data["avatar"] = display_text.avatar
 
-        if role == "assistant" and thinking_blocks:
-            # Claude-path side field: preserved thinking blocks (summary text +
-            # signature, or redacted data) from the turn that produced this
-            # reply. claude_llm._convert_message_format replays them verbatim
-            # ahead of the text on later requests, so Opus keeps its prior
-            # reasoning in context across turns (preserved thinking). Lives in
-            # _memory only — on-disk history stays clean, so a restart drops
-            # them by design.
-            message_data["thinking_blocks"] = list(thinking_blocks)
+        if (
+            role == "assistant"
+            and claude_protocol
+            and self._claude_protocol_has_thinking(claude_protocol)
+        ):
+            # Claude-path side field: the exact assistant/tool-result protocol
+            # sequence that produced this visible reply. It is expanded
+            # verbatim by claude_llm instead of rebuilding an assistant message
+            # from selected thinking/text blocks. This is in-memory only;
+            # on-disk chat history remains clean and a restart safely falls
+            # back to the visible text without thinking blocks.
+            message_data["claude_protocol"] = deepcopy(claude_protocol)
 
         if (
             self._memory
@@ -375,6 +379,23 @@ class BasicMemoryAgent(AgentInterface):
         self._last_message_dt = datetime.now()
         if role == "user":
             self._last_user_message_dt = self._last_message_dt
+
+    @staticmethod
+    def _claude_protocol_has_thinking(
+        protocol: List[Dict[str, Any]],
+    ) -> bool:
+        """Whether an exact Claude transcript contains signed thinking."""
+        for message in protocol:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            if any(
+                isinstance(block, dict)
+                and block.get("type") in {"thinking", "redacted_thinking"}
+                for block in content
+            ):
+                return True
+        return False
 
     def set_memory_manager(self, manager) -> None:
         """Attach a PersistentMemoryManager for fact extraction and diary injection."""
@@ -830,41 +851,50 @@ class BasicMemoryAgent(AgentInterface):
     def _attach_cache_breakpoint(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Mark the last message's last text block with cache_control.
+        """Mark the newest safe history block with ``cache_control``.
 
-        Returns a new list with the last message replaced; the original
-        message objects (which live in self._memory) are not mutated.
-        Only applies for Claude LLM — otherwise returns messages unchanged.
+        Exact Claude protocol entries containing signed thinking must remain
+        structurally unchanged from the original response, so they are skipped.
+        The preceding user message still provides an incremental cache
+        breakpoint without modifying the latest assistant response.
+
+        Returns a new list with one message replaced; the original message
+        objects (which live in self._memory) are not mutated. Only applies for
+        Claude LLM — otherwise returns messages unchanged.
         """
         if not self._is_claude_llm() or not messages:
             return messages
 
         new_messages = list(messages)
-        last = new_messages[-1]
-        content = last.get("content")
+        for index in range(len(new_messages) - 1, -1, -1):
+            candidate = new_messages[index]
+            if candidate.get("claude_protocol") or candidate.get("thinking_blocks"):
+                continue
 
-        if isinstance(content, str):
-            new_last = {
-                **last,
-                "content": [
-                    {
-                        "type": "text",
-                        "text": content,
-                        "cache_control": self._CACHE_CONTROL_1H,
-                    }
-                ],
-            }
-        elif isinstance(content, list) and content:
-            new_content = [dict(c) for c in content]
-            new_content[-1] = {
-                **new_content[-1],
-                "cache_control": self._CACHE_CONTROL_1H,
-            }
-            new_last = {**last, "content": new_content}
-        else:
-            return new_messages
+            content = candidate.get("content")
+            if isinstance(content, str):
+                replacement = {
+                    **candidate,
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "cache_control": self._CACHE_CONTROL_1H,
+                        }
+                    ],
+                }
+            elif isinstance(content, list) and content:
+                new_content = [dict(block) for block in content]
+                new_content[-1] = {
+                    **new_content[-1],
+                    "cache_control": self._CACHE_CONTROL_1H,
+                }
+                replacement = {**candidate, "content": new_content}
+            else:
+                continue
 
-        new_messages[-1] = new_last
+            new_messages[index] = replacement
+            break
         return new_messages
 
     @staticmethod
@@ -1054,6 +1084,11 @@ class BasicMemoryAgent(AgentInterface):
         self._interrupt_handled = True
 
         if self._memory and self._memory[-1]["role"] == "assistant":
+            # The user heard only a truncated reply, so the original exact
+            # Claude transcript no longer represents conversation reality.
+            # Drop it and replay the heard text without thinking blocks.
+            self._memory[-1].pop("claude_protocol", None)
+            self._memory[-1].pop("thinking_blocks", None)
             if not self._memory[-1]["content"].endswith("..."):
                 self._memory[-1]["content"] = heard_response + "..."
             else:
@@ -1102,8 +1137,9 @@ class BasicMemoryAgent(AgentInterface):
     def _to_messages(self, input_data: BatchInput) -> List[Dict[str, Any]]:
         """Prepare messages for LLM API call."""
         messages = self._memory.copy()
-        # Cache breakpoint goes on the last historical message — everything
-        # up to and including it gets cached by Anthropic, while the fresh
+        # Cache breakpoint goes on the newest safe historical block. Exact
+        # Claude assistant transcripts with signed thinking are skipped, so
+        # their preceding user block becomes the breakpoint instead. The fresh
         # user input appended below stays uncached. No-op for non-Claude.
         messages = self._attach_cache_breakpoint(messages)
         if self._openai_explicit_cache():
@@ -1411,10 +1447,11 @@ class BasicMemoryAgent(AgentInterface):
         pending_tool_calls = []
         current_assistant_message_content = []
         emitted_markers: set = set()  # inline tool tags shown once per turn
-        # Thinking blocks produced this turn but not yet attached to a _memory
-        # entry — flushed into the next assistant _add_message so later turns
-        # replay them (preserved thinking).
-        uncommitted_thinking: List[Dict[str, Any]] = []
+        # Exact Claude messages generated after the user's input. Keeping the
+        # assistant/tool-result alternation is essential: thinking blocks from
+        # different tool-loop requests must never be flattened together.
+        claude_protocol: List[Dict[str, Any]] = []
+        protocol_is_exact = True
 
         while True:
             stream = self._llm.chat_completion(
@@ -1422,6 +1459,7 @@ class BasicMemoryAgent(AgentInterface):
             )
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
+            current_assistant_message_is_exact = False
 
             async for event in stream:
                 if event["type"] == "text_delta":
@@ -1465,15 +1503,18 @@ class BasicMemoryAgent(AgentInterface):
                     if mk:
                         yield mk
                 elif event["type"] == "thinking_complete":
-                    # Keep the thinking block (text + signature) in the assistant
-                    # turn so it's replayed ahead of any tool_use when we echo
-                    # this turn back — Anthropic requires that when thinking is
-                    # on. Also queued for _memory (via _add_message below) so
-                    # later TURNS replay it too — Opus 4.5+ keeps replayed
-                    # thinking from all prior turns in context. Not yielded to
-                    # the user.
+                    # Manual fallback while streaming. At message_stop the SDK's
+                    # exact accumulated response replaces this reconstructed
+                    # list via assistant_message_complete.
                     current_assistant_message_content.append(event["data"])
-                    uncommitted_thinking.append(event["data"])
+                elif event["type"] == "assistant_message_complete":
+                    assistant_message = event.get("data") or {}
+                    content = assistant_message.get("content")
+                    if assistant_message.get("role") == "assistant" and isinstance(
+                        content, list
+                    ):
+                        current_assistant_message_content[:] = deepcopy(content)
+                        current_assistant_message_is_exact = True
                 # elif event["type"] == "message_delta":
                 #     if event["data"]["delta"].get("stop_reason"):
                 #         stop_reason = event["data"]["delta"].get("stop_reason")
@@ -1485,33 +1526,36 @@ class BasicMemoryAgent(AgentInterface):
                     return
 
             if pending_tool_calls:
-                filtered_assistant_content = [
-                    block
-                    for block in current_assistant_message_content
-                    if not (
-                        block.get("type") == "text"
-                        and not block.get("text", "").strip()
+                if current_assistant_message_is_exact:
+                    assistant_content_for_replay = deepcopy(
+                        current_assistant_message_content
                     )
-                ]
-
-                if filtered_assistant_content:
-                    messages.append(
-                        {"role": "assistant", "content": filtered_assistant_content}
+                else:
+                    # Compatibility fallback for a custom/old stream wrapper.
+                    # It keeps the live tool loop working, but the transcript is
+                    # not persisted across turns because it is not guaranteed
+                    # to contain every immutable Claude block.
+                    protocol_is_exact = False
+                    logger.warning(
+                        "Claude stream ended without an exact assistant "
+                        "snapshot; falling back to reconstructed tool content."
                     )
-                    assistant_text_for_memory = "".join(
-                        [
-                            c["text"]
-                            for c in filtered_assistant_content
-                            if c["type"] == "text"
-                        ]
-                    ).strip()
-                    if assistant_text_for_memory:
-                        self._add_message(
-                            assistant_text_for_memory,
-                            "assistant",
-                            thinking_blocks=uncommitted_thinking or None,
+                    assistant_content_for_replay = [
+                        block
+                        for block in current_assistant_message_content
+                        if not (
+                            block.get("type") == "text"
+                            and not block.get("text", "").strip()
                         )
-                        uncommitted_thinking = []
+                    ]
+
+                if assistant_content_for_replay:
+                    assistant_protocol_message = {
+                        "role": "assistant",
+                        "content": assistant_content_for_replay,
+                    }
+                    messages.append(deepcopy(assistant_protocol_message))
+                    claude_protocol.append(deepcopy(assistant_protocol_message))
 
                 # Split: in-process tools (alarms + self-check + steam) are
                 # handled here, provider-agnostic; everything else goes to the
@@ -1595,14 +1639,31 @@ class BasicMemoryAgent(AgentInterface):
                         )
 
                 if tool_results_for_llm:
-                    messages.append({"role": "user", "content": tool_results_for_llm})
+                    tool_result_message = {
+                        "role": "user",
+                        "content": tool_results_for_llm,
+                    }
+                    messages.append(deepcopy(tool_result_message))
+                    claude_protocol.append(deepcopy(tool_result_message))
                 continue
             else:
                 if current_turn_text:
+                    protocol_for_memory: Optional[List[Dict[str, Any]]] = None
+                    if (
+                        protocol_is_exact
+                        and current_assistant_message_is_exact
+                        and current_assistant_message_content
+                    ):
+                        protocol_for_memory = claude_protocol + [
+                            {
+                                "role": "assistant",
+                                "content": deepcopy(current_assistant_message_content),
+                            }
+                        ]
                     self._add_message(
                         current_turn_text,
                         "assistant",
-                        thinking_blocks=uncommitted_thinking or None,
+                        claude_protocol=protocol_for_memory,
                     )
                 return
 
@@ -1912,12 +1973,21 @@ class BasicMemoryAgent(AgentInterface):
             # No tools at all: plain streaming completion.
             logger.info("Starting simple chat completion.")
             complete_response = ""
+            claude_assistant_message: Optional[Dict[str, Any]] = None
             async for event in self._llm.chat_completion(
                 messages, self._build_system_for_llm()
             ):
                 text_chunk = ""
                 if isinstance(event, dict) and event.get("type") == "text_delta":
                     text_chunk = event.get("text", "")
+                elif (
+                    isinstance(event, dict)
+                    and event.get("type") == "assistant_message_complete"
+                ):
+                    candidate = event.get("data")
+                    if isinstance(candidate, dict):
+                        claude_assistant_message = deepcopy(candidate)
+                    continue
                 elif isinstance(event, str):
                     text_chunk = event
                 else:
@@ -1926,7 +1996,15 @@ class BasicMemoryAgent(AgentInterface):
                     yield text_chunk
                     complete_response += text_chunk
             if complete_response:
-                self._add_message(complete_response, "assistant")
+                self._add_message(
+                    complete_response,
+                    "assistant",
+                    claude_protocol=(
+                        [claude_assistant_message]
+                        if claude_assistant_message is not None
+                        else None
+                    ),
+                )
 
         return chat_with_memory
 

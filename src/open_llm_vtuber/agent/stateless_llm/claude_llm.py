@@ -5,6 +5,7 @@ for language generation.
 
 import asyncio
 import json
+from copy import deepcopy
 from typing import AsyncIterator, List, Dict, Any, Optional, Union
 
 import anthropic
@@ -305,25 +306,16 @@ class AsyncLLM(StatelessLLMInterface):
 
     def _convert_message_format(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """Convert message format to Claude's expected format."""
-        # Assistant entries may carry preserved thinking blocks from the turn
-        # that produced them (side field set by basic_memory_agent._add_message).
-        # Rebuild them into ordered content blocks — thinking first, then the
-        # visible text — and drop the side field so only valid API fields go on
-        # the wire. Opus 4.5+ keeps replayed thinking from ALL prior turns in
-        # context (reconstructed server-side from the signature). A
-        # cache_control tag attached by the agent rides on the text block,
-        # which stays last, so the breakpoint still covers the thinking blocks
-        # ahead of it.
-        thinking_blocks = message.get("thinking_blocks")
-        if message.get("role") == "assistant" and thinking_blocks:
-            new_content: List[Dict[str, Any]] = [dict(b) for b in thinking_blocks]
-            content = message.get("content")
-            if isinstance(content, str):
-                if content:
-                    new_content.append({"type": "text", "text": content})
-            elif isinstance(content, list):
-                new_content.extend(dict(c) for c in content)
-            return {"role": "assistant", "content": new_content}
+        # These are in-memory transport side fields, never Anthropic API
+        # parameters. ``thinking_blocks`` is the legacy field that rebuilt an
+        # assistant message from selected blocks; deliberately drop it instead
+        # of replaying it because reconstructed thinking sequences can fail the
+        # API's immutable-latest-assistant validation.
+        message = {
+            key: value
+            for key, value in message.items()
+            if key not in {"claude_protocol", "thinking_blocks"}
+        }
 
         # Handle potential tool_result content blocks
         if isinstance(message.get("content"), list):
@@ -374,6 +366,45 @@ class AsyncLLM(StatelessLLMInterface):
         # Handle plain text content or non-list content
         return message
 
+    def _convert_messages_format(
+        self, messages: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Convert and expand the agent's in-memory Claude transcript.
+
+        A visible assistant entry can carry ``claude_protocol``: the complete
+        sequence of assistant responses and user tool-result messages that
+        produced that visible reply. Thinking blocks are signed and immutable,
+        so this sequence must be replayed exactly rather than reconstructed
+        from the visible text. The side field is in-memory only.
+        """
+        converted: List[Dict[str, Any]] = []
+        for message in messages:
+            if message.get("role") == "system":
+                continue
+
+            protocol = message.get("claude_protocol")
+            if (
+                message.get("role") == "assistant"
+                and isinstance(protocol, list)
+                and protocol
+                and all(isinstance(item, dict) for item in protocol)
+            ):
+                converted.extend(deepcopy(protocol))
+                continue
+
+            converted.append(self._convert_message_format(message))
+        return converted
+
+    @staticmethod
+    def _assistant_message_for_replay(message: Any) -> Dict[str, Any]:
+        """Serialize an SDK response as the exact assistant message to replay."""
+        return {
+            "role": "assistant",
+            "content": [
+                block.model_dump(exclude_none=True) for block in message.content
+            ],
+        }
+
     async def chat_completion(
         self,
         messages: List[Dict[str, Any]],
@@ -406,6 +437,7 @@ class AsyncLLM(StatelessLLMInterface):
             - {"type": "tool_input_delta", "tool_id": ..., "partial_json": "..."} # Optional
             - {"type": "tool_use_complete", "data": {"id": ..., "name": ..., "input": {...}}}
             - {"type": "thinking_complete", "data": {"type": "thinking", "thinking": ..., "signature": ...}}
+            - {"type": "assistant_message_complete", "data": {"role": "assistant", "content": [...]}}
             - {"type": "message_delta", "data": ...} # e.g., stop_reason
             - {"type": "message_stop"}
             - {"type": "error", "message": "..."}
@@ -417,12 +449,9 @@ class AsyncLLM(StatelessLLMInterface):
             max_tokens = self._max_tokens
         text_emitted = False
         try:
-            # Filter out system messages and convert message format
-            converted_messages = [
-                self._convert_message_format(msg)
-                for msg in messages
-                if msg["role"] != "system"
-            ]
+            # Filter system messages, expand exact Claude tool transcripts, and
+            # convert the remaining generic message blocks.
+            converted_messages = self._convert_messages_format(messages)
 
             # Build the tool list: caller-supplied tools plus Anthropic's
             # native server tools when enabled. Both web_search and
@@ -811,6 +840,16 @@ class AsyncLLM(StatelessLLMInterface):
                         }
                     elif event.type == "message_stop":
                         logger.debug("Stream: message_stop")
+                        # The SDK has accumulated the complete response by this
+                        # point. Hand that exact message to the agent before the
+                        # stop event so tool loops can echo every block unchanged
+                        # (including redacted thinking and server-tool blocks).
+                        yield {
+                            "type": "assistant_message_complete",
+                            "data": self._assistant_message_for_replay(
+                                stream.current_message_snapshot
+                            ),
+                        }
                         yield {"type": "message_stop"}
                         # No need to break here, the context manager handles the end
                     elif event.type == "ping":
