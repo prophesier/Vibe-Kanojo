@@ -177,7 +177,7 @@ def run(console_log_level: str):
     init_logger(console_log_level)
     logger.info(f"Open-LLM-VTuber, version v{get_version()}")
 
-    # Write PID file so restart.bat (triggered by Discord /restart) can
+    # Write PID file so restart.bat (triggered by Discord /restart or /resume) can
     # cleanly target this process. The file is removed on graceful exit.
     write_pid("olv")
 

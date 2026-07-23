@@ -178,37 +178,17 @@ class DiscordVTuberBot(discord.Client):
 
         @self._tree.command(
             name="restart",
-            description="Pull latest code and restart OLV + Discord bot (admin only)",
+            description="Restart OLV + Discord bot with a new session (admin only)",
         )
-        async def restart(interaction: discord.Interaction) -> None:  # noqa: ARG001
-            if interaction.user.id != self._admin_user_id:
-                await interaction.response.send_message("Unauthorized.", ephemeral=True)
-                return
-            restart_bat = self._project_root / "restart.bat"
-            if not restart_bat.exists():
-                await interaction.response.send_message(
-                    f"restart.bat not found at {restart_bat}. "
-                    "Copy it from the repo root to your project root first.",
-                    ephemeral=True,
-                )
-                return
-            await interaction.response.send_message(
-                "🔄 Pulling latest code and restarting OLV + Discord bot. "
-                "Expect ~10-20s of downtime.",
-                ephemeral=True,
-            )
-            # Persist context so the post-restart bot can announce completion
-            # in the same channel. Written before close() so it's saved even
-            # if the bot is taskkilled before atexit hooks run.
-            self._save_restart_pending(
-                channel_id=interaction.channel_id,
-                user_id=interaction.user.id,
-            )
-            self._spawn_detached_restart(restart_bat)
-            # Bot will be killed by restart.bat shortly; close gracefully so
-            # the PID file atexit cleanup runs.
-            logger.info("Restart requested by admin; shutting down bot.")
-            await self.close()
+        async def restart(interaction: discord.Interaction) -> None:
+            await self._request_restart(interaction, resume=False)
+
+        @self._tree.command(
+            name="resume",
+            description="Restart OLV + Discord bot and continue the previous session",
+        )
+        async def resume(interaction: discord.Interaction) -> None:
+            await self._request_restart(interaction, resume=True)
 
         @self._tree.command(
             name="logs",
@@ -703,10 +683,92 @@ class DiscordVTuberBot(discord.Client):
             return f"{m}m {s}s"
         return f"{s}s"
 
+    async def _request_restart(
+        self, interaction: discord.Interaction, *, resume: bool
+    ) -> None:
+        """Validate and launch a detached local restart.
+
+        ``resume=False`` starts a new chat session; ``resume=True`` passes
+        ``--resume`` to ``run_server.py`` so the previous session is continued.
+        The launcher is spawned before this bot closes. If spawning fails, the
+        bot stays online and reports the failure instead of stranding the
+        remote admin.
+        """
+        if interaction.user.id != self._admin_user_id:
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+
+        restart_bat = self._project_root / "restart.bat"
+        if sys.platform == "win32" and not restart_bat.exists():
+            await interaction.response.send_message(
+                f"restart.bat not found at {restart_bat}. "
+                "Copy it from restart.bat.example first.",
+                ephemeral=True,
+            )
+            return
+        if sys.platform != "win32":
+            restart_sh = self._project_root / "restart.sh"
+            if not restart_sh.exists():
+                await interaction.response.send_message(
+                    f"restart.sh not found at {restart_sh}.",
+                    ephemeral=True,
+                )
+                return
+
+        # Persist context before close() so the replacement bot can announce
+        # completion in this channel (or DM the admin as a fallback).
+        try:
+            self._save_restart_pending(
+                channel_id=interaction.channel_id,
+                user_id=interaction.user.id,
+                resume=resume,
+            )
+        except Exception as e:
+            logger.exception(f"Failed to save restart state: {e}")
+            await interaction.response.send_message(
+                f"❌ Could not save restart state: {type(e).__name__}: {e}",
+                ephemeral=True,
+            )
+            return
+
+        if not self._spawn_detached_restart(restart_bat, resume=resume):
+            self._clear_restart_pending()
+            await interaction.response.send_message(
+                "❌ Failed to launch the restart script. The bot is still running; "
+                "check the Discord log.",
+                ephemeral=True,
+            )
+            return
+
+        if resume:
+            status = (
+                "🔄 Restarting OLV + Discord bot in resume mode. "
+                "The previous session will be continued."
+            )
+        else:
+            status = (
+                "🔄 Restarting OLV + Discord bot. "
+                "The next connection will start a new session."
+            )
+        await interaction.response.send_message(
+            f"{status} Expect ~10-20s of downtime.",
+            ephemeral=True,
+        )
+
+        # The detached batch waits briefly before reading PID files. Close
+        # gracefully now so the Discord PID file is removed by its atexit hook.
+        mode = "resume" if resume else "fresh"
+        logger.info(
+            f"{mode.capitalize()} restart requested by admin; shutting down bot."
+        )
+        await self.close()
+
     def _restart_state_path(self) -> Path:
         return self._project_root / "pids" / "restart_pending.json"
 
-    def _save_restart_pending(self, *, channel_id: int, user_id: int) -> None:
+    def _save_restart_pending(
+        self, *, channel_id: Optional[int], user_id: int, resume: bool
+    ) -> None:
         path = self._restart_state_path()
         path.parent.mkdir(exist_ok=True)
         path.write_text(
@@ -715,39 +777,63 @@ class DiscordVTuberBot(discord.Client):
                     "channel_id": channel_id,
                     "user_id": user_id,
                     "initiated_at": time.time(),
+                    "resume": resume,
                 }
             )
         )
 
-    def _spawn_detached_restart(self, restart_bat: Path) -> None:
+    def _clear_restart_pending(self) -> None:
+        try:
+            self._restart_state_path().unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning(f"Failed to clear restart state: {e}")
+
+    def _spawn_detached_restart(
+        self, restart_bat: Path, *, resume: bool = False
+    ) -> bool:
         """Launch restart.bat in a detached process so it outlives this bot."""
         if sys.platform == "win32":
             # `cmd /c start "" "path"` spawns a brand-new cmd window for the
             # bat. The window is independent of this Python process, so it
-            # survives the bot's imminent shutdown. Keeping the window
-            # visible (rather than DETACHED_PROCESS) lets the user see git
-            # pull / launch output if something goes wrong.
+            # survives the bot's imminent shutdown. Keeping the launcher window
+            # visible makes local startup failures diagnosable.
             try:
+                command = ["cmd", "/c", "start", "", str(restart_bat)]
+                if resume:
+                    command.append("--resume")
                 subprocess.Popen(
-                    ["cmd", "/c", "start", "", str(restart_bat)],
+                    command,
                     cwd=str(self._project_root),
                     close_fds=True,
                 )
-                logger.info(f"Spawned restart script: {restart_bat}")
+                logger.info(
+                    f"Spawned restart script: {restart_bat} "
+                    f"(mode={'resume' if resume else 'fresh'})"
+                )
+                return True
             except Exception as e:
                 logger.exception(f"Failed to spawn restart script: {e}")
+                return False
         else:
             # Non-Windows fallback: best-effort, expects a restart.sh script.
             restart_sh = self._project_root / "restart.sh"
             if restart_sh.exists():
-                subprocess.Popen(
-                    ["bash", str(restart_sh)],
-                    start_new_session=True,
-                    close_fds=True,
-                    cwd=str(self._project_root),
-                )
-            else:
-                logger.error("Non-Windows platform but restart.sh not found.")
+                try:
+                    command = ["bash", str(restart_sh)]
+                    if resume:
+                        command.append("--resume")
+                    subprocess.Popen(
+                        command,
+                        start_new_session=True,
+                        close_fds=True,
+                        cwd=str(self._project_root),
+                    )
+                    return True
+                except Exception as e:
+                    logger.exception(f"Failed to spawn restart script: {e}")
+                    return False
+            logger.error("Non-Windows platform but restart.sh not found.")
+            return False
 
     async def setup_hook(self) -> None:
         """Sync slash commands once on startup."""
@@ -774,7 +860,7 @@ class DiscordVTuberBot(discord.Client):
     async def on_ready(self) -> None:
         user = self.user
         logger.info(f"Discord bot ready as {user} (id={getattr(user, 'id', '?')})")
-        # If we got here via /restart, announce completion in the originating
+        # If we got here via /restart or /resume, announce completion in the originating
         # channel. This is a one-shot: the state file is deleted after the
         # attempt regardless of success.
         await self._maybe_announce_restart_complete()
@@ -799,6 +885,7 @@ class DiscordVTuberBot(discord.Client):
         channel_id = data.get("channel_id")
         user_id = data.get("user_id")
         initiated_at = float(data.get("initiated_at") or time.time())
+        resume = bool(data.get("resume", False))
 
         # Hold the notification until OLV's startup backfill has settled. Backfill
         # can rewrite facts → change the system prompt; if the user starts talking
@@ -812,11 +899,20 @@ class DiscordVTuberBot(discord.Client):
         # on_message (filtered by message.author.bot), so this notification
         # cannot trigger the OLV conversation pipeline or pollute chat history.
         embed = discord.Embed(
-            title="✅ 再起動完了",
-            description="OLV と Discord bot の再起動が完了し、両方とも稼働中です。",
+            title="✅ 再開完了" if resume else "✅ 再起動完了",
+            description=(
+                "OLV と Discord bot の再起動が完了し、前回のセッションを継続しています。"
+                if resume
+                else "OLV と Discord bot の再起動が完了し、両方とも稼働中です。"
+            ),
             color=0x57F287,
         )
         embed.add_field(name="所要時間", value=f"{elapsed:.1f} 秒", inline=True)
+        embed.add_field(
+            name="セッション",
+            value="前回を継続" if resume else "新規開始",
+            inline=True,
+        )
         embed.add_field(
             name="メモリ整理",
             value="完了" if settled else "進行中の可能性",

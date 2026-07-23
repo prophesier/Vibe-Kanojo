@@ -67,12 +67,12 @@ class DiscordConfig(I18nMixin):
         "admin_user_id": Description(
             en=(
                 "Discord user ID authorized to use admin slash commands like "
-                "/restart. Set to 0 (default) to disable admin commands "
+                "/restart and /resume. Set to 0 (default) to disable admin commands "
                 "entirely. Enable Discord developer mode, right-click your "
                 "profile, and 'Copy User ID' to obtain it."
             ),
             zh=(
-                "可使用 /restart 等管理员斜杠命令的 Discord 用户 ID。设为 0（默认）"
+                "可使用 /restart、/resume 等管理员斜杠命令的 Discord 用户 ID。设为 0（默认）"
                 "则完全禁用管理命令。开启 Discord 开发者模式后，右键自己头像 → "
                 "「复制用户 ID」获取。"
             ),

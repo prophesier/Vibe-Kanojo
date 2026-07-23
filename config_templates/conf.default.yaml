@@ -692,7 +692,7 @@ discord_config:
   # Override the OLV WebSocket URL. Empty = derive from system_config:
   # ws://{system_config.host}:{system_config.port}/proxy-ws
   olv_ws_url: ""
-  # Discord user ID authorized to use admin slash commands like /restart.
+  # Discord user ID authorized to use admin slash commands like /restart and /resume.
   # 0 = admin commands disabled. To get your ID: enable Discord developer
   # mode (Settings → Advanced), right-click your profile, "Copy User ID".
   # NEVER commit a real ID — fill it in only in your local conf.yaml.

@@ -2,8 +2,8 @@
 
 Each long-running service writes its PID to ``pids/<name>.pid`` at the
 project root on startup and removes the file on clean exit. ``restart.bat``
-reads these files to know which processes to kill before pulling new code
-and re-launching everything.
+reads these files to know which local processes to kill before re-launching
+them.
 
 The ``pids/`` directory is gitignored — these files are transient runtime
 state, not configuration.
@@ -41,9 +41,7 @@ def mark_backfill_settled(root: Optional[Path] = None, conf_uid: str = "") -> No
     """
     path = _pid_dir(root) / _BACKFILL_SETTLED
     try:
-        path.write_text(
-            json.dumps({"settled_at": time.time(), "conf_uid": conf_uid})
-        )
+        path.write_text(json.dumps({"settled_at": time.time(), "conf_uid": conf_uid}))
     except Exception:
         pass
 

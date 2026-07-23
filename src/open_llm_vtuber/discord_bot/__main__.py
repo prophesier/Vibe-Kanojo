@@ -81,7 +81,7 @@ async def _main() -> int:
         ),
     )
 
-    # Write PID so restart.bat can find and kill this process.
+    # Write PID so /restart and /resume can find and relaunch this process.
     write_pid("discord", root=project_root)
 
     bridge = OLVBridge(server_url)
