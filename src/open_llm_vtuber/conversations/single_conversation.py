@@ -151,6 +151,12 @@ async def process_single_conversation(
         )
 
         if context.history_uid and full_response:  # Check full_response before storing
+            # Claude path: the agent stages the turn's final assistant message
+            # (signed thinking + text) for on-disk persistence — the restart
+            # cold-start seed. One-shot; None for non-Claude agents and
+            # thinking-less turns.
+            pop_seed = getattr(context.agent_engine, "pop_thinking_seed", None)
+            thinking_seed = pop_seed() if callable(pop_seed) else None
             store_message(
                 conf_uid=context.character_config.conf_uid,
                 history_uid=context.history_uid,
@@ -158,6 +164,7 @@ async def process_single_conversation(
                 content=full_response,
                 name=context.character_config.character_name,
                 avatar=context.character_config.avatar,
+                thinking_seed=thinking_seed,
             )
             logger.info(f"AI response: {full_response}")
 

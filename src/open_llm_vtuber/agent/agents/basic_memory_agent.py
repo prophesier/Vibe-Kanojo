@@ -380,6 +380,155 @@ class BasicMemoryAgent(AgentInterface):
         if role == "user":
             self._last_user_message_dt = self._last_message_dt
 
+    # Cap on tool_result content stored in the cross-turn protocol. The live
+    # tool loop always sees full results; this trims only what later turns
+    # replay, where the useful content already lives in the visible reply
+    # text. Chars, not tokens: cheap and close enough (JA≈1, EN≈4 chars/tok).
+    _PROTOCOL_RESULT_MAX_CHARS = 400
+    _PROTOCOL_TRUNCATION_MARKER = "…[truncated for replay]"
+
+    # Cold-start thinking seeds (あさひ's design, 07-23): persist each turn's
+    # final assistant message ([thinking..., text], verbatim) to chat history;
+    # on reload, replay the newest N of them as thinking precedent — but only
+    # when the recent tail was actually thinking (rate gate), because seeding
+    # a slump just reinforces it, while a bare fresh session thinks
+    # spontaneously on its own.
+    _THINKING_SEED_COUNT = 10
+    _THINKING_SEED_RATE_WINDOW = 20  # assistant turns considered for the rate
+    # Seed only a genuinely healthy tail — anything below 80% recent thinking
+    # is already slipping, and replaying a slipping tail reinforces the slump.
+    _THINKING_SEED_MIN_RATE = 0.8
+    # Final assistant message of the just-completed turn, staged for the
+    # conversation layer to persist (pop_thinking_seed). Class-level default
+    # so __new__-constructed test instances read None.
+    _last_thinking_seed: Optional[Dict[str, Any]] = None
+
+    def pop_thinking_seed(self) -> Optional[Dict[str, Any]]:
+        """One-shot getter for the just-completed turn's thinking seed.
+
+        Returns {"model": ..., "content": [blocks]} — the final assistant
+        message verbatim (signed thinking included, no tool machinery) — or
+        None when the turn produced no thinking. The conversation layer
+        attaches it to the on-disk history record (store_message).
+        """
+        seed = self._last_thinking_seed
+        self._last_thinking_seed = None
+        return seed
+
+    def _apply_thinking_seeds(self, candidates: List[tuple], resuming: bool) -> None:
+        """Replay the newest persisted thinking turns into reloaded context.
+
+        Each seed becomes a length-1 ``claude_protocol`` on its memory entry,
+        reusing the exact-replay machinery. Gated on the recent thinking RATE:
+        below the threshold nothing is seeded (don't reinforce a slump), and a
+        resumed session gets a log hint that a fresh session recovers
+        spontaneous thinking. Seeds from a different model are skipped (other
+        models ignore foreign thinking blocks but still bill their tokens).
+        """
+        if not self._is_claude_llm() or not self._memory:
+            return
+        assistant_idxs = [
+            i for i, m in enumerate(self._memory) if m.get("role") == "assistant"
+        ]
+        window = assistant_idxs[-self._THINKING_SEED_RATE_WINDOW :]
+        if not window:
+            return
+        candidate_idxs = {i for i, _ in candidates}
+        thinking_turns = sum(1 for i in window if i in candidate_idxs)
+        rate = thinking_turns / len(window)
+        if rate < self._THINKING_SEED_MIN_RATE:
+            logger.info(
+                f"[thinking_seed] recent thinking rate {thinking_turns}/{len(window)} "
+                f"is below {self._THINKING_SEED_MIN_RATE:.0%} — no seeds injected."
+            )
+            if resuming:
+                logger.warning(
+                    "[thinking_seed] resuming a session with a low-thinking tail; "
+                    "a FRESH session recovers spontaneous thinking — consider "
+                    "/restart instead of /resume."
+                )
+            return
+        model = getattr(self._llm, "model", "") or ""
+        applied = 0
+        for idx, seed in candidates[-self._THINKING_SEED_COUNT :]:
+            content = seed.get("content")
+            seed_model = seed.get("model") or ""
+            if not isinstance(content, list) or not content:
+                continue
+            if seed_model and model and seed_model != model:
+                continue
+            self._memory[idx]["claude_protocol"] = [
+                {"role": "assistant", "content": deepcopy(content)}
+            ]
+            applied += 1
+        logger.info(
+            f"[thinking_seed] seeded {applied} thinking turn(s) into reloaded "
+            f"context (recent rate {thinking_turns}/{len(window)})."
+        )
+
+    @classmethod
+    def _truncate_protocol_tool_results(
+        cls, protocol: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Cap tool_result content in a stored Claude protocol.
+
+        Applies ONLY to user-role tool_result messages — those are
+        client-built and unsigned, so their content is ours to edit.
+        Assistant messages are never touched: signed thinking blocks are
+        position-bound within their message, and sibling blocks (tool_use,
+        server-tool results) must stay exactly as generated.
+        """
+        out: List[Dict[str, Any]] = []
+        for msg in protocol:
+            content = msg.get("content")
+            if msg.get("role") != "user" or not isinstance(content, list):
+                out.append(msg)
+                continue
+            new_content = [
+                cls._truncate_tool_result_block(block)
+                if isinstance(block, dict) and block.get("type") == "tool_result"
+                else block
+                for block in content
+            ]
+            out.append({**msg, "content": new_content})
+        return out
+
+    @classmethod
+    def _truncate_tool_result_block(cls, block: Dict[str, Any]) -> Dict[str, Any]:
+        limit = cls._PROTOCOL_RESULT_MAX_CHARS
+        marker = cls._PROTOCOL_TRUNCATION_MARKER
+        content = block.get("content")
+        if isinstance(content, str):
+            if len(content) <= limit:
+                return block
+            return {**block, "content": content[:limit] + marker}
+        if isinstance(content, list):
+            new_blocks: List[Dict[str, Any]] = []
+            budget = limit
+            changed = False
+            for b in content:
+                if isinstance(b, dict) and b.get("type") == "text":
+                    text = b.get("text", "")
+                    if budget <= 0:
+                        changed = True
+                        continue
+                    if len(text) > budget:
+                        b = {**b, "text": text[:budget] + marker}
+                        changed = True
+                    budget -= min(len(text), budget)
+                    new_blocks.append(b)
+                else:
+                    # Images and other non-text payloads are pure replay bulk
+                    # with no precedent value — stub them out.
+                    new_blocks.append(
+                        {"type": "text", "text": "[non-text tool output omitted]"}
+                    )
+                    changed = True
+            if not changed:
+                return block
+            return {**block, "content": new_blocks or marker}
+        return block
+
     @staticmethod
     def _claude_protocol_has_thinking(
         protocol: List[Dict[str, Any]],
@@ -1011,6 +1160,18 @@ class BasicMemoryAgent(AgentInterface):
             if msg.get("role") == "human":
                 prev_user_dt = cur_dt or prev_user_dt
 
+        # (memory index, on-disk thinking seed) of assistant records that
+        # carry a persisted final message — see _apply_thinking_seeds.
+        seed_candidates: List[tuple] = []
+        resumed_with_messages = False
+
+        def _maybe_collect_seed(msg: Dict[str, Any], entry: Dict[str, str]) -> None:
+            # Banner-carrying entries are excluded: seed replay replaces the
+            # entry's content wholesale, which would silently drop the banner.
+            seed = msg.get("thinking_seed")
+            if entry["role"] == "assistant" and isinstance(seed, dict):
+                seed_candidates.append((len(self._memory) - 1, seed))
+
         for uid, messages in sessions:
             loaded_uids.append(uid)
             first_in_session = True
@@ -1022,13 +1183,17 @@ class BasicMemoryAgent(AgentInterface):
                     continue
                 _with_time_banner(entry, cur_dt)
                 _advance(msg, cur_dt)
+                had_banner = False
                 if first_in_session:
                     # Prepend a session-boundary banner so the LLM can tell
                     # where one past session ends and the next begins.
                     banner = self._session_header_text(uid, is_current=False)
                     entry["content"] = f"{banner}\n{entry['content']}"
                     first_in_session = False
+                    had_banner = True
                 self._memory.append(entry)
+                if not had_banner:
+                    _maybe_collect_seed(msg, entry)
 
         # Always append the current session last so conversation continuity
         # is preserved even for clients that join mid-session.
@@ -1040,6 +1205,7 @@ class BasicMemoryAgent(AgentInterface):
             # would otherwise fire on every fresh-session startup.
             current_messages = get_history(conf_uid, current_uid, quiet=True)
             if current_messages:
+                resumed_with_messages = True
                 first_in_session = True
                 for msg in current_messages:
                     entry = self._msg_from_history_record(msg)
@@ -1049,18 +1215,27 @@ class BasicMemoryAgent(AgentInterface):
                         continue
                     _with_time_banner(entry, cur_dt)
                     _advance(msg, cur_dt)
+                    had_banner = False
                     if first_in_session:
                         banner = self._session_header_text(current_uid, is_current=True)
                         entry["content"] = f"{banner}\n{entry['content']}"
                         first_in_session = False
                         self._current_session_banner_added = True
+                        had_banner = True
                     self._memory.append(entry)
+                    if not had_banner:
+                        _maybe_collect_seed(msg, entry)
             loaded_uids.append(current_uid)
 
         # Seed the live-path baselines from the newest loaded records, so the
         # first message after a restart still gets a correct banner.
         self._last_message_dt = prev_dt
         self._last_user_message_dt = prev_user_dt
+
+        # Cold-start thinking guidance: replay the newest few persisted
+        # thinking turns (rate-gated) so the reloaded context carries a
+        # thinking precedent instead of starting bare.
+        self._apply_thinking_seeds(seed_candidates, resuming=resumed_with_messages)
 
         # Sessions whose full history is in the sliding window — their diaries
         # are excluded from RAG retrieval (the content is already in context).
@@ -1523,6 +1698,12 @@ class BasicMemoryAgent(AgentInterface):
                 elif event["type"] == "error":
                     logger.error(f"LLM API Error: {event['message']}")
                     yield f"[Error from LLM: {event['message']}]"
+                    # Keep whatever she already said in context — text only, no
+                    # protocol (the turn is incomplete, so the transcript can't
+                    # be replayed safely). The user heard this text; dropping it
+                    # would make her forget her own words next turn.
+                    if current_turn_text:
+                        self._add_message(current_turn_text, "assistant")
                     return
 
             if pending_tool_calls:
@@ -1620,6 +1801,10 @@ class BasicMemoryAgent(AgentInterface):
                             "Claude MCP tool call requested but ToolExecutor is not available."
                         )
                         yield "[Error: ToolExecutor not configured]"
+                        # Same as the stream-error path: preserve already-spoken
+                        # text in context (text only, no protocol).
+                        if current_turn_text:
+                            self._add_message(current_turn_text, "assistant")
                         return
                     tool_executor_iterator = self._tool_executor.execute_tools(
                         tool_calls=mcp_calls,
@@ -1654,12 +1839,23 @@ class BasicMemoryAgent(AgentInterface):
                         and current_assistant_message_is_exact
                         and current_assistant_message_content
                     ):
-                        protocol_for_memory = claude_protocol + [
-                            {
-                                "role": "assistant",
-                                "content": deepcopy(current_assistant_message_content),
+                        final_assistant = {
+                            "role": "assistant",
+                            "content": deepcopy(current_assistant_message_content),
+                        }
+                        # Truncate stored tool_result content (user-role
+                        # messages only — assistant messages stay verbatim).
+                        protocol_for_memory = self._truncate_protocol_tool_results(
+                            claude_protocol + [final_assistant]
+                        )
+                        # Stage the final message (thinking included, no tool
+                        # machinery — it's the loop's last response) as the
+                        # on-disk cold-start seed for pop_thinking_seed.
+                        if self._claude_protocol_has_thinking([final_assistant]):
+                            self._last_thinking_seed = {
+                                "model": getattr(self._llm, "model", "") or "",
+                                "content": deepcopy(final_assistant["content"]),
                             }
-                        ]
                     self._add_message(
                         current_turn_text,
                         "assistant",
@@ -1919,6 +2115,8 @@ class BasicMemoryAgent(AgentInterface):
             self.reset_interrupt()
             self.prompt_mode_flag = False
             self._turn_inproc_calls = []
+            # Stale seeds must not leak into an unrelated turn's store.
+            self._last_thinking_seed = None
 
             await self._maybe_inject_diary_rag(input_data)
             await self._maybe_inject_facts_rag(input_data)
@@ -1996,6 +2194,14 @@ class BasicMemoryAgent(AgentInterface):
                     yield text_chunk
                     complete_response += text_chunk
             if complete_response:
+                if (
+                    claude_assistant_message is not None
+                    and self._claude_protocol_has_thinking([claude_assistant_message])
+                ):
+                    self._last_thinking_seed = {
+                        "model": getattr(self._llm, "model", "") or "",
+                        "content": deepcopy(claude_assistant_message["content"]),
+                    }
                 self._add_message(
                     complete_response,
                     "assistant",

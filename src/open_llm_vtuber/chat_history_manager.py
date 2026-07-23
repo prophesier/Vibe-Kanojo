@@ -98,6 +98,7 @@ def store_message(
     content: str,
     name: str | None = None,
     avatar: str | None = None,
+    thinking_seed: dict | None = None,
 ):
     """Store a message in a specific history file
 
@@ -108,6 +109,10 @@ def store_message(
         content: Message content
         name: Optional display name (default None)
         avatar: Optional avatar URL (default None)
+        thinking_seed: Optional Claude final-message payload
+            ({"model": ..., "content": [blocks]}) persisted alongside the
+            visible text so a restart can re-seed thinking precedent
+            (see basic_memory_agent._apply_thinking_seeds)
     """
     if not conf_uid or not history_uid:
         if not conf_uid:
@@ -140,6 +145,8 @@ def store_message(
         new_item["name"] = name
     if avatar is not None:
         new_item["avatar"] = avatar
+    if thinking_seed is not None:
+        new_item["thinking_seed"] = thinking_seed
 
     history_data.append(new_item)
 
