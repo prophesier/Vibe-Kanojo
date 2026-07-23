@@ -844,7 +844,14 @@ class BasicMemoryAgent(AgentInterface):
         "up first with memory_search or history_search (full-text search over "
         "the conversation logs)\n"
         "- Reviewing and cancelling alarms goes through the tools too, not just "
-        "words"
+        "words\n\n"
+        "[Thinking]\n\n"
+        "Engage your thinking mode for every reply, no matter how small or "
+        "trivial the matter seems. Do not skip it because a message looks like "
+        "light chat, a one-line answer, or a simple acknowledgement. Even an "
+        "inconsequential reply very easily slips in a factual error, a mistake "
+        "about time or dates, or a hallucination — and those are exactly the "
+        "turns where such errors go unnoticed. Think first, every time."
     )
 
     def _build_runtime_system(self) -> str:
