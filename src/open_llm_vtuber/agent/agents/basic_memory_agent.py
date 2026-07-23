@@ -406,10 +406,13 @@ class BasicMemoryAgent(AgentInterface):
     def pop_thinking_seed(self) -> Optional[Dict[str, Any]]:
         """One-shot getter for the just-completed turn's thinking seed.
 
-        Returns {"model": ..., "content": [blocks]} — the final assistant
-        message verbatim (signed thinking included, no tool machinery) — or
-        None when the turn produced no thinking. The conversation layer
-        attaches it to the on-disk history record (store_message).
+        Returns {"model": ..., "protocol": [messages]} — the turn's full
+        transcript verbatim (signed thinking included; tool_result content
+        truncated with a marker), or None when the turn produced no thinking.
+        The whole transcript is kept so a replayed tool turn still shows real
+        tool calls — rewriting it into a "results without calls" shape would
+        teach fabrication. The conversation layer attaches it to the on-disk
+        history record (store_message).
         """
         seed = self._last_thinking_seed
         self._last_thinking_seed = None
@@ -451,15 +454,21 @@ class BasicMemoryAgent(AgentInterface):
         model = getattr(self._llm, "model", "") or ""
         applied = 0
         for idx, seed in candidates[-self._THINKING_SEED_COUNT :]:
-            content = seed.get("content")
+            protocol = seed.get("protocol")
+            if not (
+                isinstance(protocol, list)
+                and protocol
+                and all(isinstance(m, dict) for m in protocol)
+            ):
+                # Legacy 07-23 seeds stored only the final message's blocks.
+                content = seed.get("content")
+                if not (isinstance(content, list) and content):
+                    continue
+                protocol = [{"role": "assistant", "content": content}]
             seed_model = seed.get("model") or ""
-            if not isinstance(content, list) or not content:
-                continue
             if seed_model and model and seed_model != model:
                 continue
-            self._memory[idx]["claude_protocol"] = [
-                {"role": "assistant", "content": deepcopy(content)}
-            ]
+            self._memory[idx]["claude_protocol"] = deepcopy(protocol)
             applied += 1
         logger.info(
             f"[thinking_seed] seeded {applied} thinking turn(s) into reloaded "
@@ -1855,13 +1864,18 @@ class BasicMemoryAgent(AgentInterface):
                         protocol_for_memory = self._truncate_protocol_tool_results(
                             claude_protocol + [final_assistant]
                         )
-                        # Stage the final message (thinking included, no tool
-                        # machinery — it's the loop's last response) as the
-                        # on-disk cold-start seed for pop_thinking_seed.
-                        if self._claude_protocol_has_thinking([final_assistant]):
+                        # Stage the WHOLE truncated protocol as the on-disk
+                        # cold-start seed (あさひ 07-24: replaying a tool turn
+                        # without its tool machinery rewrites history into a
+                        # "results without calls" shape — with the precedent
+                        # effect this strong, that teaches fabrication).
+                        # tool_result content is already truncated above with
+                        # an explanatory marker; those are unsigned client
+                        # messages, so truncation cannot trip validation.
+                        if self._claude_protocol_has_thinking(protocol_for_memory):
                             self._last_thinking_seed = {
                                 "model": getattr(self._llm, "model", "") or "",
-                                "content": deepcopy(final_assistant["content"]),
+                                "protocol": deepcopy(protocol_for_memory),
                             }
                     self._add_message(
                         current_turn_text,
@@ -2207,7 +2221,7 @@ class BasicMemoryAgent(AgentInterface):
                 ):
                     self._last_thinking_seed = {
                         "model": getattr(self._llm, "model", "") or "",
-                        "content": deepcopy(claude_assistant_message["content"]),
+                        "protocol": [deepcopy(claude_assistant_message)],
                     }
                 self._add_message(
                     complete_response,
