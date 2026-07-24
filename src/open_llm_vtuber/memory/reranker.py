@@ -7,12 +7,15 @@ itself). A cheap LLM judges the shortlist and returns only the genuinely relevan
 ones, ordered.
 
 Two improvements over a bare reranker:
-- It is given the **recent conversation**, not just the isolated last message, so
-  it knows what is actually being discussed. A lone sentence has too little signal
-  and anything keyword-adjacent looks relevant; with context the judge can tell.
+- It is given the **recent conversation** — but (since the 07-24 tightening)
+  strictly for reference resolution: pronouns and ellipses in the latest message
+  are resolved against it, while relevance itself must be judged against the
+  latest user message ALONE. Judging against the whole window made the judge
+  re-inject candidates matching earlier topics turn after turn.
 - Listwise / ordered selection (à la RankGPT) — no numeric scores, since LLMs
   rank reliably but calibrate absolute scores poorly. An empty result is the
-  natural "nothing relevant" exit, so no similarity threshold has to be tuned.
+  natural "nothing relevant" exit (framed in the prompt as the NORMAL outcome),
+  so no similarity threshold has to be tuned.
 
 The same class serves both subsystems via ``item_label`` ("日記" / "事実"); diary
 and facts each construct their own instance over their own data.
@@ -28,33 +31,38 @@ from openai import AsyncOpenAI
 
 # System instruction for the judge. Plain tool prompt — no roleplay. Japanese to
 # match the memory/query language. ``{item}`` is the entry kind ("日記"/"事実").
+# 2026-07-24 tightening (あさひ): the judge was still letting too much through,
+# and kept re-injecting candidates that matched EARLIER topics turn after turn.
+# The context is therefore demoted to reference-resolution ONLY — relevance must
+# come from the latest user message alone — and the default is now framed as
+# "an empty array is the normal outcome".
 _RERANK_SYSTEM = (
     "あなたは記憶検索の関連性判定ツールです。これは会話ではありません。"
     "ロールプレイやキャラクターとしての応答はせず、判定結果のみを出力してください。\n\n"
-    "AIキャラクターとユーザーの「最近の会話」と、自動検索された「{item}の候補」の"
-    "リストが与えられます。あなたの仕事は、キャラクターが**会話の最後のユーザー発言に"
-    "返答するにあたって**、各候補が実際に役立つ・参照する必要があるかを判定することです。\n\n"
-    "判定基準:\n"
-    "- **判定の基準はあくまで「最後のユーザー発言」**。それが今まさに返答すべき内容であり、"
-    "候補がその発言に直接役立つかどうかだけで判定する。\n"
-    "- 「最近の会話」は状況を把握するための**背景情報**にすぎない。"
-    "そこに登場しても**既に過ぎ去った話題**——少し前に触れただけで今は話していない事柄——"
-    "に候補が一致するだけでは、関連とはみなさない。"
-    "会話はすでに次の話題へ移っていることが多く、過去の話題に結びつくだけの候補は"
-    "背景であって関連ではないので**選ばない**。\n"
-    "- 関連 = その候補の内容が、今まさに話している事柄・最後の発言が求めていることに"
-    "直接関係し、返答に**具体的に役立つ**。\n"
-    "- **同じ大まかな話題に属するというだけでは選ばない**（例:「どちらも食べ物の話」程度では"
-    "不十分）。その候補が、今の具体的なやり取りに対して具体的で有用な中身を持つ場合のみ選ぶ。\n"
-    "- **会話の流れを踏まえて**判断する。最後の一文だけを見て語句が一致するからといって"
-    "関連とは限らない。今の話題と無関係なら入れない。\n"
-    "- 単にキーワードが一致するだけ、または別の文脈(デバッグ・テスト・検索の失敗・"
-    "うまく思い出せなかった等)でその語に触れているだけのものは**関連ではない**。"
-    "出来事そのものではなく、それを「思い出そうとした/検索した」というメタな言及は除外する。\n"
-    "- 迷うときは**入れない**。「これが無くても自然に返答できる」なら不要。"
-    "関連が確実なものだけに絞る。\n\n"
+    "AIキャラクターへのユーザーの「最後のユーザー発言」と、自動検索された"
+    "「{item}の候補」のリストが与えられます。あなたの仕事は、キャラクターが"
+    "その発言に返答するにあたって、**候補の具体的な中身を参照しなければ返答の質が"
+    "落ちる・事実を誤る**——という厳格な基準で候補を絞り込むことです。\n\n"
+    "大原則:\n"
+    "- **判定対象は「最後のユーザー発言」ただ一つ**。添付される「最近の会話」は、"
+    "最後の発言に含まれる代名詞・指示語・省略を解決するための**参照解決専用**であり、"
+    "**関連性の根拠として使ってはならない**。\n"
+    "- **前の会話の話題と一致するだけの候補は選ばない**。最後の発言自身がその話題を"
+    "持ち出していない限り、それは過ぎた話題である。過去の話題に紐づく候補を"
+    "ターンごとに繰り返し追加し続けることが、まさに防ぐべき失敗パターンである。\n"
+    "- 関連 = 最後の発言に返答するとき、その候補の中身を参照しないと"
+    "**返答が不正確になる・嘘をつく・的外れになる**もの。"
+    "「あれば会話が少し豊かになる」程度は関連ではない。\n"
+    "- **空配列が通常の結果である**。挨拶・相槌・スキンシップ・短い感情表現・"
+    "その場限りの雑談には、原則として何も要らない。選ぶのは例外的な場合だけで、"
+    "多くても1〜2件、確信があるものに限る。\n"
+    "- 同じ大まかな話題に属するだけでは不十分（「どちらも食べ物の話」程度は無関連）。\n"
+    "- キーワードが一致するだけのもの、別の文脈(デバッグ・テスト・検索の失敗等)で"
+    "その語に触れただけのもの、出来事そのものではなく「思い出そうとした/検索した」"
+    "というメタな言及は**無関連**。\n"
+    "- 迷うときは**落とす**。「これが無くても自然に返答できる」なら不要。\n\n"
     "出力は関連する候補だけを、**関連度の高い順**に並べ、各要素に短い理由を一言添える。"
-    "関連するものが一つも無ければ空配列を返す。"
+    "関連するものが無ければ空配列を返す（それが通常の結果である）。"
 )
 
 
@@ -72,8 +80,14 @@ def _schema(item: str) -> Dict[str, Any]:
                     "items": {
                         "type": "object",
                         "properties": {
-                            "index": {"type": "integer", "description": "1-based index of the excerpt"},
-                            "reason": {"type": "string", "description": "short reason (a few words)"},
+                            "index": {
+                                "type": "integer",
+                                "description": "1-based index of the excerpt",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "short reason (a few words)",
+                            },
                         },
                         "required": ["index", "reason"],
                         "additionalProperties": False,
@@ -126,24 +140,35 @@ class MemoryReranker:
         )
         parts = []
         if context.strip():
-            parts.append(f"最近の会話:\n{context.strip()}")
-        parts.append(f"最後のユーザー発言:\n{query}")
+            parts.append(
+                "最近の会話（参照解決専用 — 関連性の根拠には使わないこと）:\n"
+                f"{context.strip()}"
+            )
+        parts.append(f"最後のユーザー発言（判定対象はこれのみ）:\n{query}")
         parts.append(f"{self._item}の候補:\n{numbered}")
         user = "\n\n".join(parts)
         try:
             resp = await self._client.chat.completions.create(
                 model=self._model,
                 messages=[
-                    {"role": "system", "content": _RERANK_SYSTEM.format(item=self._item)},
+                    {
+                        "role": "system",
+                        "content": _RERANK_SYSTEM.format(item=self._item),
+                    },
                     {"role": "user", "content": user},
                 ],
-                response_format={"type": "json_schema", "json_schema": _schema(self._item)},
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": _schema(self._item),
+                },
                 temperature=0,
                 timeout=self._timeout,
             )
             data = json.loads(resp.choices[0].message.content or "{}")
         except Exception as e:
-            logger.warning(f"[memory_rag] rerank failed ({self._model}, {self._item}): {e}")
+            logger.warning(
+                f"[memory_rag] rerank failed ({self._model}, {self._item}): {e}"
+            )
             return None
 
         out: List[Dict[str, Any]] = []
