@@ -155,6 +155,40 @@ def store_message(
     logger.debug(f"Successfully stored {role} message")
 
 
+def pop_last_message(
+    conf_uid: str, history_uid: str, expected_role: Literal["human", "ai"]
+) -> bool:
+    """Remove the NEWEST message from a history file if it matches
+    ``expected_role``.
+
+    Used by the safety-refusal path: the refused user input must leave the
+    on-disk record too, or a restart reloads it into context and the
+    classifier keeps firing forever. The role guard makes a mistimed call a
+    no-op instead of deleting an innocent record. Returns True when a record
+    was removed."""
+    if not conf_uid or not history_uid:
+        return False
+    filepath = _get_safe_history_path(conf_uid, history_uid)
+    if not os.path.exists(filepath):
+        return False
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            history_data = json.load(f)
+    except Exception:
+        logger.error(f"Failed to load history file: {filepath}")
+        return False
+    if not history_data or history_data[-1].get("role") != expected_role:
+        return False
+    removed = history_data.pop()
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(history_data, f, ensure_ascii=False, indent=2)
+    logger.info(
+        f"Removed last '{expected_role}' message from history {history_uid} "
+        f"({len(str(removed.get('content', '')))} chars)."
+    )
+    return True
+
+
 def get_metadata(conf_uid: str, history_uid: str) -> dict:
     """Get metadata from history file"""
     if not conf_uid or not history_uid:

@@ -242,14 +242,14 @@ character_config:
         enable_web_search: false
         # Max searches Claude may run per single reply.
         max_web_searches: 3
-        # Let Claude read full content from URLs already in the
-        # conversation (user-pasted, search results, previous fetches).
-        # No per-fetch fee — only fetched page tokens are billed.
+        # Advertise the CLIENT-side web_fetch tool on the Claude path
+        # (in-process web_tools.web_fetch — same fetcher as the OpenAI path).
+        # The native Anthropic server tool is retired: absent on Opus 5.
         enable_web_fetch: false
         # Max URL fetches Claude may run per single reply.
         max_web_fetches: 5
-        # Per-page truncation cap: any fetched page over this many tokens
-        # is truncated. Caps input cost on huge docs / PDFs.
+        # Legacy knob for the retired native fetch tool; unused. The client
+        # fetch truncates by characters (agent max_fetch_chars, default 20000).
         max_fetch_tokens: 30000
         # Extended thinking (adaptive): Claude reasons before replying, which
         # helps with multi-step logic, time/context tracking, and actually
@@ -281,6 +281,11 @@ character_config:
         # Long replies cost twice: a single long turn then sits in the sliding
         # history window for several sessions, inflating every later prompt.
         max_tokens: 8000
+        # If one turn's billed thinking exceeds this many tokens, that turn's
+        # transcript (thinking blocks + tool machinery) is NOT carried into
+        # later requests — it stays plain text in context, keeping oversized
+        # reasoning out of the cache prefix. 0 disables the cap.
+        thinking_replay_max_tokens: 2000
 
       llama_cpp_llm:
         model_path: '<path-to-gguf-model-file>'

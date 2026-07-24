@@ -99,6 +99,7 @@ class AsyncLLM(StatelessLLMInterface):
         thinking_force: bool = False,
         thinking_budget: int = _THINKING_FORCED_BUDGET,
         max_tokens: int = _DEFAULT_MAX_TOKENS,
+        thinking_replay_max_tokens: int = 2000,
     ):
         """
         Initialize Claude LLM.
@@ -111,12 +112,15 @@ class AsyncLLM(StatelessLLMInterface):
             enable_web_search (bool): Declare Anthropic's native web_search
                 server tool so Claude can search the web on its own decision.
             max_web_searches (int): Cap on searches per reply when enabled.
-            enable_web_fetch (bool): Declare Anthropic's native web_fetch
-                server tool so Claude can read full content from URLs
-                already present in the conversation.
+            enable_web_fetch (bool): Advertise the CLIENT-side web_fetch tool
+                on the Claude chat path (executed in-process by the agent via
+                web_tools.web_fetch). The native Anthropic web_fetch server
+                tool is no longer used — it does not exist on Claude Opus 5,
+                and one shared implementation beats two divergent ones.
             max_web_fetches (int): Cap on URL fetches per reply when enabled.
-            max_fetch_tokens (int): Truncate any single fetched page above
-                this many tokens to bound per-turn input cost.
+            max_fetch_tokens (int): Legacy knob for the retired native fetch
+                tool; unused (the client fetch truncates by max_fetch_chars
+                in the agent's web tool config).
             thinking (bool): Enable extended thinking.
             thinking_effort (str): Effort level for the adaptive path.
             thinking_force (bool): Reason on every turn via manual
@@ -132,6 +136,11 @@ class AsyncLLM(StatelessLLMInterface):
                 thinking is on the reply gets whatever reasoning leaves. One-
                 shot utility calls (memory, diary, fact extraction) pass their
                 own value and are unaffected.
+            thinking_replay_max_tokens (int): If a turn's billed thinking
+                exceeds this, the agent does NOT carry that turn's transcript
+                (thinking blocks + tool machinery) into later requests — the
+                turn falls back to plain text in context, keeping oversized
+                reasoning out of the cache prefix. 0 disables the cap.
         """
         self.model = model
         self.system = system
@@ -145,15 +154,30 @@ class AsyncLLM(StatelessLLMInterface):
         self._thinking_force = thinking_force
         self._thinking_budget = self._resolve_thinking_budget(thinking_budget)
         self._max_tokens = self._resolve_max_tokens(max_tokens)
-        logger.info(f"Claude reply ceiling: max_tokens={self._max_tokens}.")
+        # Public: read by the agent when deciding whether to carry a turn's
+        # thinking transcript into later requests. Echoed at startup for the
+        # usual typo'd-conf-key detection.
+        try:
+            self.thinking_replay_max_tokens = max(0, int(thinking_replay_max_tokens))
+        except (TypeError, ValueError):
+            logger.warning(
+                f"thinking_replay_max_tokens {thinking_replay_max_tokens!r} is not "
+                "an integer; using 2000."
+            )
+            self.thinking_replay_max_tokens = 2000
+        logger.info(
+            f"Claude reply ceiling: max_tokens={self._max_tokens}; "
+            f"thinking replay cap={self.thinking_replay_max_tokens or 'off'}."
+        )
         if enable_web_search:
             logger.info(
                 f"Claude native web search enabled (max {max_web_searches}/reply)."
             )
         if enable_web_fetch:
             logger.info(
-                f"Claude native web fetch enabled "
-                f"(max {max_web_fetches}/reply, max {max_fetch_tokens} tokens/page)."
+                f"Claude web fetch enabled — CLIENT-side tool routed through "
+                f"web_tools.web_fetch (max {max_web_fetches}/reply). The native "
+                "server tool is retired (absent on Opus 5)."
             )
         if thinking:
             # Always name the resolved budget on the forced path: a typo in the
@@ -473,20 +497,12 @@ class AsyncLLM(StatelessLLMInterface):
                         "max_uses": self._max_web_searches,
                     }
                 )
-            if not disable_server_tools and self._enable_web_fetch:
-                # Stay on the basic web_fetch version: the newer
-                # web_fetch_20260209 adds dynamic filtering but requires
-                # the code_execution tool to be enabled, which we don't
-                # use here. max_content_tokens caps how big each fetched
-                # page is allowed to grow in our context window.
-                final_tools.append(
-                    {
-                        "type": "web_fetch_20250910",
-                        "name": "web_fetch",
-                        "max_uses": self._max_web_fetches,
-                        "max_content_tokens": self._max_fetch_tokens,
-                    }
-                )
+            # web_fetch is deliberately NOT declared as a native server tool
+            # anymore: Claude Opus 5 dropped the tool entirely, and we run our
+            # own client-side fetch (web_tools.web_fetch) on both provider
+            # paths instead — one implementation, one behavior. The agent
+            # advertises it as a regular client tool (see
+            # _build_web_fetch_tool_claude) gated on enable_web_fetch.
 
             logger.debug(f"Sending messages to Claude API: {converted_messages}")
             logger.debug(f"Tools provided: {final_tools}")
@@ -817,7 +833,8 @@ class AsyncLLM(StatelessLLMInterface):
                         # trigger-rate stats). The visible summary text is
                         # token-counted off-path so both sides use the same
                         # unit; see _spawn_usage_log.
-                        if getattr(event.delta, "stop_reason", None):
+                        stop_reason = getattr(event.delta, "stop_reason", None)
+                        if stop_reason:
                             out_toks = getattr(event.usage, "output_tokens", 0) or 0
                             details = getattr(
                                 event.usage, "output_tokens_details", None
@@ -831,6 +848,28 @@ class AsyncLLM(StatelessLLMInterface):
                                 think_toks,
                                 "\n".join(visible_thinking_parts),
                             )
+                        if stop_reason == "refusal":
+                            # Safety classifier declined (HTTP 200 + refusal
+                            # stop reason — Opus 5+ behavior). Surface it as a
+                            # typed event so the agent can clean the poisoned
+                            # input out of history and notify the user.
+                            sd = getattr(event.delta, "stop_details", None)
+                            if sd is not None and not isinstance(sd, dict):
+                                sd = (
+                                    sd.model_dump() if hasattr(sd, "model_dump") else {}
+                                )
+                            sd = sd or {}
+                            logger.warning(
+                                "[refusal] safety classifier declined the request "
+                                f"(category={sd.get('category')!r})."
+                            )
+                            yield {
+                                "type": "refusal",
+                                "data": {
+                                    "category": sd.get("category"),
+                                    "explanation": sd.get("explanation"),
+                                },
+                            }
                         yield {
                             "type": "message_delta",
                             "data": {

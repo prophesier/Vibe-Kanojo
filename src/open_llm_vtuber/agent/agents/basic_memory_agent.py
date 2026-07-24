@@ -31,6 +31,7 @@ from ..stateless_llm.openai_compatible_llm import (
 from ...chat_history_manager import (
     get_history,
     get_recent_histories,
+    pop_last_message,
     search_history,
 )
 from ..transformers import (
@@ -402,6 +403,10 @@ class BasicMemoryAgent(AgentInterface):
     # conversation layer to persist (pop_thinking_seed). Class-level default
     # so __new__-constructed test instances read None.
     _last_thinking_seed: Optional[Dict[str, Any]] = None
+    # Where this conversation persists on disk (set by the memory loaders);
+    # needed by the safety-refusal cleanup. Class-level defaults for tests.
+    _conf_uid: str = ""
+    _history_uid: str = ""
 
     def pop_thinking_seed(self) -> Optional[Dict[str, Any]]:
         """One-shot getter for the just-completed turn's thinking seed.
@@ -452,8 +457,18 @@ class BasicMemoryAgent(AgentInterface):
                 )
             return
         model = getattr(self._llm, "model", "") or ""
+        replay_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
         applied = 0
         for idx, seed in candidates[-self._THINKING_SEED_COUNT :]:
+            # Fat-thinking seeds are skipped for the same reason they were
+            # never stored live (field present on seeds written after 07-25).
+            seed_thinking = seed.get("thinking_tokens")
+            if (
+                replay_cap
+                and isinstance(seed_thinking, (int, float))
+                and seed_thinking > replay_cap
+            ):
+                continue
             protocol = seed.get("protocol")
             if not (
                 isinstance(protocol, list)
@@ -1130,6 +1145,10 @@ class BasicMemoryAgent(AgentInterface):
         spurious cache misses on Anthropic's prompt cache.
         """
         sessions = get_recent_histories(conf_uid, n, exclude_uid=current_uid)
+        # Kept for the safety-refusal path: deleting a refused input from the
+        # on-disk record needs to know which file the conversation writes to.
+        self._conf_uid = conf_uid
+        self._history_uid = current_uid or ""
         self._memory = []
         # Fresh session window → reset diary-RAG dedup state (the injected
         # blocks live in _memory, which is being rebuilt here anyway).
@@ -1659,6 +1678,17 @@ class BasicMemoryAgent(AgentInterface):
         # different tool-loop requests must never be flattened together.
         claude_protocol: List[Dict[str, Any]] = []
         protocol_is_exact = True
+        # Billed thinking across the whole turn (all loop rounds) — compared
+        # against thinking_replay_max_tokens to decide whether this turn's
+        # transcript may enter later requests at all.
+        turn_thinking_tokens = 0
+        # Set when the safety classifier declines a request (stop_reason
+        # "refusal"); handled after the stream ends.
+        refusal_info: Optional[Dict[str, Any]] = None
+        # Per-turn budget for the client-side web_fetch tool.
+        web_fetch_budget = {
+            "left": max(0, int(getattr(self._llm, "_max_web_fetches", 5) or 0))
+        }
 
         while True:
             stream = self._llm.chat_completion(
@@ -1667,6 +1697,7 @@ class BasicMemoryAgent(AgentInterface):
             pending_tool_calls.clear()
             current_assistant_message_content.clear()
             current_assistant_message_is_exact = False
+            request_thinking_tokens = 0
 
             async for event in stream:
                 if event["type"] == "text_delta":
@@ -1722,9 +1753,16 @@ class BasicMemoryAgent(AgentInterface):
                     ):
                         current_assistant_message_content[:] = deepcopy(content)
                         current_assistant_message_is_exact = True
-                # elif event["type"] == "message_delta":
-                #     if event["data"]["delta"].get("stop_reason"):
-                #         stop_reason = event["data"]["delta"].get("stop_reason")
+                elif event["type"] == "message_delta":
+                    # Track this request's billed thinking (cumulative within
+                    # the request; the final delta wins, so overwrite).
+                    usage = (event.get("data") or {}).get("usage") or {}
+                    details = usage.get("output_tokens_details") or {}
+                    tt = details.get("thinking_tokens")
+                    if isinstance(tt, (int, float)):
+                        request_thinking_tokens = int(tt)
+                elif event["type"] == "refusal":
+                    refusal_info = event.get("data") or {}
                 elif event["type"] == "message_stop":
                     break
                 elif event["type"] == "error":
@@ -1737,6 +1775,12 @@ class BasicMemoryAgent(AgentInterface):
                     if current_turn_text:
                         self._add_message(current_turn_text, "assistant")
                     return
+
+            turn_thinking_tokens += request_thinking_tokens
+
+            if refusal_info is not None:
+                yield self._handle_safety_refusal(refusal_info)
+                return
 
             if pending_tool_calls:
                 if current_assistant_message_is_exact:
@@ -1780,6 +1824,8 @@ class BasicMemoryAgent(AgentInterface):
                     inproc_names.update(self._STEAM_TOOL_NAMES)
                 if self._memory_tools_active:
                     inproc_names.update(self._MEMORY_TOOL_NAMES)
+                if getattr(self._llm, "_enable_web_fetch", False):
+                    inproc_names.add("web_fetch")
                 inproc_calls = [
                     c for c in pending_tool_calls if c.get("name") in inproc_names
                 ]
@@ -1791,7 +1837,11 @@ class BasicMemoryAgent(AgentInterface):
 
                 for c in inproc_calls:
                     cname = c.get("name", "")
-                    if cname == self._MODEL_HEALTH_TOOL_NAME:
+                    if cname == "web_fetch":
+                        marker, result = await self._run_claude_web_fetch(
+                            c.get("input") or {}, web_fetch_budget
+                        )
+                    elif cname == self._MODEL_HEALTH_TOOL_NAME:
                         marker, result = await self._run_model_health_tool(
                             c.get("input") or {}
                         )
@@ -1892,7 +1942,28 @@ class BasicMemoryAgent(AgentInterface):
                             self._last_thinking_seed = {
                                 "model": getattr(self._llm, "model", "") or "",
                                 "protocol": deepcopy(protocol_for_memory),
+                                "thinking_tokens": turn_thinking_tokens,
                             }
+                    # Oversized-thinking gate (あさひ 07-25): a turn whose
+                    # billed thinking exceeds the cap is NOT carried into
+                    # later requests at all — neither in-session nor as a
+                    # seed — so a single reasoning spree can't squat in the
+                    # cache prefix for the rest of the session.
+                    replay_cap = (
+                        getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
+                    )
+                    if (
+                        protocol_for_memory is not None
+                        and replay_cap
+                        and turn_thinking_tokens > replay_cap
+                    ):
+                        logger.info(
+                            f"[thinking_replay] turn thinking "
+                            f"{turn_thinking_tokens} tok > cap {replay_cap} — "
+                            "transcript not carried into context."
+                        )
+                        protocol_for_memory = None
+                        self._last_thinking_seed = None
                     self._add_message(
                         current_turn_text,
                         "assistant",
@@ -2172,6 +2243,10 @@ class BasicMemoryAgent(AgentInterface):
                     claude_tools.extend(self._build_steam_tools_claude())
                 if self._memory_tools_active:
                     claude_tools.extend(self._build_memory_tools_claude())
+                if getattr(self._llm, "_enable_web_fetch", False):
+                    # Client-side web_fetch (native server tool retired —
+                    # absent on Opus 5; one shared fetcher for both paths).
+                    claude_tools.extend(self._build_web_fetch_tool_claude())
                 if claude_tools:
                     logger.debug(
                         f"Starting Claude tool loop with {len(claude_tools)} tools."
@@ -2208,6 +2283,7 @@ class BasicMemoryAgent(AgentInterface):
             logger.info("Starting simple chat completion.")
             complete_response = ""
             claude_assistant_message: Optional[Dict[str, Any]] = None
+            plain_thinking_tokens = 0
             async for event in self._llm.chat_completion(
                 messages, self._build_system_for_llm()
             ):
@@ -2222,6 +2298,16 @@ class BasicMemoryAgent(AgentInterface):
                     if isinstance(candidate, dict):
                         claude_assistant_message = deepcopy(candidate)
                     continue
+                elif isinstance(event, dict) and event.get("type") == "message_delta":
+                    usage = (event.get("data") or {}).get("usage") or {}
+                    details = usage.get("output_tokens_details") or {}
+                    tt = details.get("thinking_tokens")
+                    if isinstance(tt, (int, float)):
+                        plain_thinking_tokens = int(tt)
+                    continue
+                elif isinstance(event, dict) and event.get("type") == "refusal":
+                    yield self._handle_safety_refusal(event.get("data") or {})
+                    return
                 elif isinstance(event, str):
                     text_chunk = event
                 else:
@@ -2229,6 +2315,9 @@ class BasicMemoryAgent(AgentInterface):
                 if text_chunk:
                     yield text_chunk
                     complete_response += text_chunk
+            plain_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
+            if plain_cap and plain_thinking_tokens > plain_cap:
+                claude_assistant_message = None
             if complete_response:
                 if (
                     claude_assistant_message is not None
@@ -2323,6 +2412,85 @@ class BasicMemoryAgent(AgentInterface):
         if tool_name:
             return f"\n🔧 *ツール: {tool_name[:40]}*\n"
         return ""
+
+    def _handle_safety_refusal(self, info: Dict[str, Any]) -> str:
+        """Clean up after a safety-classifier refusal and build the notice.
+
+        The refused USER input is deleted from both the in-memory conversation
+        and the on-disk history record — left in place it would ride in every
+        later request (and reload on restart), so the classifier keeps firing
+        and the whole session is poisoned. The returned notice is yielded as
+        the turn's visible output (reaches the frontend and Discord alike) and
+        is stored to disk as an ordinary AI line — harmless, and it tells both
+        her and あさひ what happened."""
+        category = info.get("category") or "unknown"
+        if self._memory and self._memory[-1].get("role") == "user":
+            self._memory.pop()
+        removed_disk = False
+        try:
+            if self._conf_uid and self._history_uid:
+                removed_disk = pop_last_message(
+                    self._conf_uid, self._history_uid, "human"
+                )
+        except Exception as e:
+            logger.warning(f"[refusal] disk cleanup failed: {e}")
+        logger.warning(
+            f"[refusal] turn dropped (category={category}, "
+            f"disk_cleaned={removed_disk})."
+        )
+        return (
+            f"\n⚠️ 安全分類器が応答を拒否した（category: {category}）。"
+            "直前の入力は履歴から削除された。別の話題で続けてほしい。\n"
+        )
+
+    @staticmethod
+    def _build_web_fetch_tool_claude() -> List[Dict[str, Any]]:
+        """Claude schema for the CLIENT-side web_fetch tool.
+
+        Runs in-process via web_tools.web_fetch — the same fetcher the OpenAI
+        path uses — replacing the retired Anthropic native server tool (absent
+        on Claude Opus 5). Claude's native web_search stays server-side."""
+        return [
+            {
+                "name": "web_fetch",
+                "description": (
+                    "Fetch and read the full text content of a specific URL "
+                    "(e.g. one the user pasted or one from a web search "
+                    "result). Returns the page's title and cleaned text. "
+                    "HTML/text pages only — PDFs and heavily script-rendered "
+                    "pages may not be readable."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "The URL to fetch.",
+                        }
+                    },
+                    "required": ["url"],
+                },
+            }
+        ]
+
+    async def _run_claude_web_fetch(
+        self, args: Dict[str, Any], budget: Dict[str, int]
+    ) -> tuple:
+        """Client-side web_fetch for the Claude tool loop.
+
+        Same fetcher, marker, and truncation as the OpenAI path; the per-turn
+        budget comes from the claude_llm max_web_fetches setting."""
+        self._turn_inproc_calls.append("web_fetch")
+        url = str(args.get("url", "")).strip()
+        if budget.get("left", 0) <= 0:
+            return None, {"error": "web fetch limit reached this turn"}
+        budget["left"] -= 1
+        logger.info(f"[web_fetch] url: {url or '(empty)'}")
+        marker = f"\n🔗 *Web取得: {url[:120] or '...'}*\n"
+        cfg = getattr(self, "_web_tools_config", None) or {}
+        max_chars = int(cfg.get("max_fetch_chars", 20000) or 20000)
+        result = await web_fetch(url, max_chars=max_chars)
+        return marker, result
 
     @staticmethod
     def _build_web_tools_openai() -> List[Dict[str, Any]]:

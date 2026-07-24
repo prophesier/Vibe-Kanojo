@@ -58,7 +58,11 @@ class SeedCaptureTests(unittest.IsolatedAsyncioTestCase):
         seed = agent.pop_thinking_seed()
         self.assertEqual(
             seed,
-            {"model": "claude-opus-4-6", "protocol": [FINAL]},
+            {
+                "model": "claude-opus-4-6",
+                "protocol": [FINAL],
+                "thinking_tokens": 0,
+            },
         )
         self.assertIsNone(agent.pop_thinking_seed(), "pop must be one-shot")
 

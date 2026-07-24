@@ -233,6 +233,7 @@ class ClaudeConfig(StatelessLLMBaseConfig):
     thinking_force: bool = Field(False, alias="thinking_force")
     thinking_budget: int = Field(4096, alias="thinking_budget")
     max_tokens: int = Field(8000, alias="max_tokens")
+    thinking_replay_max_tokens: int = Field(2000, alias="thinking_replay_max_tokens")
 
     _CLAUDE_DESCRIPTIONS: ClassVar[dict[str, Description]] = {
         "base_url": Description(
@@ -259,16 +260,15 @@ class ClaudeConfig(StatelessLLMBaseConfig):
         ),
         "enable_web_fetch": Description(
             en=(
-                "Enable Anthropic's native web_fetch server tool. When on, "
-                "Claude can read full content from URLs that appear in the "
-                "conversation (user message, search results, prior fetches). "
-                "No per-fetch fee — only the fetched page's tokens are "
-                "billed as input."
+                "Advertise the CLIENT-side web_fetch tool on the Claude chat "
+                "path (executed in-process via web_tools.web_fetch — the same "
+                "fetcher the OpenAI path uses). The native Anthropic server "
+                "tool is retired: it does not exist on Claude Opus 5."
             ),
             zh=(
-                "启用 Anthropic 原生 web_fetch 工具。开启后 Claude 可以读取对话中"
-                "出现的 URL 的完整内容（用户消息、搜索结果、之前的 fetch）。"
-                "fetch 调用本身免费，只有获取到的页面 token 会计入 input。"
+                "在 Claude 聊天路径上提供【客户端】web_fetch 工具（进程内执行,"
+                "与 OpenAI 路径共用 web_tools.web_fetch 同一实现）。Anthropic "
+                "原生 server 工具已弃用——Claude Opus 5 上它不存在。"
             ),
         ),
         "max_web_fetches": Description(
@@ -277,12 +277,13 @@ class ClaudeConfig(StatelessLLMBaseConfig):
         ),
         "max_fetch_tokens": Description(
             en=(
-                "Per-page truncation cap. Any fetched page above this many "
-                "tokens is truncated to bound input cost on huge documents."
+                "Legacy knob for the retired native fetch tool; unused. The "
+                "client fetch truncates by characters (max_fetch_chars in the "
+                "agent web tool settings, default 20000)."
             ),
             zh=(
-                "单页内容截断上限。超过这个 token 数的页面会被自动截断，"
-                "避免大文档把 input 成本撑爆。"
+                "弃用的原生 fetch 工具遗留参数,现已无效。客户端 fetch 按字符"
+                "截断（agent web 工具设置的 max_fetch_chars,默认 20000）。"
             ),
         ),
         "thinking": Description(
@@ -365,6 +366,21 @@ class ClaudeConfig(StatelessLLMBaseConfig):
                 "中文约 0.9 字/token。记忆/日记/事实抽取调用自带数值，不受此项影响。"
                 "回复过长的代价在后面：一条长回复会在滑动历史窗口里停留好几个 "
                 "session，把之后每一轮的 prompt 都撑大。"
+            ),
+        ),
+        "thinking_replay_max_tokens": Description(
+            en=(
+                "If one turn's billed thinking exceeds this many tokens, that "
+                "turn's transcript (thinking blocks + tool machinery) is NOT "
+                "carried into later requests — the turn stays plain text in "
+                "context, keeping oversized reasoning out of the cache prefix "
+                "(a single 6k-thinking turn would otherwise squat in every "
+                "later prompt). 0 disables the cap."
+            ),
+            zh=(
+                "单回合计费思考量超过该 token 数时,该回合的转录(思考块+工具"
+                "往返)不再注入后续请求——退化为纯文本,避免超大思考驻留缓存前缀"
+                "(一次 6k 思考否则会挂在之后每一轮的 prompt 里)。0 = 不设上限。"
             ),
         ),
     }
