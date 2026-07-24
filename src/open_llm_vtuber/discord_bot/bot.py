@@ -542,6 +542,20 @@ class DiscordVTuberBot(discord.Client):
     # upward from here" must cross them too.
     _CLIP_SESSIONS_SPAN = 5
 
+    def _current_llm_model(self) -> str:
+        """Resolve the chat model name from the loaded config (provider-aware).
+
+        Defensive getattr chain — a config-shape change must degrade to
+        'unknown', never break /clip."""
+        try:
+            agent_cfg = self._full_config.character_config.agent_config
+            provider = agent_cfg.agent_settings.basic_memory_agent.llm_provider or ""
+            llm_cfg = getattr(agent_cfg.llm_configs, provider, None)
+            model = getattr(llm_cfg, "model", "") if llm_cfg else ""
+            return str(model) or "unknown"
+        except Exception:
+            return "unknown"
+
     def _save_clip(self, start: int, end: int, requested_by: str) -> dict:
         """Cut messages[start..end] out of the recent conversation and append
         them to the shared excerpts file.
@@ -585,6 +599,10 @@ class DiscordVTuberBot(discord.Client):
             "clamped": clamped,
             "requested_by": requested_by,
             "conf_uid": conf_uid,
+            # Which chat model produced the assistant lines in this clip —
+            # needed once clips span model generations (pre-field records
+            # were all claude-opus-4-6 and were backfilled accordingly).
+            "model": self._current_llm_model(),
             "sessions": sorted({uid for uid, _ in picked}),
             "messages": [
                 {
