@@ -128,23 +128,39 @@ async def web_fetch(url: str, *, max_chars: int = 20000) -> Dict[str, Any]:
                     "url": url,
                     "error": f"unsupported content type: {ctype or 'unknown'}",
                 }
-            html = resp.text
+            # Raw BYTES, not resp.text: httpx decodes .text from the HTTP
+            # header charset (falling back to UTF-8), but many older JA sites
+            # declare Shift_JIS/EUC-JP only in <meta charset> — that combo
+            # produced mojibake ("couldn't read the page"). BeautifulSoup's
+            # own detector reads the meta declaration, so give it the bytes.
+            raw = resp.content
     except httpx.HTTPStatusError as e:
         return {"url": url, "error": f"HTTP {e.response.status_code}"}
     except Exception as e:
         logger.warning(f"[web_fetch] {url} failed: {type(e).__name__}: {e}")
         return {"url": url, "error": f"fetch failed: {type(e).__name__}"}
 
-    title, text = _extract_main_text(html)
+    title, text = _extract_main_text(raw)
+    if not text.strip():
+        # Say so instead of returning silent emptiness — the model can tell
+        # the user the page was unreadable instead of hallucinating content.
+        return {
+            "url": url,
+            "title": title,
+            "error": "no extractable text (page may be JS-rendered)",
+        }
     if len(text) > max_chars:
         text = text[:max_chars] + "\n…(truncated)"
     return {"url": url, "title": title, "text": text}
 
 
-def _extract_main_text(html: str) -> tuple[str, str]:
-    """Strip boilerplate and return (title, main_text) from raw HTML."""
+def _extract_main_text(html: str | bytes) -> tuple[str, str]:
+    """Strip boilerplate and return (title, main_text) from raw HTML.
+
+    Accepts bytes so BeautifulSoup can sniff the charset from the page's own
+    <meta> declaration (see web_fetch)."""
     soup = BeautifulSoup(html, "html.parser")
-    title = (soup.title.string.strip() if soup.title and soup.title.string else "")
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
     # Drop non-content elements outright.
     for tag in soup(
@@ -153,16 +169,36 @@ def _extract_main_text(html: str) -> tuple[str, str]:
         tag.decompose()
 
     # Prefer <article> / <main> if present, else fall back to <body>.
+    # td/th/dd/dt included: table/definition-list heavy pages (docs, wikis)
+    # previously extracted almost nothing ("couldn't read the whole page").
     container = soup.find("article") or soup.find("main") or soup.body or soup
+    tags = [
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "p",
+        "li",
+        "blockquote",
+        "pre",
+        "td",
+        "th",
+        "dd",
+        "dt",
+    ]
     parts: List[str] = []
-    for el in container.find_all(
-        ["h1", "h2", "h3", "h4", "p", "li", "blockquote", "pre"]
-    ):
+    for el in container.find_all(tags):
         txt = el.get_text(" ", strip=True)
         if txt:
             parts.append(txt)
     text = "\n".join(parts)
-    # Fallback: if structured extraction found little, use the whole text.
+    # Fallback ladder: a sparse <article>/<main> must ESCALATE to <body>, not
+    # re-dump its own (possibly empty) subtree — the old code fell back into
+    # the same container, so an empty <article> hid a full <body>.
     if len(text) < 200:
-        text = container.get_text("\n", strip=True)
+        body = soup.body or soup
+        candidates = [text, container.get_text("\n", strip=True)]
+        if body is not container:
+            candidates.append(body.get_text("\n", strip=True))
+        text = max(candidates, key=len)
     return title, text
