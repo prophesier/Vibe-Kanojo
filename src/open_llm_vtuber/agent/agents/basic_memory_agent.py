@@ -1417,6 +1417,22 @@ class BasicMemoryAgent(AgentInterface):
 
         return messages
 
+    async def _inject_memory_rags(self, input_data: BatchInput) -> None:
+        """Run diary-RAG and facts-RAG retrieval CONCURRENTLY.
+
+        The two subsystems are fully independent — own vector index, own
+        reranker instance, own pending field, own dedup state — so the turn
+        pays max(diary, facts) latency instead of the sum. Each leg is an
+        embedding call plus a judge round-trip, so the serial version was
+        adding up to a couple of seconds of dead time per turn. Both legs
+        keep their never-raises contract, so gather propagates nothing in
+        normal operation.
+        """
+        await asyncio.gather(
+            self._maybe_inject_diary_rag(input_data),
+            self._maybe_inject_facts_rag(input_data),
+        )
+
     async def _maybe_inject_diary_rag(self, input_data: BatchInput) -> None:
         """Retrieve long-tail diaries relevant to this turn and stage them.
 
@@ -2139,8 +2155,7 @@ class BasicMemoryAgent(AgentInterface):
             # Stale seeds must not leak into an unrelated turn's store.
             self._last_thinking_seed = None
 
-            await self._maybe_inject_diary_rag(input_data)
-            await self._maybe_inject_facts_rag(input_data)
+            await self._inject_memory_rags(input_data)
             messages = self._to_messages(input_data)
             # Claude path: MCP tools (if enabled) + built-in ALARM tools share
             # the Claude tool loop. web_search/fetch are NOT added here — Claude
