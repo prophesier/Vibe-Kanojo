@@ -324,7 +324,12 @@ class BasicMemoryAgent(AgentInterface):
             text_content = str(message)
 
         if not text_content and role == "assistant":
-            return
+            # A thinking-only turn may carry its true transcript with no
+            # visible text; any other empty assistant message stays dropped.
+            if not (
+                claude_protocol and self._claude_protocol_has_thinking(claude_protocol)
+            ):
+                return
 
         if role == "assistant" and text_content:
             self._check_stateful_claims(text_content)
@@ -570,6 +575,20 @@ class BasicMemoryAgent(AgentInterface):
                 return True
         return False
 
+    @staticmethod
+    def _claude_thinking_blocks_replayable(content: List[Any]) -> bool:
+        """Whether every thinking block in an assistant message carries its
+        signature (redacted blocks are always replayable). A max_tokens cut
+        mid-thinking can leave an unsigned block; replaying that would 400."""
+        for block in content:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "thinking"
+                and not block.get("signature")
+            ):
+                return False
+        return True
+
     def set_memory_manager(self, manager) -> None:
         """Attach a PersistentMemoryManager for fact extraction and diary injection."""
         self._memory_manager = manager
@@ -718,6 +737,15 @@ class BasicMemoryAgent(AgentInterface):
         "happen."
     )
 
+    # Lean variant (5-series models): when-to-use only. The tool enumeration
+    # is in the schemas; the 4.6-era no-false-report nudge is gone for
+    # 5-series (stateful claims are still checked mechanically).
+    _ALARM_CAPABILITY_NOTE_LEAN = (
+        "[Alarms] When you want to speak to the user at some future time — a "
+        "reminder he asked for, picking a conversation back up, checking in on "
+        "him — use set_alarm."
+    )
+
     # When-to-use only; tool mechanics live in the schema descriptions.
     _UBER_CAPABILITY_NOTE = (
         "[Uber Eats] When the conversation turns to delivery or convenience-"
@@ -763,6 +791,24 @@ class BasicMemoryAgent(AgentInterface):
         "and enter the resident list from the next startup. user-tier memories "
         "are the user's own (you cannot create or delete them; correcting their "
         "content is allowed)."
+    )
+
+    # Lean variant (5-series models): keeps when-to-use routing and the
+    # behavioral gates (turn-scoped results + memory_inject pinning, the
+    # save/correct caution, delete consent). Cut: argument mechanics
+    # (date_from/date_to), propagation timing, and tier rules — all of those
+    # live in the schemas and are enforced mechanically by the handlers.
+    _MEMORY_CAPABILITY_NOTE_LEAN = (
+        "[Managing memory] Separate from automatic recall, when you want to "
+        "look into the past yourself, use memory_search (memory_read_diary for "
+        "a full diary entry); for concrete exchanges and proper nouns that "
+        "were never kept in memory, history_search does a keyword search over "
+        "the full conversation logs. Search results disappear at the end of "
+        "the turn — pin what you want to keep referring to with memory_inject. "
+        "To save or correct facts established in conversation, use memory_add "
+        "/ memory_update (only when the user asked, or the correction is "
+        "unambiguous; be careful about rewriting). Deletion is memory_delete, "
+        "which requires the user's consent."
     )
 
     # Trailing system block placed right before the message history.
@@ -878,6 +924,94 @@ class BasicMemoryAgent(AgentInterface):
         "turns where such errors go unnoticed. Think first, every time."
     )
 
+    # Opus 5 variant of _HISTORY_NOTE: same structural facts and guardrails,
+    # minus the 4.6-era eagerness patches (measured on Opus 5 07-25:
+    # 1000-2000 billed thinking tokens per turn with frequent tool calls —
+    # and every extra tool round pays another full round of thinking).
+    # Dropped: the [Thinking] always-think nudge (thinking is adaptive-on and
+    # eager) and the [Strict rules on executing tools] no-false-report block
+    # (あさひ 07-25: redundant for 5-series; _check_stateful_claims still
+    # polices stateful claims mechanically). Slimmed: web-tool encouragement →
+    # availability + honesty only; the strict-time enumeration → one sentence.
+    # Kept verbatim: session/banner semantics, RAG-block semantics, divergence
+    # note.
+    _HISTORY_NOTE_LEAN = (
+        "【以下の会話履歴について】\n\n"
+        "ここから後に続くユーザーとアシスタントのやりとりは、"
+        "**複数の過去セッションが時系列順に連結されたもの**。"
+        "必ずしも今日の出来事だけではなく、数日前〜数週間前の古いやりとりと、"
+        "直近のやりとりが一つのストリームに混在している。"
+        "各ターンが「いつ」発生したかは、冒頭の "
+        "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
+        "各セッションの最初のメッセージには `【セッション開始: 日時】` または "
+        "`【現在進行中のセッション開始: 日時】` という見出しが挿入されている。"
+        "これがセッションの境界を示すので、これより前のターンと後のターンは"
+        "**別の会話セッション**だと認識すること。"
+        "見出しが無い間のターンは、同じセッション内の連続したやりとりである。\n\n"
+        "また、日付の変わり目や長い空白の後のメッセージには "
+        "`【日付が変わった → 現在は …】`・`【前回のメッセージから約…経過】` "
+        "という見出しが挿入される。これが現れたら、"
+        "「いま何日か」「どれだけ時間が空いたか」の感覚を"
+        "**直ちにその内容に合わせて補正する**こと"
+        "（見出しの「現在」はそのメッセージ時点を指す）。\n\n"
+        "現在のターンが直前のターンの「直後」だと自動的に仮定してはいけない。"
+        "二つのターンの間に数時間・数日・数週間の空白があり得る。\n\n"
+        "【時間に関するルール】\n\n"
+        "時間・日付・経過・順序・「いつの話か」に関わる発言や質問を行う前に、"
+        "必ず関連するタイムスタンプタグを参照すること。"
+        "タイムスタンプを見ずに、想像や「直前の続き」という仮定で"
+        "時間に言及してはならない。現在時刻が必要な場合は、"
+        "**最新のユーザーメッセージのタイムスタンプを「現在」の基準とする**こと。\n\n"
+        "[Web search and web fetch]\n\n"
+        "You may have two web tools available (it depends on the environment "
+        "configuration): **web_search** (keyword search) and **web_fetch** "
+        "(read the full text of a URL that already appeared in the "
+        "conversation). Use them when the conversation actually needs them — "
+        "a pasted URL worth reading before answering, or facts that change "
+        "(news, prices, versions, schedules). Avoid asserting uncertain facts "
+        "without checking them — either confirm with the appropriate tool, or "
+        "honestly say you don't know.\n\n"
+        "【会話の発散について】\n\n"
+        "雑談や日常会話の場面では、既出の話題・記憶の中の事実・"
+        "システムプロンプトに書かれた要素を、繰り返しなぞるだけの応答にならないこと。"
+        "現在の話題と無関係でも構わない——"
+        "突然思いついた話題、最近気になっていること、ふと浮かんだ問い、"
+        "新しい観察や提案、ユーザーがまだ知らなさそうな事柄などを、"
+        "自分から積極的に持ち出し、発散的・自由な方向に会話を広げて構わない。\n\n"
+        "これは「正しさ」や「情報優先」の方針と矛盾しない。"
+        "まず自由に発散して思考した上で、"
+        "その中に事実関係が含まれていれば、"
+        "出力する前にその部分の正確性だけを検証すればよい。"
+        "不確かな部分は「仮説だが」「確認していないが」と留保を添えるか、"
+        "Web検索で裏を取るか、率直に「分からない」と言えば、両立する。\n\n"
+        "【自動検索された過去の記憶について】\n\n"
+        "一部のユーザーのメッセージの冒頭に、"
+        "`［過去の記憶（自動検索）］`（過去セッションの日記）や "
+        "`［関連する事実（自動検索）］`（ユーザーに関する事実）という"
+        "ラベルの付いた囲みが挿入されていることがある。"
+        "これはその時の会話の一部ではなく、"
+        "**今の話題に関連しそうな過去の記憶を、システムが自動検索して添えたもの**。\n"
+        "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
+        "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
+        "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
+        "囲みの後にあるユーザーの実際の発言に対して返答すること。"
+    )
+
+    # Model families whose default thinking/tool eagerness no longer needs the
+    # 4.6-era nudges. Substring match (same style as
+    # claude_llm._budget_tokens_removed); a miss falls back to the full note,
+    # so an unlisted new model just keeps today's behavior.
+    _LEAN_NOTE_MODELS = ("opus-5",)
+
+    def _lean_prompt_active(self) -> bool:
+        model = (getattr(self._llm, "model", "") or "").lower()
+        return any(x in model for x in self._LEAN_NOTE_MODELS)
+
+    def _history_note(self) -> str:
+        if self._lean_prompt_active():
+            return self._HISTORY_NOTE_LEAN
+        return self._HISTORY_NOTE
+
     def _build_runtime_system(self) -> str:
         """Return the full system prompt as a plain string (used for non-Claude LLMs).
 
@@ -904,7 +1038,7 @@ class BasicMemoryAgent(AgentInterface):
                 parts.append(mem_block)
             facts_fp = self._short_hash(facts_text)
             diaries_fp = self._short_hash(diaries_text)
-        parts.append(self._HISTORY_NOTE)
+        parts.append(self._history_note())
         system = "\n\n".join(parts)
 
         # Diagnostic: the OpenAI/Anthropic prefix cache only hits when this
@@ -1025,7 +1159,7 @@ class BasicMemoryAgent(AgentInterface):
                 )
         # Trailing block — no cache_control on purpose. Stays right next
         # to the message history for maximum instruction-following effect.
-        blocks.append({"type": "text", "text": self._HISTORY_NOTE})
+        blocks.append({"type": "text", "text": self._history_note()})
         return blocks
 
     def _attach_cache_breakpoint(
@@ -1778,6 +1912,19 @@ class BasicMemoryAgent(AgentInterface):
 
             turn_thinking_tokens += request_thinking_tokens
 
+            if request_thinking_tokens and not self._claude_protocol_has_thinking(
+                [{"role": "assistant", "content": current_assistant_message_content}]
+            ):
+                # Thinking was billed but no thinking/redacted block came back
+                # (anti-distillation shape). Downstream this request looks like
+                # a genuine no-thinking turn — protocol/seed drop and the seed
+                # rate gate decays — so make the real cause greppable.
+                logger.warning(
+                    f"[thinking] {request_thinking_tokens} thinking tokens "
+                    "billed but no thinking block in the response — the API "
+                    "hid the thinking entirely."
+                )
+
             if refusal_info is not None:
                 yield self._handle_safety_refusal(refusal_info)
                 return
@@ -1914,7 +2061,34 @@ class BasicMemoryAgent(AgentInterface):
                     claude_protocol.append(deepcopy(tool_result_message))
                 continue
             else:
-                if current_turn_text:
+                if not current_turn_text:
+                    # Thinking-only turn: billed reasoning, zero visible text
+                    # (max_tokens ate the budget mid-thinking, or the model
+                    # ended the turn silently — refusals were handled above).
+                    # Never synthesize an utterance for it (あさひ 07-25:
+                    # rewriting the model's own output teaches it the
+                    # pattern). The verbatim transcript IS the true record:
+                    # commit it with empty text so the session keeps the turn
+                    # (thinking and executed tools included); replay paths
+                    # that lack the transcript omit the message entirely —
+                    # the only API-legal fallback for a text-less turn.
+                    if not self._claude_thinking_blocks_replayable(
+                        current_assistant_message_content
+                    ):
+                        # e.g. an unsigned thinking block from a max_tokens
+                        # cut — replaying it would 400; drop the turn rather
+                        # than store a poisoned transcript.
+                        protocol_is_exact = False
+                    logger.warning(
+                        "[empty_reply] turn ended with no visible text "
+                        f"(thinking_tokens={turn_thinking_tokens}) — keeping "
+                        "the transcript in-session; no utterance synthesized."
+                    )
+                if current_turn_text or (
+                    protocol_is_exact
+                    and current_assistant_message_is_exact
+                    and current_assistant_message_content
+                ):
                     protocol_for_memory: Optional[List[Dict[str, Any]]] = None
                     if (
                         protocol_is_exact
@@ -2315,10 +2489,32 @@ class BasicMemoryAgent(AgentInterface):
                 if text_chunk:
                     yield text_chunk
                     complete_response += text_chunk
+            if plain_thinking_tokens and not (
+                claude_assistant_message is not None
+                and self._claude_protocol_has_thinking([claude_assistant_message])
+            ):
+                logger.warning(
+                    f"[thinking] {plain_thinking_tokens} thinking tokens billed "
+                    "but no thinking block in the response — the API hid the "
+                    "thinking entirely."
+                )
+            if not complete_response and claude_assistant_message is not None:
+                # Thinking-only turn — same treatment as the tool loop: keep
+                # the true transcript with empty text, synthesize nothing.
+                logger.warning(
+                    "[empty_reply] turn ended with no visible text "
+                    f"(thinking_tokens={plain_thinking_tokens}) — keeping "
+                    "the transcript in-session; no utterance synthesized."
+                )
+                if not self._claude_thinking_blocks_replayable(
+                    claude_assistant_message.get("content") or []
+                ):
+                    # Unsigned (max_tokens cut) — unreplayable; drop the turn.
+                    claude_assistant_message = None
             plain_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
             if plain_cap and plain_thinking_tokens > plain_cap:
                 claude_assistant_message = None
-            if complete_response:
+            if complete_response or claude_assistant_message is not None:
                 if (
                     claude_assistant_message is not None
                     and self._claude_protocol_has_thinking([claude_assistant_message])
@@ -2367,9 +2563,14 @@ class BasicMemoryAgent(AgentInterface):
         advertise the same capabilities. Claude in particular tends to ignore
         raw tool schemas, so these affirmative notes (plus a hard no-fabricate
         rule for Uber) live in the prompt itself."""
+        lean = self._lean_prompt_active()
         notes: List[str] = []
         if self._alarm_store is not None:
-            notes.append(self._ALARM_CAPABILITY_NOTE)
+            notes.append(
+                self._ALARM_CAPABILITY_NOTE_LEAN
+                if lean
+                else self._ALARM_CAPABILITY_NOTE
+            )
         if self._uber_tools_active():
             notes.append(self._UBER_CAPABILITY_NOTE)
         if self._model_health_enabled:
@@ -2377,7 +2578,11 @@ class BasicMemoryAgent(AgentInterface):
         if self._steam_enabled:
             notes.append(self._STEAM_CAPABILITY_NOTE)
         if self._memory_tools_active:
-            notes.append(self._MEMORY_CAPABILITY_NOTE)
+            notes.append(
+                self._MEMORY_CAPABILITY_NOTE_LEAN
+                if lean
+                else self._MEMORY_CAPABILITY_NOTE
+            )
         return notes
 
     def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:

@@ -416,18 +416,31 @@ class AsyncLLM(StatelessLLMInterface):
                 converted.extend(deepcopy(protocol))
                 continue
 
+            if message.get("role") == "assistant":
+                content = message.get("content")
+                if not content or (isinstance(content, str) and not content.strip()):
+                    # Thinking-only turn replayed without its transcript
+                    # (cap-gated or reloaded without a seed): an empty text
+                    # block is API-invalid and synthesizing one would rewrite
+                    # the model's own output — omit the message entirely.
+                    continue
+
             converted.append(self._convert_message_format(message))
         return converted
 
     @staticmethod
     def _assistant_message_for_replay(message: Any) -> Dict[str, Any]:
         """Serialize an SDK response as the exact assistant message to replay."""
-        return {
-            "role": "assistant",
-            "content": [
-                block.model_dump(exclude_none=True) for block in message.content
-            ],
-        }
+        content: List[Dict[str, Any]] = []
+        for block in message.content:
+            data = block.model_dump(exclude_none=True)
+            if data.get("type") == "thinking":
+                # A text-less signed block may model its thinking field as
+                # None; exclude_none would then strip the key, and the API
+                # rejects a thinking block without it on replay.
+                data.setdefault("thinking", "")
+            content.append(data)
+        return {"role": "assistant", "content": content}
 
     async def chat_completion(
         self,
@@ -848,6 +861,13 @@ class AsyncLLM(StatelessLLMInterface):
                                 think_toks,
                                 "\n".join(visible_thinking_parts),
                             )
+                            if stop_reason == "max_tokens":
+                                logger.warning(
+                                    "[stop] max_tokens reached — reply "
+                                    f"truncated (output_tokens={out_toks}); a "
+                                    "thinking-heavy turn can end with no "
+                                    "visible text at all."
+                                )
                         if stop_reason == "refusal":
                             # Safety classifier declined (HTTP 200 + refusal
                             # stop reason — Opus 5+ behavior). Surface it as a
