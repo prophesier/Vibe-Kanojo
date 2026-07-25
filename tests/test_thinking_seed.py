@@ -154,6 +154,75 @@ class SeedCaptureTests(unittest.IsolatedAsyncioTestCase):
         # Seed and in-session protocol are the same transcript.
         self.assertEqual(agent._memory[-1]["claude_protocol"], seed["protocol"])
 
+    async def test_toolonly_turn_stages_seed_and_protocol(self):
+        """03:19 regression (あさひ 07-26): a tool turn with ZERO thinking must
+        still carry its transcript — dropping it made the model read its own
+        honest turn as a fabricated claim and re-set an existing alarm."""
+        tool_use = {
+            "type": "tool_use",
+            "id": "t1",
+            "name": "memory_search",
+            "input": {"query": "q"},
+        }
+        final = {"role": "assistant", "content": [{"type": "text", "text": "done"}]}
+
+        class _FakeExecutor:
+            async def execute_tools(self, tool_calls, caller_mode):
+                yield {
+                    "type": "final_tool_results",
+                    "results": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                    ],
+                }
+
+        agent = _bare_agent(
+            _FakeClaudeLLM(
+                [
+                    [
+                        {
+                            "type": "tool_use_complete",
+                            "data": {
+                                "id": "t1",
+                                "name": "memory_search",
+                                "input": {"query": "q"},
+                            },
+                        },
+                        {
+                            "type": "assistant_message_complete",
+                            "data": {
+                                "role": "assistant",
+                                "content": [deepcopy(tool_use)],
+                            },
+                        },
+                        {"type": "message_stop"},
+                    ],
+                    [
+                        {"type": "text_delta", "text": "done"},
+                        {"type": "assistant_message_complete", "data": deepcopy(final)},
+                        {"type": "message_stop"},
+                    ],
+                ]
+            )
+        )
+        agent._memory_tools_enabled = False
+        agent._model_health_enabled = False
+        agent._steam_enabled = False
+        agent._tool_executor = _FakeExecutor()
+        agent._mcp_tool_marker = lambda name: ""
+
+        async for _ in agent._claude_tool_interaction_loop(
+            [{"role": "user", "content": "hi"}], [{"name": "memory_search"}]
+        ):
+            pass
+
+        self.assertIn("claude_protocol", agent._memory[-1])
+        seed = agent.pop_thinking_seed()
+        self.assertIsNotNone(seed, "tool-only turn must persist its transcript")
+        self.assertEqual(seed["thinking_tokens"], 0)
+        self.assertEqual(
+            [m["role"] for m in seed["protocol"]], ["assistant", "user", "assistant"]
+        )
+
     async def test_thinking_less_turn_stages_nothing(self):
         agent = await self._run_loop(
             [
@@ -216,17 +285,37 @@ class SeedApplyTests(unittest.TestCase):
             [{"role": "assistant", "content": legacy["content"]}],
         )
 
-    def test_low_rate_seeds_nothing(self):
+    def test_low_rate_still_attaches_with_stats_warning(self):
+        # あさひ 07-26: the 80% rate is stats/warning only — transcripts are
+        # attached regardless (withholding them also erased tool calls and
+        # made honest turns look fabricated).
         agent = _bare_agent(_FakeClaudeLLM([]))
         agent._memory = _memory_with_assistants(10)
         assistant_idxs = [
             i for i, m in enumerate(agent._memory) if m["role"] == "assistant"
         ]
-        candidates = [(assistant_idxs[0], _seed())]  # 1/10 < 30%
+        candidates = [(assistant_idxs[0], _seed())]  # 1/10 thinking
 
         agent._apply_thinking_seeds(candidates, resuming=True)
 
-        self.assertFalse(any("claude_protocol" in m for m in agent._memory))
+        self.assertIn("claude_protocol", agent._memory[assistant_idxs[0]])
+
+    def test_only_last_10_root_assistant_turns_eligible(self):
+        # The attach window is the last 10 ROOT assistant entries
+        # (あさひ 07-26), not the last 10 seed-carrying candidates.
+        agent = _bare_agent(_FakeClaudeLLM([]))
+        agent._memory = _memory_with_assistants(12)
+        assistant_idxs = [
+            i for i, m in enumerate(agent._memory) if m["role"] == "assistant"
+        ]
+        candidates = [(i, _seed()) for i in assistant_idxs]
+
+        agent._apply_thinking_seeds(candidates, resuming=False)
+
+        for i in assistant_idxs[:2]:
+            self.assertNotIn("claude_protocol", agent._memory[i])
+        for i in assistant_idxs[2:]:
+            self.assertIn("claude_protocol", agent._memory[i])
 
     def test_foreign_model_seed_skipped(self):
         agent = _bare_agent(_FakeClaudeLLM([]))

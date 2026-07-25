@@ -33,6 +33,8 @@ from ...chat_history_manager import (
     get_recent_histories,
     pop_last_message,
     search_history,
+    split_search_keywords,
+    strip_tool_markers as _strip_tool_markers,
 )
 from ..transformers import (
     sentence_divider,
@@ -49,54 +51,11 @@ from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
 
 
-# Tool-execution marker lines that get streamed to the UI and persisted into
-# chat history for human review (see _mcp_tool_marker, _run_builtin_tool /
-# _run_alarm_tool, and claude_llm's native web tags). They must be STRIPPED from
-# the copy of history replayed to the model: the model imitates them, emitting
-# the marker (and inventing the tool's result) without actually calling the tool
-# — the failure a "don't imitate" system note could not suppress. Live chat and
-# the stored history keep them; only the model's replay copy is cleaned.
-#
-# The markers are EMITTED as "\n<glyph> *…*\n", but the sentence/TTS pipeline
-# collapses those newlines before the turn is persisted, so in stored history
-# they sit INLINE, glued to the reply text (e.g. "…では試す。🔍 *Web検索: …*[neutral]
-# ……"). So match/remove them as an inline substring — NOT line-anchored (an
-# earlier line-anchored version matched zero real markers and the model kept
-# imitating them).
-#
-# Each alternative is keyed to its exact glyph + label, and the variable
-# query/url is bound with [^*\n]* so removal stops at the marker's OWN closing
-# '*'. That is deliberately conservative: replies contain real markdown like
-# "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
-# query/url that itself contains '*' (rare) is left as-is rather than risk
-# eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
-# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam / 📝 記憶).
-_TOOL_MARKER_RE = re.compile(
-    r"[ \t]*(?:"
-    r"🍔[ \t]*\*Uber Eats\*"
-    r"|🔍[ \t]*\*Web検索:[^*\n]*\*"
-    r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
-    r"|⏰[ \t]*\*Alarm[^*\n]*\*"
-    r"|🧠[ \t]*\*自己診断[^*\n]*\*"
-    r"|🎮[ \t]*\*Steam[^*\n]*\*"
-    r"|📝[ \t]*\*記憶[^*\n]*\*"
-    r"|🔧[ \t]*\*ツール:[^*\n]*\*"
-    r")"
-)
-
-
-def _strip_tool_markers(text: str) -> str:
-    """Remove tool-execution markers from an assistant turn before it is replayed
-    to the model (it imitates them — emits the marker and fabricates the tool's
-    result without calling it). Markers stay in stored history / live chat, so
-    they remain human-searchable; only the model's replay copy is cleaned.
-
-    Strips the marker wherever it sits inline (the TTS pipeline collapses the
-    newlines it was emitted with); the bounded variable part can't eat the
-    reply's own '**bold**'. See :data:`_TOOL_MARKER_RE`."""
-    if "*" not in text:  # every marker contains '*' — cheap fast path
-        return text
-    return re.sub(r"\n{3,}", "\n\n", _TOOL_MARKER_RE.sub("", text)).strip()
+# Tool-execution markers (🍔/🔍/🔗/⏰/🧠/🎮/📝/🔧 tags streamed to the UI and
+# persisted into chat history for human review) must be STRIPPED from every
+# model-visible copy — the model imitates them and fabricates tool results.
+# The regex + strip helper live in chat_history_manager (imported above as
+# _strip_tool_markers) so history_search shares the same sanitization.
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -324,10 +283,12 @@ class BasicMemoryAgent(AgentInterface):
             text_content = str(message)
 
         if not text_content and role == "assistant":
-            # A thinking-only turn may carry its true transcript with no
-            # visible text; any other empty assistant message stays dropped.
+            # A thinking-only or tool-only turn may carry its true transcript
+            # with no visible text; any other empty assistant message stays
+            # dropped.
             if not (
-                claude_protocol and self._claude_protocol_has_thinking(claude_protocol)
+                claude_protocol
+                and self._claude_protocol_worth_carrying(claude_protocol)
             ):
                 return
 
@@ -364,7 +325,7 @@ class BasicMemoryAgent(AgentInterface):
         if (
             role == "assistant"
             and claude_protocol
-            and self._claude_protocol_has_thinking(claude_protocol)
+            and self._claude_protocol_worth_carrying(claude_protocol)
         ):
             # Claude-path side field: the exact assistant/tool-result protocol
             # sequence that produced this visible reply. It is expanded
@@ -393,17 +354,20 @@ class BasicMemoryAgent(AgentInterface):
     _PROTOCOL_RESULT_MAX_CHARS = 400
     _PROTOCOL_TRUNCATION_MARKER = "…[truncated for replay]"
 
-    # Cold-start thinking seeds (あさひ's design, 07-23): persist each turn's
-    # final assistant message ([thinking..., text], verbatim) to chat history;
-    # on reload, replay the newest N of them as thinking precedent — but only
-    # when the recent tail was actually thinking (rate gate), because seeding
-    # a slump just reinforces it, while a bare fresh session thinks
-    # spontaneously on its own.
+    # Cold-start transcript seeds (あさひ's design 07-23, revised 07-26):
+    # persist a turn's verbatim transcript to chat history whenever it carries
+    # thinking OR tool calls; on reload, the last _THINKING_SEED_COUNT
+    # assistant turns (ROOT memory entries — a tool turn's inner assistant
+    # rounds live inside its one protocol and don't count separately) get
+    # their transcripts re-attached UNCONDITIONALLY. The thinking-rate figure
+    # over the last _THINKING_SEED_RATE_WINDOW turns is stats/warning only —
+    # the old 80% withhold-gate was a 4.6-era health check: on adaptive
+    # 5-series models skipping thinking is normal, and withholding transcripts
+    # also erased tool calls, making honest turns look fabricated (03:19
+    # alarm incident).
     _THINKING_SEED_COUNT = 10
     _THINKING_SEED_RATE_WINDOW = 20  # assistant turns considered for the rate
-    # Seed only a genuinely healthy tail — anything below 80% recent thinking
-    # is already slipping, and replaying a slipping tail reinforces the slump.
-    _THINKING_SEED_MIN_RATE = 0.8
+    _THINKING_SEED_MIN_RATE = 0.8  # log/warning threshold only — never gates
     # Final assistant message of the just-completed turn, staged for the
     # conversation layer to persist (pop_thinking_seed). Class-level default
     # so __new__-constructed test instances read None.
@@ -418,41 +382,45 @@ class BasicMemoryAgent(AgentInterface):
 
         Returns {"model": ..., "protocol": [messages]} — the turn's full
         transcript verbatim (signed thinking included; tool_result content
-        truncated with a marker), or None when the turn produced no thinking.
-        The whole transcript is kept so a replayed tool turn still shows real
-        tool calls — rewriting it into a "results without calls" shape would
-        teach fabrication. The conversation layer attaches it to the on-disk
-        history record (store_message).
+        truncated with a marker), or None when the turn produced neither
+        thinking nor tool calls. The whole transcript is kept so a replayed
+        tool turn still shows real tool calls — rewriting it into a "results
+        without calls" shape would teach fabrication. The conversation layer
+        attaches it to the on-disk history record (store_message).
         """
         seed = self._last_thinking_seed
         self._last_thinking_seed = None
         return seed
 
     def _apply_thinking_seeds(self, candidates: List[tuple], resuming: bool) -> None:
-        """Replay the newest persisted thinking turns into reloaded context.
+        """Re-attach persisted turn transcripts to the reloaded context.
 
-        Each seed becomes a length-1 ``claude_protocol`` on its memory entry,
-        reusing the exact-replay machinery. Gated on the recent thinking RATE:
-        below the threshold nothing is seeded (don't reinforce a slump), and a
-        resumed session gets a log hint that a fresh session recovers
-        spontaneous thinking. Seeds from a different model are skipped (other
-        models ignore foreign thinking blocks but still bill their tokens).
+        Each seed becomes the ``claude_protocol`` of its memory entry, reusing
+        the exact-replay machinery. Eligible entries are the LAST
+        _THINKING_SEED_COUNT assistant turns (root entries), attached
+        unconditionally (あさひ 07-26) — the recent thinking rate is computed
+        for the log/warning only, never to withhold transcripts: a withheld
+        tool transcript makes an honest turn look fabricated. Seeds from a
+        different model are skipped (other models ignore foreign thinking
+        blocks but still bill their tokens), as are oversized-thinking seeds
+        (replay cap).
         """
         if not self._is_claude_llm() or not self._memory:
             return
         assistant_idxs = [
             i for i, m in enumerate(self._memory) if m.get("role") == "assistant"
         ]
-        window = assistant_idxs[-self._THINKING_SEED_RATE_WINDOW :]
-        if not window:
+        if not assistant_idxs:
             return
         candidate_idxs = {i for i, _ in candidates}
-        thinking_turns = sum(1 for i in window if i in candidate_idxs)
-        rate = thinking_turns / len(window)
+        stat_window = assistant_idxs[-self._THINKING_SEED_RATE_WINDOW :]
+        thinking_turns = sum(1 for i in stat_window if i in candidate_idxs)
+        rate = thinking_turns / len(stat_window)
         if rate < self._THINKING_SEED_MIN_RATE:
             logger.info(
-                f"[thinking_seed] recent thinking rate {thinking_turns}/{len(window)} "
-                f"is below {self._THINKING_SEED_MIN_RATE:.0%} — no seeds injected."
+                f"[thinking_seed] recent transcript rate {thinking_turns}/"
+                f"{len(stat_window)} is below {self._THINKING_SEED_MIN_RATE:.0%} "
+                "(stats only — transcripts are attached regardless)."
             )
             if resuming:
                 logger.warning(
@@ -460,11 +428,13 @@ class BasicMemoryAgent(AgentInterface):
                     "a FRESH session recovers spontaneous thinking — consider "
                     "/restart instead of /resume."
                 )
-            return
         model = getattr(self._llm, "model", "") or ""
         replay_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
+        attach_window = set(assistant_idxs[-self._THINKING_SEED_COUNT :])
         applied = 0
-        for idx, seed in candidates[-self._THINKING_SEED_COUNT :]:
+        for idx, seed in candidates:
+            if idx not in attach_window:
+                continue
             # Fat-thinking seeds are skipped for the same reason they were
             # never stored live (field present on seeds written after 07-25).
             seed_thinking = seed.get("thinking_tokens")
@@ -491,8 +461,8 @@ class BasicMemoryAgent(AgentInterface):
             self._memory[idx]["claude_protocol"] = deepcopy(protocol)
             applied += 1
         logger.info(
-            f"[thinking_seed] seeded {applied} thinking turn(s) into reloaded "
-            f"context (recent rate {thinking_turns}/{len(window)})."
+            f"[thinking_seed] re-attached {applied} turn transcript(s) into "
+            f"reloaded context (recent rate {thinking_turns}/{len(stat_window)})."
         )
 
     @classmethod
@@ -557,6 +527,34 @@ class BasicMemoryAgent(AgentInterface):
                 return block
             return {**block, "content": new_blocks or marker}
         return block
+
+    @staticmethod
+    def _claude_protocol_has_tool_use(
+        protocol: List[Dict[str, Any]],
+    ) -> bool:
+        """Whether an exact Claude transcript contains a tool call."""
+        for message in protocol:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            if any(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in content
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _claude_protocol_worth_carrying(cls, protocol: List[Dict[str, Any]]) -> bool:
+        """Whether a transcript must be carried into later requests: it holds
+        signed thinking (precedent) OR tool calls. The tool half is あさひ's
+        07-26 ruling after the 03:19 incident — a dropped tool transcript made
+        an honest turn look fabricated, and the model "corrected" an alarm it
+        had actually set (except tool_result truncation, the turn must be
+        restored exactly as it happened)."""
+        return cls._claude_protocol_has_thinking(
+            protocol
+        ) or cls._claude_protocol_has_tool_use(protocol)
 
     @staticmethod
     def _claude_protocol_has_thinking(
@@ -2112,7 +2110,7 @@ class BasicMemoryAgent(AgentInterface):
                         # tool_result content is already truncated above with
                         # an explanatory marker; those are unsigned client
                         # messages, so truncation cannot trip validation.
-                        if self._claude_protocol_has_thinking(protocol_for_memory):
+                        if self._claude_protocol_worth_carrying(protocol_for_memory):
                             self._last_thinking_seed = {
                                 "model": getattr(self._llm, "model", "") or "",
                                 "protocol": deepcopy(protocol_for_memory),
@@ -3167,7 +3165,9 @@ class BasicMemoryAgent(AgentInterface):
                                 "description": (
                                     "Search terms (1-8, OR'd). Pass proper nouns "
                                     "and phrases whole — they are fragmented "
-                                    "automatically."
+                                    "automatically. Each concept must be its own "
+                                    "array element; never pack several terms "
+                                    "into one comma-joined string."
                                 ),
                             },
                             "date_from": {
@@ -4222,9 +4222,7 @@ class BasicMemoryAgent(AgentInterface):
         if name == "memory_search":
             label = f"記憶検索: {_clip(args.get('query'))}"
         elif name == "history_search":
-            kws = "、".join(
-                str(k).strip() for k in (args.get("keywords") or []) if str(k).strip()
-            )
+            kws = "、".join(split_search_keywords(args.get("keywords")))
             label = f"記憶検索(履歴): {_clip(kws)}"
         elif name == "memory_add":
             label = f"記憶追加: {_clip(args.get('fact'))}"
@@ -4253,13 +4251,14 @@ class BasicMemoryAgent(AgentInterface):
         conf_uid = str(getattr(self._memory_manager, "_conf_uid", "") or "")
         if not conf_uid:
             return {"status": "error", "message": "会話ログの場所が特定できない。"}
-        keywords = [
-            str(k).strip() for k in (args.get("keywords") or []) if str(k).strip()
-        ]
+        # Pass the raw argument through — search_history normalizes it via
+        # split_search_keywords, including the observed misuse of one
+        # comma-joined string instead of an array (iterating that string
+        # here would char-shatter it into single-character keywords).
         return await asyncio.to_thread(
             search_history,
             conf_uid,
-            keywords,
+            args.get("keywords"),
             date_from=str(args.get("date_from", "") or "").strip(),
             date_to=str(args.get("date_to", "") or "").strip(),
         )
