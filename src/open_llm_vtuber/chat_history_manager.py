@@ -446,24 +446,96 @@ def get_latest_history_uid(conf_uid: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tool-execution markers (🍔/🔍/🔗/⏰/🧠/🎮/📝/🔧 "*…*" tags appended to spoken
+# replies). They are part of the STORED history — human-searchable on purpose —
+# but must never reach the model: it imitates them and fabricates tool results.
+# Every model-visible consumer of stored history (context replay in
+# basic_memory_agent, history_search snippets below) strips them with
+# strip_tool_markers.
+#
+# The markers are EMITTED as "\n<glyph> *…*\n", but the sentence/TTS pipeline
+# collapses those newlines before the turn is persisted, so in stored history
+# they sit INLINE, glued to the reply text (e.g. "…では試す。🔍 *Web検索: …*
+# ……"). So match/remove them as an inline substring — NOT line-anchored (an
+# earlier line-anchored version matched zero real markers and the model kept
+# imitating them).
+#
+# Each alternative is keyed to its exact glyph + label, and the variable
+# query/url is bound with [^*\n]* so removal stops at the marker's OWN closing
+# '*'. That is deliberately conservative: replies contain real markdown like
+# "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
+# query/url that itself contains '*' (rare) is left as-is rather than risk
+# eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
+# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam / 📝 記憶).
+# ---------------------------------------------------------------------------
+TOOL_MARKER_RE = re.compile(
+    r"[ \t]*(?:"
+    r"🍔[ \t]*\*Uber Eats\*"
+    r"|🔍[ \t]*\*Web検索:[^*\n]*\*"
+    r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
+    r"|⏰[ \t]*\*Alarm[^*\n]*\*"
+    r"|🧠[ \t]*\*自己診断[^*\n]*\*"
+    r"|🎮[ \t]*\*Steam[^*\n]*\*"
+    r"|📝[ \t]*\*記憶[^*\n]*\*"
+    r"|🔧[ \t]*\*ツール:[^*\n]*\*"
+    r")"
+)
+
+
+def strip_tool_markers(text: str) -> str:
+    """Remove tool-execution markers from stored-history text before any
+    model-visible use (context replay, search snippets). The markers stay in
+    the files themselves so they remain human-searchable; the bounded variable
+    part of the pattern can't eat a reply's own '**bold**'. See
+    :data:`TOOL_MARKER_RE`."""
+    if "*" not in text:  # every marker contains '*' — cheap fast path
+        return text
+    return re.sub(r"\n{3,}", "\n\n", TOOL_MARKER_RE.sub("", text)).strip()
+
+
+# ---------------------------------------------------------------------------
 # history_search — keyword full-scan over the chat log (memory-tool family).
 #
 # Deliberately NOT RAG: the corpus is too large to embed and the use case is
 # exact recall ("did we talk about X"), so a plain scan wins. Matching is
 # OR + automatic bigram fragmentation: each keyword is split into contiguous
-# 2-char fragments and a message containing ANY fragment is a candidate,
-# ranked by fragment coverage. This is what makes a single call with the full
-# shop name hit conversations that only ever mentioned part of it — the
-# calling model is lazy with tools and won't retry with sub-strings itself.
+# 2-char fragments; a message qualifies as a hit only when it contains at
+# least HALF of a keyword's fragments (a whole-substring match is full
+# coverage), ranked by coverage. The fragments are what make a single call
+# with the full shop name hit conversations that only ever mentioned part of
+# it — the calling model is lazy with tools and won't retry with sub-strings
+# itself; the half-coverage bar keeps a stray shared bigram from flooding the
+# results (あさひ C1, 2026-07-25).
 # ---------------------------------------------------------------------------
 
 _SEARCH_BUDGET_CHARS = 2800
 _SEARCH_MAX_BLOCKS = 8
 _SEARCH_MAX_KEYWORDS = 8
+_SEARCH_MIN_COVERAGE = 0.5  # candidacy bar: ≥ half of a keyword's fragments
 _SEARCH_BLOCK_MAX_MSGS = 7  # merged-block span cap (common-word searches)
 _HIT_WINDOW = 160  # chars shown for the matched message, centered on the hit
 _NEIGHBOR_WINDOW = 120  # chars shown for ±1 neighbor messages
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def split_search_keywords(raw) -> List[str]:
+    """Normalize the model-supplied ``keywords`` argument into a clean list.
+
+    The documented shape is a JSON array of strings, but defend against the
+    misuse observed 2026-07-25: the model passed ONE comma-joined string
+    (keywords="分布, 口調を真似, 移った") — and iterating a str shatters it
+    into single characters, turning every character (and the commas
+    themselves) into a full-score keyword. Accept a bare string, and split
+    every element on comma-like separators so each concept stands alone.
+    """
+    items = [raw] if isinstance(raw, str) else list(raw or [])
+    out: List[str] = []
+    for item in items:
+        for part in re.split(r"[,、，;；/｜|]+", str(item)):
+            part = part.strip()
+            if part:
+                out.append(part)
+    return out
 
 
 def _search_norm(text: str) -> str:
@@ -526,7 +598,7 @@ def _search_snippet(
 
 def search_history(
     conf_uid: str,
-    keywords: List[str],
+    keywords: List[str] | str,
     date_from: str = "",
     date_to: str = "",
 ) -> dict:
@@ -541,7 +613,7 @@ def search_history(
     are SELECTED by coverage score (then recency) but DISPLAYED newest-first,
     with whole oldest blocks dropped when over budget.
     """
-    keywords = [str(k).strip() for k in (keywords or []) if str(k).strip()]
+    keywords = split_search_keywords(keywords)
     if not keywords:
         return {"status": "error", "message": "keywords が空。"}
     keywords = keywords[:_SEARCH_MAX_KEYWORDS]
@@ -564,6 +636,14 @@ def search_history(
         messages = get_history(conf_uid, uid, quiet=True)
         if not messages:
             continue
+        for m in messages:
+            # Tool markers ride the stored text (kept human-searchable on
+            # purpose); the model must not meet them through search either —
+            # context replay already strips its own copy.
+            if m.get("role") == "ai":
+                c = m.get("content")
+                if isinstance(c, str) and c:
+                    m["content"] = strip_tool_markers(c)
         sessions[uid] = messages
         for idx, msg in enumerate(messages):
             content = str(msg.get("content", ""))
@@ -579,7 +659,12 @@ def search_history(
             msg_frags = _search_fragments(msg_norm)
             score = 0.0
             for kn, kf in zip(kw_norm, kw_frags):
-                score += _search_coverage(msg_norm, msg_frags, kn, kf)
+                cov = _search_coverage(msg_norm, msg_frags, kn, kf)
+                # Candidacy bar (あさひ C1): a stray shared bigram must not
+                # make a message a hit — require at least half the keyword's
+                # fragments (a whole-substring match is always full coverage).
+                if cov >= _SEARCH_MIN_COVERAGE:
+                    score += cov
             if score > 0.0:
                 hits.append((score, ts, uid, idx))
 
