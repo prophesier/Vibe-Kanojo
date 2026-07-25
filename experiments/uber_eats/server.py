@@ -28,7 +28,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from loguru import logger  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 
-from uber_client import UberEatsClient, UberUnavailable  # noqa: E402
+from uber_client import (  # noqa: E402
+    UberEatsClient,
+    UberUnavailable,
+    normalize_vertical,
+)
 
 HERE = pathlib.Path(__file__).resolve().parent
 logger.remove()  # don't write to stdout — stdout is the MCP stdio channel!
@@ -71,10 +75,20 @@ async def _run(coro, what: str):
 
 
 @mcp.tool()
-async def uber_search(keyword: str) -> str:
+async def uber_search(keyword: str, vertical: str = "RESTAURANTS") -> str:
     """Search Uber Eats (Japan) for stores. Takes a keyword such as a dish name
     or store name and returns a list of deliverable stores (name, rating,
-    store_uuid). Browse-only: you cannot order or pay. If a store looks
+    store_uuid).
+    vertical picks the search index and must be chosen to match the intent:
+      - "RESTAURANTS" (default): restaurants and eateries — any food or dish
+        query.
+      - "RETAIL": convenience stores, supermarkets, drugstores, liquor shops —
+        when the user wants conbini/grocery shopping.
+    There is NO mixed mode: since 2026-07 Uber's API returns retail-only for
+    an empty or "ALL" vertical, so always pass the vertical explicitly (an
+    omitted/unknown value falls back to RESTAURANTS). If the intent spans
+    both, call this tool once per vertical.
+    Browse-only: you cannot order or pay. If a store looks
     interesting, pass its store_uuid to uber_store to see the menu.
     The return value is for your reference and does not stay in the
     conversation, so write anything you want to convey in your reply itself.
@@ -83,12 +97,19 @@ async def uber_search(keyword: str) -> str:
     The browsing account is not an Uber One member, but the user himself is, so
     that member price (cheaper than usual, or free) is what the user actually
     pays. "通常¥…" is the reference price for non-members."""
-    ok, data = await _run(_client.search(keyword), f"uber_search({keyword!r})")
+    v = normalize_vertical(vertical)
+    ok, data = await _run(
+        _client.search(keyword, vertical=v), f"uber_search({keyword!r},{v})"
+    )
     if not ok:
         return f"検索できませんでした: {data}"
+    v_label = "飲食店" if v == "RESTAURANTS" else "コンビニ・スーパー等の小売"
     if not data:
-        return f"「{keyword}」に一致する配達可能な店舗は見つかりませんでした。"
-    lines = [f"「{keyword}」の検索結果（{len(data)}件）:"]
+        return (
+            f"「{keyword}」に一致する配達可能な店舗（{v_label}）は"
+            "見つかりませんでした。"
+        )
+    lines = [f"「{keyword}」の検索結果（{len(data)}件・{v_label}）:"]
     for s in data:
         pr = "［PR］" if s.get("sponsored") else ""
         bits = []

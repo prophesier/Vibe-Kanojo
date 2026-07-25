@@ -24,7 +24,8 @@ import json
 import pathlib
 import re
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 from playwright.async_api import async_playwright
 
@@ -63,6 +64,62 @@ class UberUnavailable(Exception):
 def filter_replay_headers(headers: Dict[str, str]) -> Dict[str, str]:
     """Keep only the stable headers worth replaying (used by login.py too)."""
     return {k: v for k, v in headers.items() if k.lower() in _REPLAY_HEADER_KEYS}
+
+
+def _location_cookie(headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    """Rebuild the ``uev2.loc`` delivery-address cookie from the saved header
+    coordinates.
+
+    The profile's own copy expires ~30 days after login. 2026-07-25 it lapsed
+    silently: the session stayed valid (calls all 200) but with no address the
+    feed fell back to a city-wide result set — delivery point drifted to a
+    random ward and only wide-radius retail chains looked "deliverable".
+    Re-injecting a fresh copy on every call pins the delivery point for as long
+    as the session itself lives. A minimal payload is enough: the API resolves
+    serviceability (restaurants included) from lat/lng alone — verified by
+    probe against the real feed.
+    """
+    lat = headers.get("x-uber-target-location-latitude")
+    lng = headers.get("x-uber-target-location-longitude")
+    if not lat or not lng:
+        return None
+    try:
+        payload = {
+            "address": {"address1": "自宅", "title": "自宅"},
+            "latitude": float(lat),
+            "longitude": float(lng),
+            "reference": "",
+            "referenceType": "",
+            "type": "MANUAL",
+            "source": "manual_auto_complete",
+        }
+    except (TypeError, ValueError):
+        return None
+    return {
+        "name": "uev2.loc",
+        "value": quote(json.dumps(payload, ensure_ascii=False)),
+        "domain": ".ubereats.com",
+        "path": "/",
+        "expires": 2_000_000_000,
+        "httpOnly": False,
+        "secure": True,
+        "sameSite": "None",
+    }
+
+
+def normalize_vertical(vertical: str) -> str:
+    """Collapse a caller-supplied search vertical to the two real choices.
+
+    2026-07 the API dropped its mixed mode: empty and "ALL" on the wire both
+    mean retail-only now, so callers must pick RESTAURANTS (飲食店) or RETAIL
+    (コンビニ/スーパー/ドラッグストア/酒販). Anything else — including ""
+    and "ALL" — falls back to RESTAURANTS, the primary use case, so a caller
+    expecting the retired mixed mode never silently gets retail-only.
+    """
+    v = (vertical or "").strip().upper()
+    if v in ("RETAIL", "GROCERY", "CONVENIENCE", "SUPERMARKET"):
+        return "RETAIL"
+    return "RESTAURANTS"
 
 
 def _tidy_eta(text: str) -> str:
@@ -334,6 +391,12 @@ class UberEatsClient:
                     raise UberUnavailable(
                         f"ブラウザの起動に失敗しました（profile使用中かもしれません）: {e}"
                     )
+                loc = _location_cookie(headers)
+                if loc is not None:
+                    try:
+                        await ctx.add_cookies([loc])
+                    except Exception:
+                        pass  # best-effort; the call itself may still succeed
                 try:
                     resp = await ctx.request.post(
                         url,
@@ -377,7 +440,9 @@ class UberEatsClient:
                     pass
 
     # ------------------------------------------------------------------
-    async def search(self, keyword: str, limit: int = 30) -> List[Dict[str, Any]]:
+    async def search(
+        self, keyword: str, limit: int = 30, vertical: str = "RESTAURANTS"
+    ) -> List[Dict[str, Any]]:
         """Return stores matching ``keyword`` with the search-card details:
         name, store_uuid, rating (+ review count), delivery fee, ETA, sponsored
         flag, and any promos.
@@ -386,9 +451,18 @@ class UberEatsClient:
         getSearchSuggestionsV1 (autocomplete, ~3). It's a direct API call, so no
         page navigation, no ad, and no reCAPTCHA (which only the /search page
         navigation triggers).
+
+        ``vertical`` picks the search index: RESTAURANTS or RETAIL (see
+        normalize_vertical). 2026-07: Uber changed the endpoint's semantics —
+        empty and "ALL" verticals now both return ONLY grocery/retail (there is
+        no mixed mode any more), and restaurants require an explicit
+        ``vertical="RESTAURANTS"`` (probe-verified; the old single "" call is
+        why food searches suddenly came back all-conbini). RETAIL is sent as
+        the empty vertical on the wire.
         """
         if not keyword or not keyword.strip():
             return []
+        wire = "" if normalize_vertical(vertical) == "RETAIL" else "RESTAURANTS"
         data = await self._call(
             "getSearchFeedV1",
             {
@@ -398,7 +472,7 @@ class UberEatsClient:
                 "startTime": 0,
                 "endTime": 0,
                 "sortAndFilters": [],
-                "vertical": "",
+                "vertical": wire,
                 "searchSource": "",
                 "searchType": "",
                 "keyName": "",
@@ -411,14 +485,14 @@ class UberEatsClient:
         for fi in (data.get("data") or {}).get("feedItems") or []:
             if not isinstance(fi, dict):
                 continue
-            # Two feed-card shapes carry a store:
-            #   REGULAR_STORE          -> fi["store"]
-            #   MINI_STORE_WITH_ITEMS  -> fi["miniStoreWithItems"]["store"]
+            # Feed-card shapes that carry a store:
+            #   REGULAR_STORE / REGULAR_STORE_WITH_ITEMS -> fi["store"]
+            #   MINI_STORE_WITH_ITEMS -> fi["miniStoreWithItems"]["store"]
             # The mini cards are the dish-match tiles Uber groups under
             # "その他の店"/related, and they are the BULK of a dish query
-            # (~65 of 79 for "ペペロンチーノ"). Reading only fi["store"] silently
-            # dropped them, so the character saw a tiny, unrepresentative subset.
-            # Handle both, preserving feed order.
+            # (~65 of 79 for "ペペロンチーノ"). Reading only fi["store"]
+            # silently dropped them, so the character saw a tiny,
+            # unrepresentative subset. Handle both, preserving feed order.
             st = fi.get("store")
             if not isinstance(st, dict):
                 st = (fi.get("miniStoreWithItems") or {}).get("store")
@@ -434,7 +508,9 @@ class UberEatsClient:
         return out
 
     @staticmethod
-    def _category_store_info(d: Dict[str, Any], store_uuid: str) -> List[Dict[str, Any]]:
+    def _category_store_info(
+        d: Dict[str, Any], store_uuid: str
+    ) -> List[Dict[str, Any]]:
         """If ``d`` (a getStoreV1 data blob) is a multi-level category store
         (conbini/supermarket/drugstore), return its aisle categories
         (title + section_uuid + item count). Otherwise return ``[]``.
@@ -445,11 +521,8 @@ class UberEatsClient:
         clean list of top-level sections with per-section item counts.
         """
         merchant = (
-            ((d.get("storeMerchantTypeInfo") or {}).get("uberMerchantType") or {}).get(
-                "type"
-            )
-            or ""
-        )
+            (d.get("storeMerchantTypeInfo") or {}).get("uberMerchantType") or {}
+        ).get("type") or ""
         is_category = (
             d.get("menuDisplayType") == "USE_SECTION_AS_CATEGORY"
             or merchant in _CATEGORY_MERCHANT_TYPES
@@ -457,7 +530,9 @@ class UberEatsClient:
         if not is_category:
             return []
         aisles = d.get("aisles") or {}
-        lst = aisles.get(store_uuid) or next(iter(aisles.values()), []) if aisles else []
+        lst = (
+            aisles.get(store_uuid) or next(iter(aisles.values()), []) if aisles else []
+        )
         cats: List[Dict[str, Any]] = []
         for a in lst or []:
             if not isinstance(a, dict):
@@ -614,7 +689,11 @@ class UberEatsClient:
             raise UberUnavailable("store_uuid が指定されていません。")
         if not section_uuid or not section_uuid.strip():
             raise UberUnavailable("section_uuid が指定されていません。")
-        subs = [subsection_uuid.strip()] if subsection_uuid and subsection_uuid.strip() else None
+        subs = (
+            [subsection_uuid.strip()]
+            if subsection_uuid and subsection_uuid.strip()
+            else None
+        )
         data = await self._call(
             "getCatalogPresentationV2",
             {
@@ -631,7 +710,9 @@ class UberEatsClient:
         d = data.get("data") or {}
         # Subcategories (細分類). The leading "すべて" (all) tab has uuid=None; drop it.
         subcats: List[Dict[str, Any]] = []
-        for s in ((d.get("segmentedControlData") or {}).get("segmentedControlItems") or []):
+        for s in (d.get("segmentedControlData") or {}).get(
+            "segmentedControlItems"
+        ) or []:
             if not isinstance(s, dict):
                 continue
             su, title = s.get("uuid"), _label_text(s.get("title"))
