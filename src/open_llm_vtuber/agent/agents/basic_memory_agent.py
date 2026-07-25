@@ -930,9 +930,10 @@ class BasicMemoryAgent(AgentInterface):
     # eager) and the [Strict rules on executing tools] no-false-report block
     # (あさひ 07-25: redundant for 5-series; _check_stateful_claims still
     # polices stateful claims mechanically). Slimmed: web-tool encouragement →
-    # availability + honesty only; the strict-time enumeration → one sentence.
-    # Kept verbatim: session/banner semantics, RAG-block semantics, divergence
-    # note.
+    # availability + honesty only. Kept verbatim: session/banner semantics,
+    # the strict time rules (compressed 07-25, restored in full 07-26 — time
+    # errors persisted on Opus 5 and are not effort-correlated), RAG-block
+    # semantics, divergence note.
     _HISTORY_NOTE_LEAN = (
         "【以下の会話履歴について】\n\n"
         "ここから後に続くユーザーとアシスタントのやりとりは、"
@@ -954,11 +955,20 @@ class BasicMemoryAgent(AgentInterface):
         "（見出しの「現在」はそのメッセージ時点を指す）。\n\n"
         "現在のターンが直前のターンの「直後」だと自動的に仮定してはいけない。"
         "二つのターンの間に数時間・数日・数週間の空白があり得る。\n\n"
-        "【時間に関するルール】\n\n"
-        "時間・日付・経過・順序・「いつの話か」に関わる発言や質問を行う前に、"
-        "必ず関連するタイムスタンプタグを参照すること。"
-        "タイムスタンプを見ずに、想像や「直前の続き」という仮定で"
-        "時間に言及してはならない。現在時刻が必要な場合は、"
+        "【時間に関する厳格なルール】\n\n"
+        "時間・日付・経過・順序・「いつの話か」に少しでも関わる"
+        "**あらゆる発言**を行う前に、必ず関連するタイムスタンプタグを参照すること。"
+        "ユーザーの質問に答える時だけでなく、以下のすべての場合に適用される：\n"
+        "- 自分から時刻・日付・経過時間・最近性に言及する時"
+        "（「さっき」「昨日」「今日は」「久しぶり」など）\n"
+        "- 時刻に応じた挨拶をする時（おはよう・こんばんは等）\n"
+        "- ユーザーに対して時間関連の質問・確認をする時"
+        "（「今は何時頃？」「あれから〇日経った？」など）\n"
+        "- 過去の出来事の時期や、二つの出来事の時間差を述べる時\n"
+        "- 「現在」「最近」「以前」を基準とした推論をする時\n\n"
+        "**タイムスタンプを見ずに時間関連の発言・質問を行うことは禁止する。** "
+        "想像・推測・「直前の続き」と仮定して時間に言及することは許可されない。\n\n"
+        "現在時刻が必要な場合は、"
         "**最新のユーザーメッセージのタイムスタンプを「現在」の基準とする**こと。\n\n"
         "[Web search and web fetch]\n\n"
         "You may have two web tools available (it depends on the environment "

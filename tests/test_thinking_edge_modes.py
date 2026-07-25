@@ -200,6 +200,8 @@ class HistoryNoteRoutingTests(unittest.TestCase):
             "自動検索",
             "タイムスタンプ",
             "web_fetch",
+            # Full strict time rules restored 07-26 (time errors persisted).
+            "時間に関する厳格なルール",
         ):
             self.assertIn(anchor, note)
         # 4.6-era nudges must be absent from the lean variant (and present in
