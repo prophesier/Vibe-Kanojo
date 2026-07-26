@@ -79,8 +79,8 @@ class CandidacyBarTests(unittest.TestCase):
         self.assertNotIn("ドサッ", out["text"])
 
     def test_whole_substring_still_full_score(self):
-        messages = [_msg("human", "東京駅もんじゃを予約した", "2026-07-20 10:00:00")]
-        out = _run_search(["東京駅もんじゃ"], messages)
+        messages = [_msg("human", "海鮮もんじゃを予約した", "2026-07-20 10:00:00")]
+        out = _run_search(["海鮮もんじゃ"], messages)
         self.assertEqual(out["total_hits"], 1)
 
 
