@@ -84,13 +84,26 @@ class AlarmStore:
             pass
 
     # -------------------------------------------------------------- public
-    async def add(self, *, fire_at_utc: datetime.datetime, note: str) -> Dict[str, Any]:
-        """Create a pending alarm and persist it."""
+    async def add(
+        self,
+        *,
+        fire_at_utc: datetime.datetime,
+        note: str,
+        wake: bool = False,
+    ) -> Dict[str, Any]:
+        """Create a pending alarm and persist it.
+
+        ``wake`` marks an alarm that must physically wake the user: on delivery
+        the server also plays music through the speakers, independently of
+        whatever the character says. Records written before this field existed
+        simply have no ``wake`` key, which reads as False.
+        """
         record = {
             "id": uuid.uuid4().hex[:12],
             "conf_uid": self._conf_uid,
             "fire_at_utc": fire_at_utc.astimezone(datetime.timezone.utc).isoformat(),
             "note": (note or "").strip(),
+            "wake": bool(wake),
             "created_at_utc": _now_utc().isoformat(),
             "status": STATUS_PENDING,
         }
@@ -100,7 +113,7 @@ class AlarmStore:
             self._write(alarms)
         logger.info(
             f"[alarm] set {record['id']} for {record['fire_at_utc']} "
-            f"note={record['note']!r}"
+            f"note={record['note']!r}{' wake=True' if record['wake'] else ''}"
         )
         self._wake_scheduler()
         return record

@@ -2862,6 +2862,19 @@ class BasicMemoryAgent(AgentInterface):
                                     "'YYYY-MM-DD HH:MM'."
                                 ),
                             },
+                            "wake": {
+                                "type": "boolean",
+                                "description": (
+                                    "true for an alarm meant to physically "
+                                    "wake the user up (a morning alarm). Music "
+                                    "then plays out of his speakers on repeat "
+                                    "until he answers or you call music_stop — "
+                                    "a text message alone cannot wake someone "
+                                    "who is asleep. Use it only for actual "
+                                    "wake-up times, never for ordinary "
+                                    "reminders."
+                                ),
+                            },
                             "force": {
                                 "type": "boolean",
                                 "description": (
@@ -3613,14 +3626,22 @@ class BasicMemoryAgent(AgentInterface):
                         "note": dup.get("note", ""),
                     },
                 }
-            record = await self._alarm_store.add(fire_at_utc=fire_at_utc, note=note)
+            wake = bool(args.get("wake", False))
+            record = await self._alarm_store.add(
+                fire_at_utc=fire_at_utc, note=note, wake=wake
+            )
             local = format_local(record["fire_at_utc"])
-            return f"\n⏰ *Alarm set: {local}*\n", {
+            marker = f"\n⏰ *Alarm set: {local}{'（起こす）' if wake else ''}*\n"
+            return marker, {
                 "status": "ok",
-                "message": f"アラームを {local} に設定しました。",
+                "message": (
+                    f"アラームを {local} に設定しました。"
+                    + ("音楽を鳴らして起こす設定。" if wake else "")
+                ),
                 "id": record["id"],
                 "at_local": local,
                 "note": note,
+                "wake": wake,
             }
         if name == "list_alarms":
             pending = await self._alarm_store.list_pending()

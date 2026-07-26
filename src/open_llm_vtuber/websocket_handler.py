@@ -34,6 +34,7 @@ from .conversations.conversation_handler import (
 from .conversations.single_conversation import process_single_conversation
 from .conversations.conversation_utils import EMOJI_LIST
 from .alarms import get_alarm_store
+from .alarms import wake_audio
 from .alarms.scheduler import AlarmScheduler
 from .alarms.prompts import build_fire_prompt
 
@@ -97,6 +98,8 @@ class WebSocketHandler:
         # One scheduler for the default character; started on first connection.
         self._alarm_scheduler: Optional[AlarmScheduler] = None
         self._alarm_delivery_lock = asyncio.Lock()
+        # Set while a wake alarm is ringing; cancelled when the music stops.
+        self._wake_timeout_task: Optional[asyncio.Task] = None
 
         # --- Claude prompt-cache keepalive ---
         # Monotonic time of the last turn that refreshed the cache (any end's
@@ -703,6 +706,10 @@ class WebSocketHandler:
         # signals the user is present: reset the keepalive timer and counter.
         self._last_turn_at = time.monotonic()
         self._keepalive_count = 0
+        # He answered, so he is awake — that is the whole exit condition for a
+        # wake alarm. No "stop the alarm" tool call required, and no way for a
+        # missed one to leave the music running.
+        self.stop_wake_audio("user replied")
         await handle_conversation_trigger(
             msg_type=data.get("type", ""),
             data=data,
@@ -766,6 +773,35 @@ class WebSocketHandler:
         uid = ready[-1]
         return uid, self._client_end_type.get(uid) == "proxy"
 
+    # Longest a wake alarm may keep ringing unattended. Answering stops it
+    # sooner; this is only the backstop for "nobody is home".
+    _WAKE_MAX_SECONDS = 900
+
+    def _start_wake_audio(self) -> Optional[str]:
+        """Ring the speakers for a wake alarm, independently of the reply."""
+        label = wake_audio.start()
+        if label is None:
+            return None
+        if self._wake_timeout_task is not None:
+            self._wake_timeout_task.cancel()
+        self._wake_timeout_task = asyncio.create_task(self._wake_audio_timeout())
+        return label
+
+    async def _wake_audio_timeout(self) -> None:
+        try:
+            await asyncio.sleep(self._WAKE_MAX_SECONDS)
+        except asyncio.CancelledError:
+            return
+        self.stop_wake_audio("timeout")
+
+    def stop_wake_audio(self, reason: str) -> None:
+        """Silence a ringing wake alarm. Safe to call when nothing is playing."""
+        if self._wake_timeout_task is not None:
+            self._wake_timeout_task.cancel()
+            self._wake_timeout_task = None
+        if wake_audio.stop():
+            logger.info(f"[wake] stopped ({reason}).")
+
     async def _deliver_alarms(self, due: List[dict]) -> bool:
         """Scheduler callback: speak the due alarm(s) on the best end. Returns
         False if nothing could receive it (the scheduler retries later)."""
@@ -775,6 +811,17 @@ class WebSocketHandler:
                 return False
             client_uid, skip_tts = target
             prompt = build_fire_prompt(due)
+            # Start the music BEFORE the turn: waking him must not depend on
+            # the model choosing to do anything. Told about it afterwards, the
+            # character knows why he might be grumbling about noise.
+            if any(a.get("wake") for a in due):
+                label = self._start_wake_audio()
+                if label:
+                    prompt += (
+                        f"\n（システム：起こすために「{label}」を"
+                        "スピーカーで繰り返し再生中。彼が返事をすれば自動で止まる。"
+                        "先に止めたいと言われたら music_stop を呼ぶこと。）"
+                    )
             ok = await self._fire_proactive(client_uid, prompt, skip_tts)
             if ok:
                 conf_uid = self.default_context_cache.character_config.conf_uid
