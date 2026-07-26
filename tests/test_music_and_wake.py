@@ -49,20 +49,20 @@ class WeapiCryptoTests(unittest.TestCase):
         self.assertEqual(_PUB_MODULUS.bit_length(), 1024)
 
 
-class CdnUnblockTests(unittest.TestCase):
-    def test_rewrites_region_locked_host(self):
+class CdnHostTests(unittest.TestCase):
+    def test_rewrites_to_the_preferred_host(self):
         self.assertEqual(
-            ncm_client._unblock_cdn("http://m701.music.126.net/a/b.mp3"),
+            ncm_client._preferred_cdn_host("http://m701.music.126.net/a/b.mp3"),
             "http://m701c.music.126.net/a/b.mp3",
         )
 
     def test_already_rewritten_is_untouched(self):
         url = "http://m701c.music.126.net/a/b.mp3"
-        self.assertEqual(ncm_client._unblock_cdn(url), url)
+        self.assertEqual(ncm_client._preferred_cdn_host(url), url)
 
     def test_unrelated_host_untouched(self):
         url = "https://p3.music.126.net/cover.jpg"
-        self.assertEqual(ncm_client._unblock_cdn(url), url)
+        self.assertEqual(ncm_client._preferred_cdn_host(url), url)
 
 
 class CookieConflictTests(unittest.TestCase):

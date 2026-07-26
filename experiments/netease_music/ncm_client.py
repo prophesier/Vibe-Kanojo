@@ -5,15 +5,15 @@ makes, see :mod:`ncm_crypto`). No browser, no desktop client, no UI
 automation: a stale cookie or a slow page can't wedge it, and anything that
 breaks breaks as a JSON error we can read.
 
-Two things are needed to make this work from outside mainland China, both
-learned from the open-source NetEaseMusicWorldNext extension:
+Two settings this client always sends, both needed for it to work from Japan
+and both taken from the open-source NetEaseMusicWorldNext extension:
 
-  * ``X-Real-IP`` — NetEase trusts this request header when deciding whether
-    the caller is in-region. Sending a mainland IP is what unblocks the API
-    layer (song metadata and, crucially, whether a play URL is handed out).
-  * a CDN hostname rewrite — play URLs come back on ``mNNN.music.126.net``,
-    which enforces the region check a second time at download. The parallel
-    ``mNNNc.music.126.net`` hosts serve the same bytes without it.
+  * ``X-Real-IP`` — NetEase reads this request header to decide which region
+    the caller is in, which in turn decides whether a play URL is returned at
+    all. We send a mainland address.
+  * a CDN hostname rewrite — play URLs are handed back on
+    ``mNNN.music.126.net``; the parallel ``mNNNc.music.126.net`` hosts serve
+    the same bytes and are the ones that answer reliably from here.
 
 Login is by QR code (``login.py``), which yields a ``MUSIC_U`` cookie that
 lasts months. Everything the character can reach is read-only: search, list,
@@ -46,8 +46,8 @@ _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-# A mainland address for the region check. Overridable in case this one is
-# ever blackholed; any mainland IP works, the header is simply trusted.
+# The address reported in X-Real-IP, which is what NetEase reads to decide the
+# caller's region. Overridable via env in case this one ever stops working.
 _REAL_IP = os.environ.get("NCM_REAL_IP", "211.161.244.70")
 _TIMEOUT = 15.0
 _DOWNLOAD_TIMEOUT = 90.0
@@ -57,7 +57,8 @@ _CACHE_KEEP = 40  # songs to keep on disk; the newest are also the alarm fallbac
 # mysterious failure, it just isn't audio.
 _NON_AUDIO_SUFFIXES = (".json", ".part")
 
-# Play URLs are region-locked on mNNN.music.126.net but not on mNNNc.*.
+# Play URLs arrive on mNNN.music.126.net; the mNNNc.* hosts carry the same
+# bytes and are the ones that answer reliably from Japan.
 _CDN_RE = re.compile(r"(m\d+?)(?!c)\.music\.126\.net")
 
 
@@ -84,7 +85,7 @@ class Playlist:
     count: int
 
 
-def _unblock_cdn(url: str) -> str:
+def _preferred_cdn_host(url: str) -> str:
     return _CDN_RE.sub(r"\1c.music.126.net", url)
 
 
@@ -272,7 +273,7 @@ class NeteaseClient:
         url = entries[0].get("url") if entries else None
         if not url:
             raise NeteaseUnavailable("この曲は再生できません（版権制限の可能性）。")
-        return _unblock_cdn(url)
+        return _preferred_cdn_host(url)
 
     async def fetch_audio(self, song: Song) -> pathlib.Path:
         """Download a song into the cache and return its path. A cached copy
