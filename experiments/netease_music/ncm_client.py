@@ -88,6 +88,31 @@ def _unblock_cdn(url: str) -> str:
     return _CDN_RE.sub(r"\1c.music.126.net", url)
 
 
+def cookie_dict(client: httpx.AsyncClient) -> Dict[str, str]:
+    """Flatten a client's cookie jar to ``{name: value}``.
+
+    NetEase sets several cookies (MUSIC_A_T, MUSIC_U, __csrf) under more than
+    one domain at once, and httpx's mapping interface raises CookieConflict
+    the moment a name is ambiguous — which is exactly what happens at the
+    instant a QR login succeeds. Reading the jar directly sidesteps that;
+    where a name repeats, the music.163.com copy wins.
+    """
+    out: Dict[str, str] = {}
+    preferred: Dict[str, bool] = {}
+    for cookie in client.cookies.jar:
+        specific = "music.163.com" in (cookie.domain or "")
+        if cookie.name in out and preferred.get(cookie.name) and not specific:
+            continue
+        out[cookie.name] = cookie.value or ""
+        preferred[cookie.name] = specific
+    return out
+
+
+def cookie_value(client: httpx.AsyncClient, name: str, default: str = "") -> str:
+    """One cookie by name, conflict-safe (see :func:`cookie_dict`)."""
+    return cookie_dict(client).get(name, default)
+
+
 def _song_from(raw: Dict[str, Any]) -> Song:
     artists = raw.get("ar") or raw.get("artists") or []
     album = raw.get("al") or raw.get("album") or {}
@@ -126,7 +151,10 @@ class NeteaseClient:
             json.dumps({"cookies": keep, "saved_at": time.time()}, indent=2),
             encoding="utf-8",
         )
-        self._session_file.chmod(0o600)
+        try:
+            self._session_file.chmod(0o600)
+        except OSError:
+            pass  # tightening permissions is a nicety, not worth losing a login
 
     async def client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -152,7 +180,7 @@ class NeteaseClient:
         """One weapi call. Raises :class:`NeteaseUnavailable` on any failure."""
         client = await self.client()
         body = dict(payload)
-        body.setdefault("csrf_token", client.cookies.get("__csrf", ""))
+        body.setdefault("csrf_token", cookie_value(client, "__csrf"))
         try:
             resp = await client.post(f"{_BASE}/{path}", data=weapi_encrypt(body))
             resp.raise_for_status()
@@ -296,7 +324,7 @@ class NeteaseClient:
         body = {
             "key": unikey,
             "type": 1,
-            "csrf_token": client.cookies.get("__csrf", ""),
+            "csrf_token": cookie_value(client, "__csrf"),
         }
         try:
             resp = await client.post(
@@ -311,7 +339,7 @@ class NeteaseClient:
         except ValueError as e:
             return {"code": 801, "message": f"unreadable poll response: {e}"}
         if data.get("code") == 803:
-            self.save_cookies(dict(client.cookies))
+            self.save_cookies(cookie_dict(client))
         return data
 
 

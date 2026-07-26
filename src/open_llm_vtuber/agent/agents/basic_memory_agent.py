@@ -2746,7 +2746,13 @@ class BasicMemoryAgent(AgentInterface):
         if tool_name in ("music_play", "music_play_playlist"):
             # "再生開始: <song> / <artist>（<playlist> から）" on success;
             # anything else is a failure message worth showing as-is.
-            song = text.split("再生開始:", 1)[-1].strip() if "再生開始:" in text else ""
+            # Only the first line: a play result may append the other
+            # same-title candidates, which belong in the tool result, not here.
+            song = (
+                text.split("再生開始:", 1)[-1].strip().splitlines()[0].strip()
+                if "再生開始:" in text
+                else ""
+            )
             body = f"再生: {song}" if song else (text.splitlines() or ["再生"])[0]
             return f"\n🎵 *{body[:80]}*\n"
         label = cls._MUSIC_MARKER_LABELS.get(tool_name, "音楽")

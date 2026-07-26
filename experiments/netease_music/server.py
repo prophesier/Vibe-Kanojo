@@ -78,10 +78,13 @@ async def _run(coro, what: str):
 
 
 def _format(songs: list[Song]) -> str:
+    """One line per song. The id is what disambiguates covers, remixes and
+    re-recordings that share a title — pass it to music_play(song_id=...)."""
     return "\n".join(
         f"{i}. {s.label()}"
         + (f"（{s.album}）" if s.album and s.album != s.name else "")
         + f" [{s.duration_ms // 60000}:{s.duration_ms // 1000 % 60:02d}]"
+        + f" id={s.id}"
         for i, s in enumerate(songs, 1)
     )
 
@@ -109,18 +112,39 @@ async def music_search(keyword: str, limit: int = 8) -> str:
 
 
 @mcp.tool()
-async def music_play(keyword: str, volume: int = _DEFAULT_VOLUME) -> str:
-    """Play music on the user's computer speakers. Takes a song title, an
-    artist name, or both ("米津玄師 Lemon"), plays the best match, and replaces
-    whatever was playing. volume is 0-100. The song plays once; use
-    music_stop to end it early."""
+async def music_play(
+    keyword: str = "", song_id: int = 0, volume: int = _DEFAULT_VOLUME
+) -> str:
+    """Play music on the user's computer speakers, replacing whatever was
+    playing. volume is 0-100; the song plays once (music_stop ends it early).
+
+    Give either a keyword ("米津玄師 Lemon" — title, artist, or both) or an
+    exact song_id from music_search. Titles are NOT unique: covers, remixes,
+    live versions and karaoke tracks share them constantly, so a keyword plays
+    the top match and lists the other candidates with their ids. When the user
+    means a particular recording, or the top match was wrong, search first and
+    play the id."""
+    if song_id:
+        ok, songs = await _run(_client.songs_by_id([song_id]), "music_play/lookup")
+        if not ok:
+            return songs
+        if not songs:
+            return f"id={song_id} の曲が見つかりませんでした。"
+        ok, message = await _run(_play_song(songs[0], volume), "music_play/fetch")
+        return message
+
+    if not keyword.strip():
+        return "曲名かアーティスト名、または song_id を指定してください。"
     ok, songs = await _run(_client.search(keyword, 5), "music_play/search")
     if not ok:
         return songs
     if not songs:
         return f"「{keyword}」に一致する曲は見つかりませんでした。"
     ok, message = await _run(_play_song(songs[0], volume), "music_play/fetch")
-    return message
+    if not ok or len(songs) < 2:
+        return message
+    others = "、".join(f"{s.label()} (id={s.id})" for s in songs[1:4])
+    return f"{message}\n（同名の他候補: {others} — 違ったら song_id で指定し直して）"
 
 
 @mcp.tool()

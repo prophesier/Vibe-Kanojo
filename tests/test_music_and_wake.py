@@ -65,6 +65,38 @@ class CdnUnblockTests(unittest.TestCase):
         self.assertEqual(ncm_client._unblock_cdn(url), url)
 
 
+class CookieConflictTests(unittest.TestCase):
+    """NetEase sets the same cookie name under several domains at once. httpx's
+    mapping interface raises CookieConflict on an ambiguous name — and it does
+    so at exactly the worst moment, the instant a QR login is confirmed, which
+    is what silently broke the first two login attempts."""
+
+    def _client(self):
+        import httpx
+
+        client = httpx.AsyncClient()
+        client.cookies.set("MUSIC_A_T", "aaa", domain=".163.com")
+        client.cookies.set("MUSIC_A_T", "bbb", domain="music.163.com")
+        client.cookies.set("__csrf", "tok", domain="music.163.com")
+        return client
+
+    def test_plain_dict_would_raise(self):
+        import httpx
+
+        with self.assertRaises(httpx.CookieConflict):
+            dict(self._client().cookies)
+
+    def test_cookie_dict_survives_duplicates(self):
+        jar = ncm_client.cookie_dict(self._client())
+        self.assertEqual(jar["MUSIC_A_T"], "bbb")  # music.163.com wins
+        self.assertEqual(jar["__csrf"], "tok")
+
+    def test_cookie_value_helper(self):
+        client = self._client()
+        self.assertEqual(ncm_client.cookie_value(client, "__csrf"), "tok")
+        self.assertEqual(ncm_client.cookie_value(client, "nope", "dflt"), "dflt")
+
+
 class CacheSidecarTests(unittest.TestCase):
     """The metadata sidecar sits next to the audio; a glob that picks it up
     hands a .json file to the player, which fails in a way that looks like a
@@ -252,6 +284,40 @@ class WakeAudioTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await wake_audio.start())
 
 
+class LegacyAlarmTests(unittest.IsolatedAsyncioTestCase):
+    """Alarms created before the wake feature have no ``wake`` key at all.
+    They must fire exactly as they always did — silent, spoken only."""
+
+    async def test_record_without_wake_key_does_not_ring(self):
+        legacy = {"id": "abc", "note": "薬を飲んだか聞く", "status": "pending"}
+        self.assertFalse(any(a.get("wake") for a in [legacy]))
+
+    async def test_mixed_batch_rings_only_for_the_wake_one(self):
+        legacy = {"id": "old", "note": "旧アラーム"}
+        waking = {"id": "new", "note": "起きる時間", "wake": True}
+        self.assertTrue(any(a.get("wake") for a in [legacy, waking]))
+        self.assertFalse(any(a.get("wake") for a in [legacy, {"wake": False}]))
+
+    async def test_store_writes_the_key_for_new_alarms(self):
+        import datetime
+        import tempfile
+        from unittest import mock as _mock
+
+        from src.open_llm_vtuber.alarms.store import AlarmStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AlarmStore("test_uid")
+            with (
+                _mock.patch.object(store, "_dir", tmp),
+                _mock.patch.object(store, "_path", f"{tmp}/alarms.json"),
+            ):
+                when = datetime.datetime.now(datetime.timezone.utc)
+                plain = await store.add(fire_at_utc=when, note="n")
+                waking = await store.add(fire_at_utc=when, note="n", wake=True)
+        self.assertIs(plain["wake"], False)
+        self.assertIs(waking["wake"], True)
+
+
 class MusicMarkerTests(unittest.TestCase):
     """Every tool path must show a marker (あさひ audits usage from chat), and
     the music markers carry their result the way the time markers do."""
@@ -269,6 +335,13 @@ class MusicMarkerTests(unittest.TestCase):
 
     def test_play_marker_names_the_song(self):
         out = self._marker("music_play", "再生開始: Lemon / 米津玄師")
+        self.assertEqual(out, "\n🎵 *再生: Lemon / 米津玄師*\n")
+
+    def test_play_marker_ignores_the_candidates_line(self):
+        out = self._marker(
+            "music_play",
+            "再生開始: Lemon / 米津玄師\n（同名の他候補: Lemon / KBShinya (id=9)…）",
+        )
         self.assertEqual(out, "\n🎵 *再生: Lemon / 米津玄師*\n")
 
     def test_play_marker_from_mcp_content_blocks(self):
