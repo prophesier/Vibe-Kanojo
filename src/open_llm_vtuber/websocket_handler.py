@@ -791,12 +791,15 @@ class WebSocketHandler:
             return False
         metadata = {
             "proactive_speak": True,
-            # Don't persist the injected alarm prompt as a fake "human" turn.
-            # The AI's proactive REPLY is still saved to history (that store is
-            # unconditional) and to memory (assistant messages always are), so
-            # the character remembers what it said — just not the machinery.
-            "skip_history": True,
-            "skip_memory": True,
+            # あさひ 07-26: the injected stimulus (alarm memo / cache keepalive
+            # nudge) IS persisted to memory and history now. The earlier design
+            # hid it while keeping the visible reply — which taught the model
+            # that unprompted alarm-style speech "just happens" mid-conversation,
+            # and Opus 5 started fabricating alarm-fired replies. Same lesson as
+            # the tool transcripts: the causal chain must be visible; context
+            # fidelity has no shortcut.
+            "skip_history": False,
+            "skip_memory": False,
             "skip_tts": skip_tts,
         }
         try:

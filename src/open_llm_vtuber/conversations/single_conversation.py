@@ -77,7 +77,15 @@ async def process_single_conversation(
                 history_uid=context.history_uid,
                 role="human",
                 content=input_text,
-                name=context.character_config.human_name,
+                # System-injected stimuli (alarm memo / cache keepalive) act as
+                # the user turn and are stored as one, but attributed to the
+                # system so displays and history search don't claim the user
+                # typed them.
+                name=(
+                    "システム"
+                    if (metadata and metadata.get("proactive_speak"))
+                    else context.character_config.human_name
+                ),
             )
 
         if skip_history:
