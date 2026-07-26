@@ -109,6 +109,12 @@ class MarkerSanitizationTests(unittest.TestCase):
             "これは**太字**のまま。",
         )
 
+    def test_time_marker_stripped(self):
+        self.assertEqual(
+            strip_tool_markers("🕐 *時刻確認: 2026-07-26 22:44（日）*いま10時44分だ。"),
+            "いま10時44分だ。",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -466,7 +466,8 @@ def get_latest_history_uid(conf_uid: str) -> str:
 # "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
 # query/url that itself contains '*' (rare) is left as-is rather than risk
 # eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
-# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam / 📝 記憶).
+# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam / 📝 記憶 /
+# 🕐 時刻確認・時刻変換).
 # ---------------------------------------------------------------------------
 TOOL_MARKER_RE = re.compile(
     r"[ \t]*(?:"
@@ -478,6 +479,7 @@ TOOL_MARKER_RE = re.compile(
     r"|🎮[ \t]*\*Steam[^*\n]*\*"
     r"|📝[ \t]*\*記憶[^*\n]*\*"
     r"|🔧[ \t]*\*ツール:[^*\n]*\*"
+    r"|🕐[ \t]*\*時刻[^*\n]*\*"
     r")"
 )
 

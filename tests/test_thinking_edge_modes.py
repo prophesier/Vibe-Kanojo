@@ -239,6 +239,45 @@ class LeanCapabilityNoteTests(unittest.TestCase):
         self.assertFalse(_bare_agent(llm2)._lean_prompt_active())
 
 
+class TimeToolMarkerTests(unittest.TestCase):
+    def test_get_current_time_marker_carries_result(self):
+        content = (
+            '{"timezone": "Asia/Tokyo", "datetime": "2026-07-26T22:44:23+09:00",'
+            ' "day_of_week": "Sunday", "is_dst": false}'
+        )
+        mk = BasicMemoryAgent._time_tool_marker("get_current_time", content)
+        self.assertEqual(mk, "\n🕐 *時刻確認: 2026-07-26 22:44（日）*\n")
+
+    def test_convert_time_uses_target(self):
+        content = (
+            '{"source": {"datetime": "2026-07-26T22:00:00+09:00"},'
+            ' "target": {"datetime": "2026-07-26T15:00:00+02:00",'
+            ' "day_of_week": "Sunday"}, "time_difference": "-7.0h"}'
+        )
+        mk = BasicMemoryAgent._time_tool_marker("convert_time", content)
+        self.assertEqual(mk, "\n🕐 *時刻変換: 2026-07-26 15:00（日）*\n")
+
+    def test_mcp_content_blocks_shape(self):
+        content = [
+            {
+                "type": "text",
+                "text": '{"datetime": "2026-07-26T08:00:00+09:00",'
+                ' "day_of_week": "Sunday"}',
+            }
+        ]
+        mk = BasicMemoryAgent._time_tool_marker("get_current_time", content)
+        self.assertIn("時刻確認: 2026-07-26 08:00", mk)
+
+    def test_garbage_falls_back_to_plain_marker(self):
+        mk = BasicMemoryAgent._time_tool_marker("get_current_time", "not json")
+        self.assertEqual(mk, "\n🕐 *時刻確認*\n")
+
+    def test_other_tools_and_pre_marker_deferral(self):
+        self.assertEqual(BasicMemoryAgent._time_tool_marker("uber_search", "{}"), "")
+        self.assertEqual(BasicMemoryAgent._mcp_tool_marker("get_current_time"), "")
+        self.assertIn("🔧", BasicMemoryAgent._mcp_tool_marker("some_other_tool"))
+
+
 class _StubBlock:
     def __init__(self, data):
         self._data = data

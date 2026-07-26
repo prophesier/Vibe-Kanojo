@@ -2059,6 +2059,18 @@ class BasicMemoryAgent(AgentInterface):
                         logger.warning(
                             "Tool executor finished without final results marker."
                         )
+                    # Deferred result-bearing markers for the time tools.
+                    name_by_id = {c.get("id"): c.get("name", "") for c in mcp_calls}
+                    for r in tool_results_for_llm:
+                        if not isinstance(r, dict):
+                            continue
+                        mk = self._time_tool_marker(
+                            name_by_id.get(r.get("tool_use_id"), ""),
+                            r.get("content"),
+                        )
+                        if mk and mk not in emitted_markers:
+                            emitted_markers.add(mk)
+                            yield mk
 
                 if tool_results_for_llm:
                     tool_result_message = {
@@ -2375,6 +2387,20 @@ class BasicMemoryAgent(AgentInterface):
                             logger.warning(
                                 "OpenAI tool executor finished without final results marker."
                             )
+                        # Deferred result-bearing markers for the time tools.
+                        name_by_id = {
+                            tc.id: tc.function.name for tc in mcp_calls if tc.id
+                        }
+                        for r in tool_results_for_llm:
+                            if not isinstance(r, dict):
+                                continue
+                            mk = self._time_tool_marker(
+                                name_by_id.get(r.get("tool_call_id"), ""),
+                                r.get("content"),
+                            )
+                            if mk and mk not in emitted_markers:
+                                emitted_markers.add(mk)
+                                yield mk
 
                 if tool_results_for_llm:
                     messages.extend(tool_results_for_llm)
@@ -2619,12 +2645,53 @@ class BasicMemoryAgent(AgentInterface):
     def _mcp_tool_marker(tool_name: str) -> str:
         """Short inline tag flagging that an MCP tool was used. Uber keeps its
         own glyph; any other MCP tool gets a generic 🔧 tag so EVERY tool call
-        is visible in chat (あさひ audits usage from there when away)."""
+        is visible in chat (あさひ audits usage from there when away). Time
+        tools return "" here — their marker is result-bearing and fires after
+        execution (_time_tool_marker)."""
         if tool_name.startswith("uber"):
             return "\n🍔 *Uber Eats*\n"
+        if tool_name in ("get_current_time", "convert_time"):
+            return ""
         if tool_name:
             return f"\n🔧 *ツール: {tool_name[:40]}*\n"
         return ""
+
+    _DAY_JA = {
+        "Monday": "月",
+        "Tuesday": "火",
+        "Wednesday": "水",
+        "Thursday": "木",
+        "Friday": "金",
+        "Saturday": "土",
+        "Sunday": "日",
+    }
+
+    @classmethod
+    def _time_tool_marker(cls, tool_name: str, content: Any) -> str:
+        """Result-bearing marker for the time MCP tools (あさひ 07-26: the
+        generic 🔧 tag hid the answer — show what the clock said). Unlike the
+        name-only pre-markers this fires AFTER execution; display-only, and
+        stripped from replay like every marker (TOOL_MARKER_RE has 🕐)."""
+        if tool_name not in ("get_current_time", "convert_time"):
+            return ""
+        label = "時刻確認" if tool_name == "get_current_time" else "時刻変換"
+        try:
+            data = content
+            if isinstance(data, list):
+                # MCP content blocks: [{"type": "text", "text": "<json>"}]
+                for block in data:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        data = block.get("text", "")
+                        break
+            if isinstance(data, str):
+                data = json.loads(data)
+            node = data.get("target") if "target" in data else data
+            stamp = str(node["datetime"])[:16].replace("T", " ")
+            day = cls._DAY_JA.get(str(node.get("day_of_week", "")), "")
+            tail = f"（{day}）" if day else ""
+            return f"\n🕐 *{label}: {stamp}{tail}*\n"
+        except Exception:
+            return f"\n🕐 *{label}*\n"
 
     def _handle_safety_refusal(self, info: Dict[str, Any]) -> str:
         """Clean up after a safety-classifier refusal and build the notice.
