@@ -5,6 +5,7 @@ determinism, not against the live service, and playback is exercised through
 a stubbed player.
 """
 
+import asyncio
 import base64
 import json
 import pathlib
@@ -12,6 +13,9 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+
+from src.open_llm_vtuber.agent.agents.basic_memory_agent import BasicMemoryAgent
+from src.open_llm_vtuber.chat_history_manager import strip_tool_markers
 
 _MUSIC_DIR = (
     pathlib.Path(__file__).resolve().parents[1] / "experiments" / "netease_music"
@@ -129,9 +133,27 @@ class _StubClient:
         return list(self._songs)
 
 
-class WakeAudioTests(unittest.TestCase):
-    def _install(self, songs):
-        player = _StubPlayer()
+async def _never_returns(*_args, **_kwargs):
+    await asyncio.sleep(3600)
+
+
+class _ExplodingPlayer(_StubPlayer):
+    """Every OS-touching call fails — the state file is locked, ffplay is
+    gone, whatever. Nothing may escape to the caller."""
+
+    def play(self, path, **kwargs):
+        raise OSError("boom")
+
+    def stop(self):
+        raise OSError("boom")
+
+    def status(self):
+        raise OSError("boom")
+
+
+class WakeAudioTests(unittest.IsolatedAsyncioTestCase):
+    def _install(self, songs, player=None):
+        player = player or _StubPlayer()
         patcher = mock.patch.object(
             wake_audio, "_load", lambda: (player, _StubClient(songs))
         )
@@ -139,36 +161,161 @@ class WakeAudioTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
         return player
 
-    def test_plays_a_cached_song_on_repeat(self):
+    async def test_plays_a_cached_song_on_repeat(self):
         player = self._install(
             [{"id": 1, "name": "朝", "artists": "誰か", "path": "C:/x/1.mp3"}]
         )
-        label = wake_audio.start(volume=90)
+        label = await wake_audio.start(volume=90)
         self.assertEqual(label, "朝 / 誰か")
         ((path, kwargs),) = player.calls
         self.assertEqual(path, "C:/x/1.mp3")
         self.assertTrue(kwargs["loop"])  # a wake alarm must not play once
         self.assertEqual(kwargs["volume"], 90)
 
-    def test_silent_when_cache_is_empty(self):
+    async def test_playlist_song_preferred_over_cache(self):
+        player = self._install(
+            [{"id": 9, "name": "古い", "artists": "誰か", "path": "C:/x/9.mp3"}]
+        )
+        with mock.patch.object(
+            wake_audio,
+            "_from_playlist",
+            mock.AsyncMock(return_value=("C:/x/new.mp3", "新曲 / 誰か")),
+        ):
+            label = await wake_audio.start(playlist="起床")
+        self.assertEqual(label, "新曲 / 誰か")
+        self.assertEqual(player.calls[0][0], "C:/x/new.mp3")
+
+    async def test_falls_back_to_cache_when_playlist_fetch_fails(self):
+        player = self._install(
+            [{"id": 9, "name": "古い", "artists": "誰か", "path": "C:/x/9.mp3"}]
+        )
+        with mock.patch.object(
+            wake_audio,
+            "_from_playlist",
+            mock.AsyncMock(side_effect=RuntimeError("net")),
+        ):
+            label = await wake_audio.start(playlist="起床")
+        self.assertEqual(label, "古い / 誰か")
+        self.assertEqual(player.calls[0][0], "C:/x/9.mp3")
+
+    async def test_falls_back_to_cache_on_fetch_timeout(self):
+        player = self._install(
+            [{"id": 9, "name": "古い", "artists": "誰か", "path": "C:/x/9.mp3"}]
+        )
+        with (
+            mock.patch.object(wake_audio, "_FETCH_TIMEOUT_S", 0.01),
+            mock.patch.object(wake_audio, "_from_playlist", _never_returns),
+        ):
+            label = await wake_audio.start(playlist="起床")
+        self.assertEqual(label, "古い / 誰か")
+        self.assertEqual(player.calls[0][0], "C:/x/9.mp3")
+
+    async def test_silent_when_cache_is_empty(self):
         player = self._install([])
-        self.assertIsNone(wake_audio.start())
+        self.assertIsNone(await wake_audio.start())
         self.assertEqual(player.calls, [])
         self.assertFalse(wake_audio.available())
 
-    def test_stop_reports_whether_it_was_playing(self):
+    async def test_stop_reports_whether_it_was_playing(self):
         self._install([{"id": 1, "name": "n", "artists": "a", "path": "p"}])
-        wake_audio.start()
+        await wake_audio.start()
         self.assertTrue(wake_audio.is_playing())
         self.assertTrue(wake_audio.stop())
         self.assertFalse(wake_audio.stop())
 
-    def test_missing_music_module_degrades_quietly(self):
+    async def test_missing_music_module_degrades_quietly(self):
         with mock.patch.object(wake_audio, "_load", lambda: None):
-            self.assertIsNone(wake_audio.start())
+            self.assertIsNone(await wake_audio.start())
             self.assertFalse(wake_audio.stop())
             self.assertFalse(wake_audio.available())
             self.assertFalse(wake_audio.is_playing())
+
+    async def test_player_errors_never_escape(self):
+        # あさひ is usually away from the machine: nothing about the music may
+        # take down the alarm path or the message handler.
+        self._install(
+            [{"id": 1, "name": "n", "artists": "a", "path": "p"}], _ExplodingPlayer()
+        )
+        self.assertIsNone(await wake_audio.start())
+        self.assertFalse(wake_audio.stop())
+        self.assertFalse(wake_audio.is_playing())
+
+    async def test_broken_cache_never_escapes(self):
+        class _BadClient:
+            def cached_songs(self):
+                raise OSError("cache unreadable")
+
+        with mock.patch.object(
+            wake_audio, "_load", lambda: (_StubPlayer(), _BadClient())
+        ):
+            self.assertFalse(wake_audio.available())
+            self.assertIsNone(await wake_audio.start())
+
+
+class MusicMarkerTests(unittest.TestCase):
+    """Every tool path must show a marker (あさひ audits usage from chat), and
+    the music markers carry their result the way the time markers do."""
+
+    def _marker(self, tool, content):
+        return BasicMemoryAgent._deferred_tool_marker(tool, content)
+
+    def test_no_pre_marker_for_music_tools(self):
+        # The generic 🔧 tag would fire before the result is known.
+        self.assertEqual(BasicMemoryAgent._mcp_tool_marker("music_play"), "")
+        self.assertEqual(BasicMemoryAgent._mcp_tool_marker("music_stop"), "")
+
+    def test_unknown_tool_still_gets_the_generic_marker(self):
+        self.assertIn("🔧", BasicMemoryAgent._mcp_tool_marker("something_else"))
+
+    def test_play_marker_names_the_song(self):
+        out = self._marker("music_play", "再生開始: Lemon / 米津玄師")
+        self.assertEqual(out, "\n🎵 *再生: Lemon / 米津玄師*\n")
+
+    def test_play_marker_from_mcp_content_blocks(self):
+        out = self._marker(
+            "music_play_playlist",
+            [{"type": "text", "text": "再生開始: 朝 / 誰か（起床 から）"}],
+        )
+        self.assertIn("🎵", out)
+        self.assertIn("朝 / 誰か", out)
+
+    def test_play_failure_shows_the_reason(self):
+        out = self._marker(
+            "music_play", "「xyzzy」に一致する曲は見つかりませんでした。"
+        )
+        self.assertIn("🎵", out)
+        self.assertIn("見つかりません", out)
+
+    def test_search_marker_carries_the_keyword(self):
+        out = self._marker("music_search", "「YOASOBI」の検索結果:\n1. 夜に駆ける")
+        self.assertEqual(out, "\n🎵 *曲を検索: YOASOBI*\n")
+
+    def test_stop_and_status_markers(self):
+        self.assertEqual(
+            self._marker("music_stop", "再生を止めました。"), "\n🎵 *再生停止*\n"
+        )
+        self.assertEqual(
+            self._marker("music_now_playing", "今は何も再生していません。"),
+            "\n🎵 *再生状況*\n",
+        )
+
+    def test_garbage_result_still_yields_a_marker(self):
+        for junk in (None, 12345, [], [{"type": "image"}]):
+            self.assertIn("🎵", self._marker("music_stop", junk))
+
+    def test_time_marker_still_works_through_the_dispatcher(self):
+        out = self._marker(
+            "get_current_time",
+            '{"datetime": "2026-07-27T08:30:00+09:00", "day_of_week": "Monday"}',
+        )
+        self.assertIn("🕐", out)
+        self.assertIn("2026-07-27 08:30", out)
+
+    def test_music_markers_are_stripped_from_model_visible_text(self):
+        self.assertEqual(
+            strip_tool_markers("🎵 *再生: Lemon / 米津玄師*かけたよ。"), "かけたよ。"
+        )
+        self.assertEqual(strip_tool_markers("🎵 *再生停止*止めた。"), "止めた。")
 
 
 if __name__ == "__main__":

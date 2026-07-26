@@ -130,11 +130,19 @@ def _official_line(off: Optional[AnthropicStatus], lang: str) -> List[str]:
     ja = lang == "ja"
     if not off or not off.ok:
         return [
-            ("Anthropic公式: 取得失敗（判断材料なし）" if ja else "Anthropic官方: 获取失败（无判断依据）")
+            (
+                "Anthropic公式: 取得失敗（判断材料なし）"
+                if ja
+                else "Anthropic官方: 获取失败（无判断依据）"
+            )
         ]
     lines = []
     if ja:
-        overall = "全システム正常" if off.indicator == "none" else f"異常あり（{off.indicator}）"
+        overall = (
+            "全システム正常"
+            if off.indicator == "none"
+            else f"異常あり（{off.indicator}）"
+        )
         lines.append(f"Anthropic公式: {overall}")
         lines.append(f"  Claude API: {off.claude_api_status or '不明'}")
         if off.degraded_components:
@@ -147,7 +155,9 @@ def _official_line(off: Optional[AnthropicStatus], lang: str) -> List[str]:
         else:
             lines.append("  未解決の障害: なし")
     else:
-        overall = "全部正常" if off.indicator == "none" else f"有异常（{off.indicator}）"
+        overall = (
+            "全部正常" if off.indicator == "none" else f"有异常（{off.indicator}）"
+        )
         lines.append(f"Anthropic官方: {overall}")
         lines.append(f"  Claude API 组件: {off.claude_api_status or '未知'}")
         if off.degraded_components:
@@ -228,9 +238,15 @@ def _render(a: Assessment, lang: str) -> str:
             sv = f"{cur:.0f}" if numeric else "?"
             L.append(f"  {axis_lbl[ax]}: {sv}/100 {mark}{extra}".rstrip())
     else:
-        L.append("  （データなし / no data）" + (f" [{a.bench_error}]" if a.bench_error else ""))
+        L.append(
+            "  （データなし / no data）"
+            + (f" [{a.bench_error}]" if a.bench_error else "")
+        )
     L.append("■ Anthropic " + ("公式ステータス" if ja else "官方状态"))
-    L.extend("  " + ln if not ln.startswith("  ") else ln for ln in _official_line(a.official, lang))
+    L.extend(
+        "  " + ln if not ln.startswith("  ") else ln
+        for ln in _official_line(a.official, lang)
+    )
     verdict_head = "■ 総合評価" if ja else "■ 综合评价"
     L.append(verdict_head)
     L.append("  " + (_VERDICT_JA if ja else _VERDICT_ZH).get(a.verdict, ""))

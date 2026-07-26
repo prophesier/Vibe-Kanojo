@@ -27,6 +27,8 @@ import sys
 import time
 from typing import Any, Dict, Optional
 
+from loguru import logger
+
 HERE = pathlib.Path(__file__).resolve().parent
 STATE_FILE = HERE / "playback.json"
 
@@ -48,27 +50,38 @@ def _pid_alive(pid: int) -> bool:
     """True if the pid is still running. Never signals the process — on
     Windows ``os.kill(pid, 0)`` would *terminate* it rather than probe it."""
     if _IS_WINDOWS:
-        out = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        ).stdout
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=10,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            # Can't tell — assume alive so stop() still tries to kill it.
+            return True
         return str(pid) in out
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
         return False
+    except OSError:
+        return True
     return True
 
 
 def _kill(pid: int) -> None:
     if _IS_WINDOWS:
-        subprocess.run(
-            ["taskkill", "/PID", str(pid), "/T", "/F"],
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
         return
     try:
         os.kill(pid, 15)
@@ -77,37 +90,56 @@ def _kill(pid: int) -> None:
 
 
 def _read_state() -> Optional[Dict[str, Any]]:
+    # Broad by design: this sits on the path of every user message (the server
+    # stops a ringing wake alarm there), so a locked or half-written state file
+    # must degrade to "nothing playing", never raise.
     try:
-        return json.loads(STATE_FILE.read_text("utf-8"))
-    except (FileNotFoundError, ValueError):
+        state = json.loads(STATE_FILE.read_text("utf-8"))
+    except Exception:
         return None
+    return state if isinstance(state, dict) else None
 
 
 def _clear_state() -> None:
-    STATE_FILE.unlink(missing_ok=True)
+    try:
+        STATE_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _state_pid(state: Dict[str, Any]) -> int:
+    try:
+        return int(state.get("pid") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def status() -> Optional[Dict[str, Any]]:
     """What is playing right now, or ``None``. Clears state left behind by a
-    player that has already exited."""
+    player that has already exited. Never raises."""
     state = _read_state()
     if state is None:
         return None
-    pid = int(state.get("pid", 0))
+    pid = _state_pid(state)
     if not pid or not _pid_alive(pid):
         _clear_state()
         return None
-    state["playing_for"] = round(time.time() - state.get("started_at", time.time()))
+    try:
+        started = float(state.get("started_at") or time.time())
+    except (TypeError, ValueError):
+        started = time.time()
+    state["playing_for"] = round(time.time() - started)
     return state
 
 
 def stop() -> bool:
-    """Stop playback. Returns True if something was actually playing."""
+    """Stop playback. Returns True if something was actually playing.
+    Never raises."""
     state = _read_state()
     _clear_state()
     if not state:
         return False
-    pid = int(state.get("pid", 0))
+    pid = _state_pid(state)
     if pid and _pid_alive(pid):
         _kill(pid)
         return True
@@ -174,5 +206,10 @@ def play(
         "volume": volume,
         "started_at": time.time(),
     }
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), "utf-8")
+    try:
+        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), "utf-8")
+    except OSError as e:
+        # The sound is already playing; losing the state file only costs us the
+        # ability to stop or report it. Don't undo a ringing alarm over this.
+        logger.warning(f"[player] could not write {STATE_FILE.name}: {e}")
     return state

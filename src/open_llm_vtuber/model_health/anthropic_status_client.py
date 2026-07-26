@@ -96,9 +96,7 @@ class AnthropicStatus:
     @property
     def degraded_components(self) -> List[str]:
         return [
-            f"{n}={s}"
-            for n, s in self.components.items()
-            if s and s != _OK_COMPONENT
+            f"{n}={s}" for n, s in self.components.items() if s and s != _OK_COMPONENT
         ]
 
 

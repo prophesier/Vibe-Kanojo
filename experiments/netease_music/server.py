@@ -169,7 +169,11 @@ async def music_play_playlist(name: str, volume: int = _DEFAULT_VOLUME) -> str:
 @mcp.tool()
 async def music_now_playing() -> str:
     """What is playing on the user's speakers right now, if anything."""
-    state = ncm_player.status()
+    try:
+        state = ncm_player.status()
+    except Exception:
+        logger.exception("music_now_playing: unexpected error")
+        return "再生状況を確認できませんでした。"
     if state is None:
         return "今は何も再生していません。"
     elapsed = state.get("playing_for", 0)
@@ -181,7 +185,12 @@ async def music_now_playing() -> str:
 async def music_stop() -> str:
     """Stop whatever is playing on the user's speakers. This is also how an
     alarm that woke the user up gets silenced."""
-    return "再生を止めました。" if ncm_player.stop() else "何も再生していません。"
+    try:
+        stopped = ncm_player.stop()
+    except Exception:
+        logger.exception("music_stop: unexpected error")
+        return "再生を止められませんでした。"
+    return "再生を止めました。" if stopped else "何も再生していません。"
 
 
 if __name__ == "__main__":

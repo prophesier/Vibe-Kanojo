@@ -51,11 +51,42 @@ from ...mcpp.types import ToolCallObject
 from ...mcpp.tool_executor import ToolExecutor
 
 
-# Tool-execution markers (🍔/🔍/🔗/⏰/🧠/🎮/📝/🔧 tags streamed to the UI and
-# persisted into chat history for human review) must be STRIPPED from every
+# Tool-execution markers (🍔/🔍/🔗/⏰/🧠/🎮/📝/🔧/🕐/🎵 tags streamed to the UI
+# and persisted into chat history for human review) must be STRIPPED from every
 # model-visible copy — the model imitates them and fabricates tool results.
 # The regex + strip helper live in chat_history_manager (imported above as
 # _strip_tool_markers) so history_search shares the same sanitization.
+
+# MCP tools whose marker is written AFTER execution, so it can carry the
+# result (the clock reading, the song that started) instead of just the tool
+# name. _mcp_tool_marker stays silent for these; _deferred_tool_marker emits.
+_DEFERRED_MARKER_TOOLS = frozenset(
+    {
+        "get_current_time",
+        "convert_time",
+        "music_search",
+        "music_play",
+        "music_play_playlist",
+        "music_playlists",
+        "music_now_playing",
+        "music_stop",
+    }
+)
+
+
+def _mcp_result_text(content: Any) -> str:
+    """Flatten an MCP tool result into plain text. Results arrive either as a
+    string or as content blocks ``[{"type": "text", "text": ...}]``."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            str(b.get("text", ""))
+            for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+    return ""
 
 
 class BasicMemoryAgent(AgentInterface):
@@ -2064,7 +2095,7 @@ class BasicMemoryAgent(AgentInterface):
                     for r in tool_results_for_llm:
                         if not isinstance(r, dict):
                             continue
-                        mk = self._time_tool_marker(
+                        mk = self._deferred_tool_marker(
                             name_by_id.get(r.get("tool_use_id"), ""),
                             r.get("content"),
                         )
@@ -2394,7 +2425,7 @@ class BasicMemoryAgent(AgentInterface):
                         for r in tool_results_for_llm:
                             if not isinstance(r, dict):
                                 continue
-                            mk = self._time_tool_marker(
+                            mk = self._deferred_tool_marker(
                                 name_by_id.get(r.get("tool_call_id"), ""),
                                 r.get("content"),
                             )
@@ -2650,12 +2681,15 @@ class BasicMemoryAgent(AgentInterface):
         execution (_time_tool_marker)."""
         if tool_name.startswith("uber"):
             return "\n🍔 *Uber Eats*\n"
-        if tool_name in ("get_current_time", "convert_time"):
+        if tool_name in _DEFERRED_MARKER_TOOLS:
             return ""
         if tool_name:
             return f"\n🔧 *ツール: {tool_name[:40]}*\n"
         return ""
 
+    # Tools whose marker can only be written once the result is known, so
+    # _mcp_tool_marker stays silent for them and _deferred_tool_marker emits
+    # after execution instead.
     _DAY_JA = {
         "Monday": "月",
         "Tuesday": "火",
@@ -2692,6 +2726,42 @@ class BasicMemoryAgent(AgentInterface):
             return f"\n🕐 *{label}: {stamp}{tail}*\n"
         except Exception:
             return f"\n🕐 *{label}*\n"
+
+    _MUSIC_MARKER_LABELS = {
+        "music_search": "曲を検索",
+        "music_playlists": "プレイリスト一覧",
+        "music_now_playing": "再生状況",
+        "music_stop": "再生停止",
+    }
+
+    @classmethod
+    def _music_tool_marker(cls, tool_name: str, content: Any) -> str:
+        """Result-bearing marker for the music MCP tools. Like the time
+        markers this fires AFTER execution, so a play call can name the song
+        it actually started instead of just the tool. Display-only, and
+        stripped from replay like every marker (TOOL_MARKER_RE has 🎵)."""
+        if not tool_name.startswith("music_"):
+            return ""
+        text = _mcp_result_text(content)
+        if tool_name in ("music_play", "music_play_playlist"):
+            # "再生開始: <song> / <artist>（<playlist> から）" on success;
+            # anything else is a failure message worth showing as-is.
+            song = text.split("再生開始:", 1)[-1].strip() if "再生開始:" in text else ""
+            body = f"再生: {song}" if song else (text.splitlines() or ["再生"])[0]
+            return f"\n🎵 *{body[:80]}*\n"
+        label = cls._MUSIC_MARKER_LABELS.get(tool_name, "音楽")
+        if tool_name == "music_search":
+            keyword = text.split("」", 1)[0].split("「", 1)[-1] if "「" in text else ""
+            if keyword:
+                label = f"{label}: {keyword[:40]}"
+        return f"\n🎵 *{label}*\n"
+
+    @classmethod
+    def _deferred_tool_marker(cls, tool_name: str, content: Any) -> str:
+        """Markers that can only be written once the result is in hand."""
+        return cls._time_tool_marker(tool_name, content) or cls._music_tool_marker(
+            tool_name, content
+        )
 
     def _handle_safety_refusal(self, info: Dict[str, Any]) -> str:
         """Clean up after a safety-classifier refusal and build the notice.

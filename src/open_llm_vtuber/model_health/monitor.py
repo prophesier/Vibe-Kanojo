@@ -45,7 +45,6 @@ class DegradationMonitor:
         state = config.state_path or pathlib.Path("cache/model_health_state.json")
         self._detector = Detector(state, params)
 
-
     AXES = ("combined", "reasoning", "coding", "tooling")
 
     async def _fetch_all(self):
@@ -164,14 +163,24 @@ STATUS_ZH = {"good": "良好", "warning": "警告", "critical": "危险", "": "�
 TREND_ZH = {"up": "上升 ↑", "down": "下降 ↓", "stable": "平稳", "": "未知"}
 
 
-_AXIS_ZH = {"combined": "综合", "reasoning": "逻辑推理", "coding": "代码", "tooling": "工具使用"}
+_AXIS_ZH = {
+    "combined": "综合",
+    "reasoning": "逻辑推理",
+    "coding": "代码",
+    "tooling": "工具使用",
+}
 
 
 def _num(v, dash: str = "?") -> str:
     return f"{v:.0f}" if isinstance(v, (int, float)) else dash
 
 
-_AXIS_LBL = {"combined": "综合分", "reasoning": "逻辑推理", "coding": "编程", "tooling": "工具使用"}
+_AXIS_LBL = {
+    "combined": "综合分",
+    "reasoning": "逻辑推理",
+    "coding": "编程",
+    "tooling": "工具使用",
+}
 
 
 def _g(s, k):
@@ -195,14 +204,20 @@ def score_lines(axes: dict) -> list:
     return out
 
 
-def signal_lines(axes: dict, status: str, official, floor: float, cur_drop: float = 8.0) -> list:
+def signal_lines(
+    axes: dict, status: str, official, floor: float, cur_drop: float = 8.0
+) -> list:
     """参考信号状态 block: A/B/C/D, each ending with its own ✅/⚠️ emoji."""
     c = axes.get("combined")
     cur, mean, std = _g(c, "current"), _g(c, "mean"), _g(c, "std")
     trend = (_g(c, "trend") or "").lower()
     out = []
     # A — combined below its own mean (declining)
-    drop = (mean - cur) if isinstance(cur, (int, float)) and isinstance(mean, (int, float)) else None
+    drop = (
+        (mean - cur)
+        if isinstance(cur, (int, float)) and isinstance(mean, (int, float))
+        else None
+    )
     if drop is not None and drop > 0 and (drop >= cur_drop or trend == "down"):
         if isinstance(std, (int, float)) and std > 0:
             k = drop / std
@@ -234,7 +249,9 @@ def signal_lines(axes: dict, status: str, official, floor: float, cur_drop: floa
     return out
 
 
-def report_block(axes: dict, status: str, official, floor: float, cur_drop: float = 8.0) -> str:
+def report_block(
+    axes: dict, status: str, official, floor: float, cur_drop: float = 8.0
+) -> str:
     """Full body: 当前模型评分 block + 参考信号状态 block. Shared by the alert and
     /model-status."""
     return "\n".join(
@@ -245,23 +262,35 @@ def report_block(axes: dict, status: str, official, floor: float, cur_drop: floa
     )
 
 
-def format_alert_zh(e: DegradationEvent, official: Optional[AnthropicStatus] = None) -> dict:
+def format_alert_zh(
+    e: DegradationEvent, official: Optional[AnthropicStatus] = None
+) -> dict:
     """Degradation alert — exactly あさひ's template: title, 评分 block (per axis
     score / 平均分 / 标准差), 信号 block (A/B/C/D with a trailing emoji). No legend,
     no reasons line — the emoji carry the state."""
-    color = _COLOR["ESCALATED"] if e.severity == "critical" else _COLOR.get(e.event, 0x95A5A6)
+    color = (
+        _COLOR["ESCALATED"]
+        if e.severity == "critical"
+        else _COLOR.get(e.event, 0x95A5A6)
+    )
     floor = e.floor if e.floor is not None else 60.0
     if e.event == "RECOVERED":
         return {
             "title": f"✅{e.model} : 评分已恢复",
             "description": "综合评分回到正常范围，可以考虑切回。",
-            "color": _COLOR["RECOVERED"], "fields": [], "url": e.source_url, "footer": "",
+            "color": _COLOR["RECOVERED"],
+            "fields": [],
+            "url": e.source_url,
+            "footer": "",
         }
     emoji = "🔴" if e.event == "ESCALATED" or e.severity == "critical" else "⚠️"
     return {
         "title": f"{emoji}{e.model} : 模型有降智风险",
         "description": report_block(e.axes, e.status, official, floor),
-        "color": color, "fields": [], "url": e.source_url, "footer": "",
+        "color": color,
+        "fields": [],
+        "url": e.source_url,
+        "footer": "",
     }
 
 

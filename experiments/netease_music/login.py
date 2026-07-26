@@ -20,6 +20,7 @@ import asyncio
 import pathlib
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -29,7 +30,8 @@ HERE = pathlib.Path(__file__).resolve().parent
 QR_FILE = HERE / "login_qr.png"
 
 _POLL_SECONDS = 2
-_TIMEOUT_SECONDS = 300
+# Total time to keep trying; a QR key that expires within it is replaced.
+_TOTAL_SECONDS = 600
 _MESSAGES = {
     801: "スマホでスキャン待ち…",
     802: "スキャン済み。アプリで確認して…",
@@ -76,18 +78,27 @@ async def main() -> int:
             print("入れ直す場合は ncm_session.json を消してから再実行。")
             return 0
 
-        unikey = await client.qr_key()
-        url = NeteaseClient.qr_login_url(unikey)
-        if _write_qr(url):
-            print(f"QRコード: {QR_FILE}")
-            _open(QR_FILE)
-        else:
-            print("QR画像を作れませんでした。次のURLを自分でQR化してスキャンして:")
-            print(f"  {url}")
-        print("網易雲音樂アプリでスキャンして確認してください。\n")
-
+        deadline = time.monotonic() + _TOTAL_SECONDS
+        unikey = ""
         last = None
-        for _ in range(_TIMEOUT_SECONDS // _POLL_SECONDS):
+        while time.monotonic() < deadline:
+            if not unikey:
+                # NetEase expires a QR key faster than most people get their
+                # phone out, so refresh it in place instead of making the user
+                # re-run the script (the failure this replaces).
+                unikey = await client.qr_key()
+                url = NeteaseClient.qr_login_url(unikey)
+                if _write_qr(url):
+                    print(f"\nQRコード: {QR_FILE}")
+                    _open(QR_FILE)
+                else:
+                    print("\nQR画像を作れませんでした。このURLを自分でQR化して:")
+                    print(f"  {url}")
+                print(
+                    "網易雲音樂アプリでスキャンし、アプリ側で「確認」を押してください。"
+                )
+                last = None
+
             await asyncio.sleep(_POLL_SECONDS)
             result = await client.qr_check(unikey)
             code = result.get("code")
@@ -98,12 +109,13 @@ async def main() -> int:
                 QR_FILE.unlink(missing_ok=True)
                 return 0
             if code == 800:
-                print("\nQRコードの有効期限切れ。もう一度実行してください。")
-                return 1
+                print("QRコードの期限切れ。新しいものを出します…")
+                unikey = ""
+                continue
             if code != last:
                 print(_MESSAGES.get(code, f"code={code}"))
                 last = code
-        print("\nタイムアウトしました。もう一度実行してください。")
+        print("\n時間切れ。もう一度実行してください。")
         return 1
     except NeteaseUnavailable as e:
         print(f"失敗: {e}")

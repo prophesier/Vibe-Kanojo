@@ -49,6 +49,10 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
     # fires later (even across restarts) as a proactive message.
     enable_alarms: Optional[bool] = Field(True, alias="enable_alarms")
 
+    # Which NetEase playlist a wake alarm draws its song from. Empty = play
+    # whatever is already cached.
+    wake_playlist: Optional[str] = Field("", alias="wake_playlist")
+
     # Self-service memory tools: the character can search its facts/diaries
     # and add/update facts; deleting a fact requires the user's in-chat
     # approval (verified mechanically). Needs persistent memory enabled.
@@ -125,6 +129,18 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "max_fetch_chars": Description(
             en="Truncate each fetched page to this many characters.",
             zh="每个抓取页面截断到的字符数。",
+        ),
+        "wake_playlist": Description(
+            en=(
+                "Name of the NetEase playlist a wake alarm picks a random song "
+                "from (partial names match). Uncached songs are downloaded when "
+                "the alarm fires. Leave empty to play whatever is already "
+                "cached. (default: empty)"
+            ),
+            zh=(
+                "叫醒闹钟从哪个网易云歌单里随机选歌（支持部分匹配）。没缓存的歌"
+                "会在闹钟响时当场下载。留空则播放已缓存的任意歌曲。（默认：空）"
+            ),
         ),
         "enable_alarms": Description(
             en=(

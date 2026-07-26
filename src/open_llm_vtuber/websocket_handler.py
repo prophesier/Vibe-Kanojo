@@ -777,9 +777,16 @@ class WebSocketHandler:
     # sooner; this is only the backstop for "nobody is home".
     _WAKE_MAX_SECONDS = 900
 
-    def _start_wake_audio(self) -> Optional[str]:
-        """Ring the speakers for a wake alarm, independently of the reply."""
-        label = wake_audio.start()
+    async def _start_wake_audio(self) -> Optional[str]:
+        """Ring the speakers for a wake alarm, independently of the reply.
+        Never raises: a wake alarm that can't find a song still gets spoken."""
+        try:
+            bma = self._bma_cfg()
+            playlist = str(getattr(bma, "wake_playlist", "") or "") if bma else ""
+            label = await wake_audio.start(playlist=playlist)
+        except Exception as e:
+            logger.warning(f"[wake] could not start wake audio: {e}")
+            return None
         if label is None:
             return None
         if self._wake_timeout_task is not None:
@@ -795,12 +802,18 @@ class WebSocketHandler:
         self.stop_wake_audio("timeout")
 
     def stop_wake_audio(self, reason: str) -> None:
-        """Silence a ringing wake alarm. Safe to call when nothing is playing."""
-        if self._wake_timeout_task is not None:
-            self._wake_timeout_task.cancel()
-            self._wake_timeout_task = None
-        if wake_audio.stop():
-            logger.info(f"[wake] stopped ({reason}).")
+        """Silence a ringing wake alarm. Safe to call when nothing is playing.
+
+        Runs on the path of EVERY incoming user message, so it swallows
+        everything: no message handling may fail because of the music."""
+        try:
+            if self._wake_timeout_task is not None:
+                self._wake_timeout_task.cancel()
+                self._wake_timeout_task = None
+            if wake_audio.stop():
+                logger.info(f"[wake] stopped ({reason}).")
+        except Exception as e:
+            logger.warning(f"[wake] stop failed ({reason}): {e}")
 
     async def _deliver_alarms(self, due: List[dict]) -> bool:
         """Scheduler callback: speak the due alarm(s) on the best end. Returns
@@ -815,7 +828,7 @@ class WebSocketHandler:
             # the model choosing to do anything. Told about it afterwards, the
             # character knows why he might be grumbling about noise.
             if any(a.get("wake") for a in due):
-                label = self._start_wake_audio()
+                label = await self._start_wake_audio()
                 if label:
                     prompt += (
                         f"\n（システム：起こすために「{label}」を"

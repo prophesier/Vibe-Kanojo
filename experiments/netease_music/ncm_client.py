@@ -298,10 +298,18 @@ class NeteaseClient:
             "type": 1,
             "csrf_token": client.cookies.get("__csrf", ""),
         }
-        resp = await client.post(
-            f"{_BASE}/login/qrcode/client/login", data=weapi_encrypt(body)
-        )
-        data = resp.json()
+        try:
+            resp = await client.post(
+                f"{_BASE}/login/qrcode/client/login", data=weapi_encrypt(body)
+            )
+        except httpx.HTTPError as e:
+            # A hiccup while polling shouldn't end the login attempt — report
+            # "still waiting" and let the caller poll again.
+            return {"code": 801, "message": f"polling failed: {e}"}
+        try:
+            data = resp.json()
+        except ValueError as e:
+            return {"code": 801, "message": f"unreadable poll response: {e}"}
         if data.get("code") == 803:
             self.save_cookies(dict(client.cookies))
         return data

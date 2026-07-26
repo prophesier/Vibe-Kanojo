@@ -31,10 +31,10 @@ from .anthropic_status_client import AnthropicStatus
 
 @dataclass
 class DetectorParams:
-    floor: float = 60.0    # the single warning line (a score below this is flagged)
+    floor: float = 60.0  # the single warning line (a score below this is flagged)
     cur_drop: float = 8.0  # P: this far below the axis's own mean = degraded
     recover_streak: int = 2
-    escalate_delta: float = 6.0    # further combined-score drop to re-alert
+    escalate_delta: float = 6.0  # further combined-score drop to re-alert
 
 
 @dataclass
@@ -54,13 +54,13 @@ class AxisStat:
 class DegradationEvent:
     model: str
     provider: str
-    event: str        # DEGRADED | ESCALATED | RECOVERED
-    severity: str     # warning | critical
+    event: str  # DEGRADED | ESCALATED | RECOVERED
+    severity: str  # warning | critical
     current_score: Optional[float]  # combined
     status: str
     trend: str
     baseline: Optional[float]  # combined mean (computed from the scraped series)
-    drop: Optional[float]      # baseline - current
+    drop: Optional[float]  # baseline - current
     reasons: List[str]
     detected_at: str
     source_url: str
@@ -75,8 +75,8 @@ class OfficialStatusEvent:
     signals). ``degraded_performance`` is the priority case — subtler than a full
     outage and easy to miss."""
 
-    event: str        # DEGRADED | ESCALATED | RECOVERED
-    indicator: str    # none | minor | major | critical | maintenance
+    event: str  # DEGRADED | ESCALATED | RECOVERED
+    indicator: str  # none | minor | major | critical | maintenance
     claude_api_status: str
     degraded_components: List[str]
     incidents: List[str]  # unresolved incident names
@@ -127,8 +127,12 @@ class Detector:
         mean = statistics.fmean(vals) if vals else None
         std = statistics.pstdev(vals) if len(vals) >= 2 else (0.0 if vals else None)
         return AxisStat(
-            current=current, status=status or "", trend=trend or "",
-            mean=mean, std=std, n=len(vals),
+            current=current,
+            status=status or "",
+            trend=trend or "",
+            mean=mean,
+            std=std,
+            n=len(vals),
         )
 
     # -- core ---------------------------------------------------------------
@@ -155,8 +159,13 @@ class Detector:
             return None
         p = self._params
         st = self._state.setdefault(
-            name, {"state": "OK", "last_batch": "", "last_event_current": None,
-                   "recover_streak": 0},
+            name,
+            {
+                "state": "OK",
+                "last_batch": "",
+                "last_event_current": None,
+                "recover_streak": 0,
+            },
         )
         # Dedup once per batch timestamp; the state machine prevents re-alerting.
         batch = combined.get("last_updated") or ""
@@ -239,7 +248,11 @@ class Detector:
         if degraded:
             st["recover_streak"] = 0
             prev = st.get("last_event_current")
-            if cur is not None and prev is not None and (prev - cur) >= p.escalate_delta:
+            if (
+                cur is not None
+                and prev is not None
+                and (prev - cur) >= p.escalate_delta
+            ):
                 st["last_event_current"] = cur
                 return "ESCALATED"
             return None
