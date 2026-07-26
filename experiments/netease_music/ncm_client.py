@@ -8,9 +8,9 @@ breaks breaks as a JSON error we can read.
 Two settings this client always sends, both needed for it to work from Japan
 and both taken from the open-source NetEaseMusicWorldNext extension:
 
-  * ``X-Real-IP`` — NetEase reads this request header to decide which region
-    the caller is in, which in turn decides whether a play URL is returned at
-    all. We send a mainland address.
+  * ``X-Real-IP`` — NetEase reads this request header when deciding which
+    catalogue the caller gets, including whether a play URL is returned at
+    all. ``_REAL_IP`` holds the address we report.
   * a CDN hostname rewrite — play URLs are handed back on
     ``mNNN.music.126.net``; the parallel ``mNNNc.music.126.net`` hosts serve
     the same bytes and are the ones that answer reliably from here.
@@ -46,8 +46,8 @@ _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
-# The address reported in X-Real-IP, which is what NetEase reads to decide the
-# caller's region. Overridable via env in case this one ever stops working.
+# The address reported in X-Real-IP (see the module docstring). Overridable
+# via env in case this one ever stops working.
 _REAL_IP = os.environ.get("NCM_REAL_IP", "211.161.244.70")
 _TIMEOUT = 15.0
 _DOWNLOAD_TIMEOUT = 90.0
