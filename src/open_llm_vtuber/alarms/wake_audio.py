@@ -142,14 +142,18 @@ def _from_cache() -> Optional[Tuple[str, str]]:
         return None
 
 
-async def start(playlist: str = "", volume: int = DEFAULT_WAKE_VOLUME) -> Optional[str]:
-    """Start looping a wake song. Returns its label, or None if nothing could
-    be played. Never raises."""
-    mods = _load()
-    if mods is None:
-        return None
-    ncm_player, _ = mods
+async def pick(playlist: str = "") -> Optional[Tuple[str, str]]:
+    """Choose what to ring with, as ``(path, label)``, downloading it if it
+    isn't cached yet. None if nothing is available. Never raises.
 
+    This is the slow half — a download can take seconds — which is why it is
+    separate from :func:`play`. The caller gets a moment in between to check
+    whether the reason for ringing still holds: if あさひ speaks while the
+    song is still coming down the wire, he is already awake, and starting the
+    music at that point would be noise he never asked for.
+    """
+    if _load() is None:
+        return None
     choice = None
     if playlist:
         try:
@@ -167,11 +171,19 @@ async def start(playlist: str = "", volume: int = DEFAULT_WAKE_VOLUME) -> Option
         choice = _from_cache()
     if choice is None:
         logger.warning("[wake] no song available — the wake alarm will be silent.")
-        return None
+    return choice
 
-    path, label = choice
+
+def play(path: str, label: str, volume: int = DEFAULT_WAKE_VOLUME) -> Optional[str]:
+    """Start looping the chosen song. Returns its label, or None if it could
+    not be played. Never raises."""
+    mods = _load()
+    if mods is None:
+        return None
     try:
-        ncm_player.play(path, label=label, loop=True, volume=volume)
+        # wake=True is what lets stop(only_wake=True) tell an alarm ringing
+        # apart from a song the character put on during a conversation.
+        mods[0].play(path, label=label, loop=True, volume=volume, wake=True)
     except Exception as e:
         logger.warning(f"[wake] playback failed: {e}")
         return None
@@ -179,24 +191,49 @@ async def start(playlist: str = "", volume: int = DEFAULT_WAKE_VOLUME) -> Option
     return label
 
 
+async def start(playlist: str = "", volume: int = DEFAULT_WAKE_VOLUME) -> Optional[str]:
+    """:func:`pick` then :func:`play`, for callers with nothing to re-check in
+    between. Returns the label, or None. Never raises."""
+    choice = await pick(playlist)
+    if choice is None:
+        return None
+    return play(choice[0], choice[1], volume)
+
+
 def stop() -> bool:
-    """Stop wake playback. True if something was actually playing. Never
-    raises — this runs on the path of every incoming user message."""
+    """Stop a ringing wake alarm. True if one was actually playing.
+
+    Only the alarm: music the character started in conversation keeps playing.
+    This runs on the path of every incoming user message, so without that
+    distinction あさひ's next sentence would kill any song he had asked for.
+    Never raises.
+    """
     mods = _load()
     if mods is None:
         return False
     try:
-        return bool(mods[0].stop())
+        return bool(mods[0].stop(only_wake=True))
     except Exception as e:
         logger.warning(f"[wake] could not stop playback: {e}")
         return False
 
 
-def is_playing() -> bool:
+def ringing() -> Optional[str]:
+    """The song a wake alarm is ringing with right now, or None. Music the
+    character started in conversation does not count. Never raises."""
     mods = _load()
     if mods is None:
-        return False
+        return None
     try:
-        return mods[0].status() is not None
+        state = mods[0].status()
     except Exception:
-        return False
+        return None
+    if not state or not state.get("wake"):
+        return None
+    return str(state.get("label") or "") or "音楽"
+
+
+def is_playing() -> bool:
+    """True if a wake alarm is ringing right now. Ordinary music doesn't
+    count — this answers "is the alarm still going", not "is audio audible"."""
+    return ringing() is not None

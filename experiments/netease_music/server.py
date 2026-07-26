@@ -26,6 +26,7 @@ Run (registered in mcp_servers.json):  python experiments/netease_music/server.p
 from __future__ import annotations
 
 import asyncio
+import functools
 import pathlib
 import random
 import sys
@@ -44,10 +45,21 @@ from ncm_client import (  # noqa: E402
 )
 
 HERE = pathlib.Path(__file__).resolve().parent
-logger.remove()  # don't write to stdout — stdout is the MCP stdio channel!
-logger.add(sys.stderr, level="INFO")
-logger.add(str(HERE / "ncm_mcp.log"), rotation="2 MB", retention=3, level="INFO")
 
+
+def _setup_logging() -> None:
+    """Only when run as the server: importing this module (tests do) must not
+    reconfigure someone else's logging or drop a log file in the repo."""
+    logger.remove()  # don't write to stdout — stdout is the MCP stdio channel!
+    logger.add(sys.stderr, level="INFO")
+    logger.add(str(HERE / "ncm_mcp.log"), rotation="2 MB", retention=3, level="INFO")
+
+
+# One budget for the WHOLE call, not per step. The MCP client gives a tool
+# call 30 seconds total (mcpp/mcp_client.py), so a search and a download that
+# each got their own 25s could let the client give up while this server was
+# still working — and the song would then start playing well after the
+# character had already said something else about it.
 _TOOL_TIMEOUT = 25  # seconds — under the MCP client's 30s read timeout
 _DEFAULT_VOLUME = 70
 
@@ -61,20 +73,30 @@ mcp = FastMCP("netease-music")
 _client = NeteaseClient()
 
 
-async def _run(coro, what: str):
-    """Run a client coroutine with a hard timeout; never raise. Returns
-    ``(ok, value_or_message)``."""
-    try:
-        return True, await asyncio.wait_for(coro, timeout=_TOOL_TIMEOUT)
-    except NeteaseUnavailable as e:
-        logger.warning(f"{what}: unavailable: {e}")
-        return False, str(e)
-    except asyncio.TimeoutError:
-        logger.warning(f"{what}: timed out after {_TOOL_TIMEOUT}s")
-        return False, "音楽サービスの応答が遅すぎます（タイムアウト）。"
-    except Exception:
-        logger.exception(f"{what}: unexpected error")
-        return False, "音楽の処理中に問題が発生しました。"
+def _tool(fn):
+    """Give a tool its one timeout and its one catch-all, around the whole body.
+
+    Applied under ``@mcp.tool()``, so the body below can be written as plain
+    linear code that raises — every failure still comes back to the character
+    as a short sentence it can say out loud, and no tool call can outlive the
+    client's patience.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs) -> str:
+        try:
+            return await asyncio.wait_for(fn(*args, **kwargs), timeout=_TOOL_TIMEOUT)
+        except NeteaseUnavailable as e:
+            logger.warning(f"{fn.__name__}: unavailable: {e}")
+            return str(e)
+        except asyncio.TimeoutError:
+            logger.warning(f"{fn.__name__}: timed out after {_TOOL_TIMEOUT}s")
+            return "音楽サービスの応答が遅すぎます（タイムアウト）。"
+        except Exception:
+            logger.exception(f"{fn.__name__}: unexpected error")
+            return "音楽の処理中に問題が発生しました。"
+
+    return wrapper
 
 
 def _format(songs: list[Song]) -> str:
@@ -91,27 +113,34 @@ def _format(songs: list[Song]) -> str:
 
 async def _play_song(song: Song, volume: int) -> str:
     path = await _client.fetch_audio(song)
-    ncm_player.play(
-        path, label=song.label(), loop=False, volume=volume, song_id=song.id
+    # The player shells out to the OS to clear the previous one; off the event
+    # loop so the tool's timeout can still fire while that happens.
+    await asyncio.to_thread(
+        ncm_player.play,
+        path,
+        label=song.label(),
+        loop=False,
+        volume=volume,
+        song_id=song.id,
     )
     logger.info(f"playing {song.id} {song.label()}")
     return f"再生開始: {song.label()}"
 
 
 @mcp.tool()
+@_tool
 async def music_search(keyword: str, limit: int = 8) -> str:
     """Search NetEase Cloud Music for songs. Returns song titles, artists and
     durations. Use this when the user wants to know what is available, or when
     you want to confirm which version of a song before playing it."""
-    ok, result = await _run(_client.search(keyword, limit), "music_search")
-    if not ok:
-        return result
-    if not result:
+    songs = await _client.search(keyword, limit)
+    if not songs:
         return f"「{keyword}」に一致する曲は見つかりませんでした。"
-    return f"「{keyword}」の検索結果:\n{_format(result)}{_RESULT_NOTE}"
+    return f"「{keyword}」の検索結果:\n{_format(songs)}{_RESULT_NOTE}"
 
 
 @mcp.tool()
+@_tool
 async def music_play(
     keyword: str = "", song_id: int = 0, volume: int = _DEFAULT_VOLUME
 ) -> str:
@@ -125,49 +154,42 @@ async def music_play(
     means a particular recording, or the top match was wrong, search first and
     play the id."""
     if song_id:
-        ok, songs = await _run(_client.songs_by_id([song_id]), "music_play/lookup")
-        if not ok:
-            return songs
+        songs = await _client.songs_by_id([song_id])
         if not songs:
             return f"id={song_id} の曲が見つかりませんでした。"
-        ok, message = await _run(_play_song(songs[0], volume), "music_play/fetch")
-        return message
+        return await _play_song(songs[0], volume)
 
     if not keyword.strip():
         return "曲名かアーティスト名、または song_id を指定してください。"
-    ok, songs = await _run(_client.search(keyword, 5), "music_play/search")
-    if not ok:
-        return songs
+    songs = await _client.search(keyword, 5)
     if not songs:
         return f"「{keyword}」に一致する曲は見つかりませんでした。"
-    ok, message = await _run(_play_song(songs[0], volume), "music_play/fetch")
-    if not ok or len(songs) < 2:
+    message = await _play_song(songs[0], volume)
+    if len(songs) < 2:
         return message
     others = "、".join(f"{s.label()} (id={s.id})" for s in songs[1:4])
     return f"{message}\n（同名の他候補: {others} — 違ったら song_id で指定し直して）"
 
 
 @mcp.tool()
+@_tool
 async def music_playlists() -> str:
     """List the user's own NetEase playlists (name and track count), so you
     can pick one to play with music_play_playlist."""
-    ok, result = await _run(_client.user_playlists(), "music_playlists")
-    if not ok:
-        return result
-    if not result:
+    playlists = await _client.user_playlists()
+    if not playlists:
         return "プレイリストが見つかりません（ログインが必要かも）。"
-    listing = "\n".join(f"- {p.name}（{p.count}曲）" for p in result)
+    listing = "\n".join(f"- {p.name}（{p.count}曲）" for p in playlists)
     return f"プレイリスト:\n{listing}{_RESULT_NOTE}"
 
 
 @mcp.tool()
+@_tool
 async def music_play_playlist(name: str, volume: int = _DEFAULT_VOLUME) -> str:
     """Play a random song from one of the user's playlists, matched by name
     (partial names are fine). Use music_playlists first if you don't know
     what exists."""
-    ok, playlists = await _run(_client.user_playlists(), "music_play_playlist/list")
-    if not ok:
-        return playlists
+    playlists = await _client.user_playlists()
     wanted = name.strip().lower()
     match = next(
         (p for p in playlists if wanted and wanted in p.name.lower()),
@@ -177,45 +199,35 @@ async def music_play_playlist(name: str, volume: int = _DEFAULT_VOLUME) -> str:
         available = "、".join(p.name for p in playlists[:10]) or "（なし）"
         return f"「{name}」というプレイリストは見つかりません。候補: {available}"
 
-    ok, tracks = await _run(
-        _client.playlist_tracks(match.id), "music_play_playlist/tracks"
-    )
-    if not ok:
-        return tracks
+    tracks = await _client.playlist_tracks(match.id)
     if not tracks:
         return f"「{match.name}」は空でした。"
-    ok, message = await _run(
-        _play_song(random.choice(tracks), volume), "music_play_playlist/fetch"
-    )
-    return f"{message}（{match.name} から）" if ok else message
+    message = await _play_song(random.choice(tracks), volume)
+    return f"{message}（{match.name} から）"
 
 
 @mcp.tool()
+@_tool
 async def music_now_playing() -> str:
     """What is playing on the user's speakers right now, if anything."""
-    try:
-        state = ncm_player.status()
-    except Exception:
-        logger.exception("music_now_playing: unexpected error")
-        return "再生状況を確認できませんでした。"
+    state = await asyncio.to_thread(ncm_player.status)
     if state is None:
         return "今は何も再生していません。"
     elapsed = state.get("playing_for", 0)
     loop = "（繰り返し中）" if state.get("loop") else ""
-    return f"再生中: {state.get('label', '?')}{loop} — {elapsed}秒経過"
+    wake = "（アラーム）" if state.get("wake") else ""
+    return f"再生中: {state.get('label', '?')}{wake}{loop} — {elapsed}秒経過"
 
 
 @mcp.tool()
+@_tool
 async def music_stop() -> str:
     """Stop whatever is playing on the user's speakers. This is also how an
     alarm that woke the user up gets silenced."""
-    try:
-        stopped = ncm_player.stop()
-    except Exception:
-        logger.exception("music_stop: unexpected error")
-        return "再生を止められませんでした。"
+    stopped = await asyncio.to_thread(ncm_player.stop)
     return "再生を止めました。" if stopped else "何も再生していません。"
 
 
 if __name__ == "__main__":
+    _setup_logging()
     mcp.run()

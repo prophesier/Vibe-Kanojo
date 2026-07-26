@@ -10,7 +10,10 @@ codec matrix to maintain, and it is already installed.
 
 State lives in ``playback.json`` next to this file: whoever holds the file can
 see what is playing and stop it. A stale entry (process already gone) is
-detected on read, so a crash can't leave the state wedged.
+detected on read, so a crash can't leave the state wedged. ``playback.lock``
+next to it serialises the moments that mutate that state, because those are
+the moments where two processes could otherwise strand a player nobody can
+reach any more.
 
 This module deliberately has no NetEase dependency — it plays a path. The
 alarm path in the main server can import it without pulling in the API client.
@@ -18,6 +21,7 @@ alarm path in the main server can import it without pulling in the API client.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import pathlib
@@ -25,14 +29,22 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 from loguru import logger
 
 HERE = pathlib.Path(__file__).resolve().parent
 STATE_FILE = HERE / "playback.json"
+LOCK_FILE = HERE / "playback.lock"
 
 _IS_WINDOWS = sys.platform == "win32"
+
+# Lock tuning. Contention means two processes reached for the player in the
+# same millisecond, so the wait is deliberately short — and a caller that
+# cannot get the lock proceeds anyway (see _state_lock).
+_LOCK_WAIT_S = 2.0
+_LOCK_POLL_S = 0.02
+_LOCK_STALE_S = 30.0
 
 
 class PlaybackError(Exception):
@@ -46,28 +58,114 @@ def ffplay_path() -> str:
     return exe
 
 
-def _pid_alive(pid: int) -> bool:
-    """True if the pid is still running. Never signals the process — on
-    Windows ``os.kill(pid, 0)`` would *terminate* it rather than probe it."""
+def _lock_is_stale() -> bool:
+    """A lock file older than ``_LOCK_STALE_S`` was left behind by a process
+    that died holding it; the operations it guards take milliseconds."""
+    try:
+        return time.time() - LOCK_FILE.stat().st_mtime > _LOCK_STALE_S
+    except OSError:
+        return False
+
+
+def _unlink_lock() -> None:
+    try:
+        LOCK_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@contextlib.contextmanager
+def _state_lock() -> Iterator[None]:
+    """Serialise the start/stop sequence across processes.
+
+    Without it, two processes can each stop "nothing", each spawn a player,
+    and the second one's state file wins — leaving the first ffplay running at
+    wake volume, on repeat, with its pid on no record at all. That is the one
+    failure mode here that nobody can recover from without Task Manager.
+
+    Never raises and never blocks for long: if the lock cannot be taken it
+    proceeds without it, because a wedged lock must not be able to prevent an
+    alarm from being silenced. Only the holder releases it — a caller that
+    gave up must not delete a lock somebody else is still using.
+    """
+    fd: Optional[int] = None
+    # One deadline over every path through the loop, so no failure mode here —
+    # including an unlink that keeps failing on a stale lock — can spin.
+    deadline = time.monotonic() + _LOCK_WAIT_S
+    while fd is None and time.monotonic() < deadline:
+        try:
+            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if _lock_is_stale():
+                _unlink_lock()  # its holder died; take it over
+            else:
+                time.sleep(_LOCK_POLL_S)
+        except OSError as e:
+            logger.warning(f"[player] could not take the lock: {e}")
+            break
+    if fd is None:
+        logger.warning("[player] lock unavailable; proceeding without it.")
+    try:
+        yield
+    finally:
+        if fd is not None:
+            # Close before unlinking: Windows refuses to delete a file that
+            # still has an open handle on it.
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            _unlink_lock()
+
+
+def _process_alive(state: Dict[str, Any], *, unknown: bool) -> bool:
+    """True if the player recorded in ``state`` is still running.
+
+    Matches the image name as well as the pid. Pids get recycled, and this
+    module kills whole process *trees* (``taskkill /T``) — acting on a
+    recycled pid would take down an unrelated program.
+
+    ``unknown`` is the answer to give when the OS won't say: True before a
+    kill, so ``stop()`` still tries; False after one, so a kill that worked is
+    not reported as a failure.
+
+    Never signals the process: on Windows ``os.kill(pid, 0)`` *terminates* it
+    rather than probing it.
+    """
+    pid = _state_pid(state)
+    if not pid:
+        return False
+    exe = str(state.get("exe") or "")
     if _IS_WINDOWS:
+        args = ["tasklist", "/FI", f"PID eq {pid}"]
+        if exe:
+            args += ["/FI", f"IMAGENAME eq {exe}"]
+        # CSV quotes every field, so the pid can be matched as a whole column
+        # instead of as a substring that a memory figure could also contain.
+        args += ["/FO", "CSV", "/NH"]
         try:
             out = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                args,
                 capture_output=True,
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 timeout=10,
             ).stdout
         except (OSError, subprocess.SubprocessError):
-            # Can't tell — assume alive so stop() still tries to kill it.
-            return True
-        return str(pid) in out
+            return unknown
+        return f'"{pid}"' in out
+    try:
+        comm = pathlib.Path(f"/proc/{pid}/comm")
+        if comm.exists():
+            return not exe or comm.read_text().strip() == pathlib.Path(exe).name
+    except OSError:
+        return unknown
     try:
         os.kill(pid, 0)
     except (ProcessLookupError, PermissionError):
         return False
     except OSError:
-        return True
+        return unknown
     return True
 
 
@@ -120,8 +218,7 @@ def status() -> Optional[Dict[str, Any]]:
     state = _read_state()
     if state is None:
         return None
-    pid = _state_pid(state)
-    if not pid or not _pid_alive(pid):
+    if not _process_alive(state, unknown=True):
         _clear_state()
         return None
     try:
@@ -132,18 +229,41 @@ def status() -> Optional[Dict[str, Any]]:
     return state
 
 
-def stop() -> bool:
-    """Stop playback. Returns True if something was actually playing.
-    Never raises."""
-    state = _read_state()
-    _clear_state()
-    if not state:
-        return False
+def _stop_locked(state: Dict[str, Any]) -> bool:
+    """Kill the recorded player and clear the state. Caller holds the lock.
+    Returns True only if a running player was actually killed."""
     pid = _state_pid(state)
-    if pid and _pid_alive(pid):
-        _kill(pid)
-        return True
-    return False
+    if not pid or not _process_alive(state, unknown=True):
+        _clear_state()  # it exited on its own
+        return False
+    _kill(pid)
+    if _process_alive(state, unknown=False):
+        # Keep the state: claiming a stop we did not achieve would leave music
+        # playing with nothing on record able to address it.
+        logger.warning(f"[player] pid {pid} survived the kill; state kept to retry.")
+        return False
+    _clear_state()
+    return True
+
+
+def stop(*, only_wake: bool = False) -> bool:
+    """Stop playback. Returns True only if a player was actually killed.
+
+    ``only_wake`` restricts this to a ringing wake alarm and leaves music the
+    character started in conversation alone. The server stops on that setting
+    for every incoming message: answering has to silence the alarm, but must
+    not kill a song あさひ asked for two lines earlier.
+
+    Never raises.
+    """
+    state = _read_state()
+    if state is None or (only_wake and not state.get("wake")):
+        return False  # nothing to do, and nothing worth taking the lock for
+    with _state_lock():
+        state = _read_state()  # another process may have moved on meanwhile
+        if state is None or (only_wake and not state.get("wake")):
+            return False
+        return _stop_locked(state)
 
 
 def play(
@@ -153,17 +273,19 @@ def play(
     loop: bool = False,
     volume: int = 70,
     song_id: Optional[int] = None,
+    wake: bool = False,
 ) -> Dict[str, Any]:
     """Play a local audio file, replacing whatever was playing.
 
     ``loop`` repeats until stopped — that is the wake-alarm mode; music
-    requested in conversation plays once.
+    requested in conversation plays once. ``wake`` marks the playback as an
+    alarm ringing, which is what lets ``stop(only_wake=True)`` tell the two
+    apart.
     """
     audio = pathlib.Path(path)
     if not audio.exists():
         raise PlaybackError("音声ファイルが見つかりません。")
     exe = ffplay_path()
-    stop()
 
     args = [
         exe,
@@ -192,24 +314,40 @@ def play(
     else:
         kwargs["start_new_session"] = True
 
-    try:
-        proc = subprocess.Popen(args, **kwargs)
-    except OSError as e:
-        raise PlaybackError(f"再生を開始できません: {e}") from e
+    # Stopping the old player, spawning the new one and recording its pid have
+    # to be one indivisible step — see _state_lock.
+    with _state_lock():
+        previous = _read_state()
+        if previous is not None and not _stop_locked(previous):
+            # Couldn't kill it. Two songs at once is bad; refusing to ring an
+            # alarm is worse, so start anyway and leave a trail.
+            if _process_alive(previous, unknown=False):
+                logger.warning(
+                    f"[player] pid {_state_pid(previous)} is still playing and "
+                    "will be replaced in the state file."
+                )
+        try:
+            proc = subprocess.Popen(args, **kwargs)
+        except OSError as e:
+            raise PlaybackError(f"再生を開始できません: {e}") from e
 
-    state = {
-        "pid": proc.pid,
-        "label": label or audio.stem,
-        "path": str(audio),
-        "song_id": song_id,
-        "loop": loop,
-        "volume": volume,
-        "started_at": time.time(),
-    }
-    try:
-        STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), "utf-8")
-    except OSError as e:
-        # The sound is already playing; losing the state file only costs us the
-        # ability to stop or report it. Don't undo a ringing alarm over this.
-        logger.warning(f"[player] could not write {STATE_FILE.name}: {e}")
+        state = {
+            "pid": proc.pid,
+            "exe": pathlib.Path(exe).name,  # guards against pid reuse
+            "label": label or audio.stem,
+            "path": str(audio),
+            "song_id": song_id,
+            "loop": loop,
+            "wake": bool(wake),
+            "volume": volume,
+            "started_at": time.time(),
+        }
+        try:
+            STATE_FILE.write_text(
+                json.dumps(state, ensure_ascii=False, indent=2), "utf-8"
+            )
+        except OSError as e:
+            # The sound is already playing; losing the state file only costs us
+            # the ability to stop or report it. Don't undo a ringing alarm.
+            logger.warning(f"[player] could not write {STATE_FILE.name}: {e}")
     return state

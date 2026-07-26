@@ -3681,12 +3681,23 @@ class BasicMemoryAgent(AgentInterface):
                     "status": "error",
                     "message": f"時刻を解釈できませんでした: {err}",
                 }
+            wake = bool(args.get("wake", False))
             force = bool(args.get("force", False))
             dup = None if force else await self._alarm_store.find_near(fire_at_utc)
             if dup is not None:
                 # Near-duplicate: don't create. Hand the existing alarm back so the
                 # model can reconsider this same turn and, if it still judges
                 # another is needed, re-call with force=true.
+                dup_wake = bool(dup.get("wake"))
+                # An ordinary reminder standing where a wake alarm was asked for
+                # is not a duplicate in the way that matters: it will speak, but
+                # it will not make a sound he can hear from bed.
+                wake_gap = (
+                    "ただし既存のものは音楽を鳴らさない（起こす設定ではない）ので、"
+                    "本当に起こす必要があるなら force=true で設定し直すこと。"
+                    if wake and not dup_wake
+                    else ""
+                )
                 return "\n⏰ *Alarm set(重複スキップ)*\n", {
                     "status": "duplicate_nearby",
                     "message": (
@@ -3694,15 +3705,15 @@ class BasicMemoryAgent(AgentInterface):
                         f"既にアラームがある:「{dup.get('note', '')}」"
                         f"(id: {dup['id']})。同じ用件ならこれ以上設定しなくてよい。"
                         "別の用件で本当に必要だと自分で判断する場合のみ、"
-                        "force=true を付けて set_alarm を呼び直すこと。"
+                        "force=true を付けて set_alarm を呼び直すこと。" + wake_gap
                     ),
                     "existing": {
                         "id": dup["id"],
                         "at_local": format_local(dup["fire_at_utc"]),
                         "note": dup.get("note", ""),
+                        "wake": dup_wake,
                     },
                 }
-            wake = bool(args.get("wake", False))
             record = await self._alarm_store.add(
                 fire_at_utc=fire_at_utc, note=note, wake=wake
             )
@@ -3721,6 +3732,9 @@ class BasicMemoryAgent(AgentInterface):
             }
         if name == "list_alarms":
             pending = await self._alarm_store.list_pending()
+            # ``wake`` travels with every entry: without it the model cannot
+            # answer "which of these will actually wake me up", and records
+            # written before the field existed correctly read as False.
             return f"\n⏰ *Alarm list: {len(pending)}件*\n", {
                 "status": "ok",
                 "count": len(pending),
@@ -3729,6 +3743,7 @@ class BasicMemoryAgent(AgentInterface):
                         "id": a["id"],
                         "at_local": format_local(a["fire_at_utc"]),
                         "note": a.get("note", ""),
+                        "wake": bool(a.get("wake")),
                     }
                     for a in pending
                 ],
@@ -3749,6 +3764,7 @@ class BasicMemoryAgent(AgentInterface):
                 "status": "ok",
                 "message": "アラームを取り消しました。",
                 "id": alarm_id,
+                "wake": bool(record.get("wake")),
             }
         return None, {"error": f"unknown alarm tool {name!r}"}
 

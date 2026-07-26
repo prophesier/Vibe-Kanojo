@@ -100,6 +100,10 @@ class WebSocketHandler:
         self._alarm_delivery_lock = asyncio.Lock()
         # Set while a wake alarm is ringing; cancelled when the music stops.
         self._wake_timeout_task: Optional[asyncio.Task] = None
+        # Bumped by every stop request. Choosing the song can take seconds, and
+        # this is how the code that finally starts it notices that the reason
+        # for ringing expired while it was waiting.
+        self._wake_epoch: int = 0
 
         # --- Claude prompt-cache keepalive ---
         # Monotonic time of the last turn that refreshed the cache (any end's
@@ -780,10 +784,27 @@ class WebSocketHandler:
     async def _start_wake_audio(self) -> Optional[str]:
         """Ring the speakers for a wake alarm, independently of the reply.
         Never raises: a wake alarm that can't find a song still gets spoken."""
+        already = wake_audio.ringing()
+        if already:
+            # An earlier delivery attempt for this same alarm is still ringing.
+            # Restarting would re-roll the song and push the backstop timer
+            # out; the point is already being made.
+            return already
+        epoch = self._wake_epoch
         try:
             bma = self._bma_cfg()
             playlist = str(getattr(bma, "wake_playlist", "") or "") if bma else ""
-            label = await wake_audio.start(playlist=playlist)
+            # Downloading the song can take seconds. Only after it is in hand
+            # do we commit to making noise — if he spoke in the meantime the
+            # alarm has already served its purpose, and starting now would be
+            # a song nobody asked for, playing after the conversation moved on.
+            choice = await wake_audio.pick(playlist)
+            if choice is None:
+                return None
+            if self._wake_epoch != epoch:
+                logger.info("[wake] he answered while the song loaded; not ringing.")
+                return None
+            label = wake_audio.play(choice[0], choice[1])
         except Exception as e:
             logger.warning(f"[wake] could not start wake audio: {e}")
             return None
@@ -804,8 +825,15 @@ class WebSocketHandler:
     def stop_wake_audio(self, reason: str) -> None:
         """Silence a ringing wake alarm. Safe to call when nothing is playing.
 
+        Only the alarm: a song the character put on during the conversation is
+        left alone (``wake_audio.stop`` filters on that), or else あさひ's very
+        next sentence would cut off music he had just asked for.
+
         Runs on the path of EVERY incoming user message, so it swallows
         everything: no message handling may fail because of the music."""
+        # Before anything else, so a wake alarm still choosing its song sees
+        # that it has been called off.
+        self._wake_epoch += 1
         try:
             if self._wake_timeout_task is not None:
                 self._wake_timeout_task.cancel()
@@ -819,10 +847,8 @@ class WebSocketHandler:
         """Scheduler callback: speak the due alarm(s) on the best end. Returns
         False if nothing could receive it (the scheduler retries later)."""
         async with self._alarm_delivery_lock:
-            target = self._pick_alarm_target()
-            if target is None:
+            if self._pick_alarm_target() is None:
                 return False
-            client_uid, skip_tts = target
             prompt = build_fire_prompt(due)
             # Start the music BEFORE the turn: waking him must not depend on
             # the model choosing to do anything. Told about it afterwards, the
@@ -835,6 +861,15 @@ class WebSocketHandler:
                         "スピーカーで繰り返し再生中。彼が返事をすれば自動で止まる。"
                         "先に止めたいと言われたら music_stop を呼ぶこと。）"
                     )
+            # Choosing the song can take seconds, and the target picked before
+            # it may since have disconnected or started a turn of its own —
+            # firing at it now would put two turns on one agent. Re-pick, and
+            # if nothing is free let the scheduler retry (the music, if it is
+            # already ringing, keeps ringing: that part did its job).
+            target = self._pick_alarm_target()
+            if target is None:
+                return False
+            client_uid, skip_tts = target
             ok = await self._fire_proactive(client_uid, prompt, skip_tts)
             if ok:
                 conf_uid = self.default_context_cache.character_config.conf_uid

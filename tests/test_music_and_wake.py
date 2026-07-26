@@ -8,9 +8,11 @@ a stubbed player.
 import asyncio
 import base64
 import json
+import os
 import pathlib
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -23,6 +25,7 @@ _MUSIC_DIR = (
 sys.path.insert(0, str(_MUSIC_DIR))
 
 import ncm_client  # noqa: E402
+import ncm_player  # noqa: E402
 from ncm_crypto import _PUB_MODULUS, weapi_encrypt  # noqa: E402
 
 from src.open_llm_vtuber.alarms import wake_audio  # noqa: E402
@@ -140,21 +143,31 @@ class CacheSidecarTests(unittest.TestCase):
 
 
 class _StubPlayer:
+    """Models the one distinction the real player makes: a ringing alarm and a
+    song the character put on are both "playing", but only the first answers to
+    ``stop(only_wake=True)``."""
+
     def __init__(self):
         self.calls = []
-        self.playing = False
+        self.state = None
 
     def play(self, path, **kwargs):
         self.calls.append((str(path), kwargs))
-        self.playing = True
-        return {"pid": 1}
+        self.state = {
+            "label": kwargs.get("label", "x"),
+            "wake": bool(kwargs.get("wake")),
+            "loop": bool(kwargs.get("loop")),
+        }
+        return dict(self.state, pid=1)
 
-    def stop(self):
-        was, self.playing = self.playing, False
-        return was
+    def stop(self, *, only_wake=False):
+        if self.state is None or (only_wake and not self.state["wake"]):
+            return False
+        self.state = None
+        return True
 
     def status(self):
-        return {"label": "x"} if self.playing else None
+        return dict(self.state) if self.state else None
 
 
 class _StubClient:
@@ -176,7 +189,7 @@ class _ExplodingPlayer(_StubPlayer):
     def play(self, path, **kwargs):
         raise OSError("boom")
 
-    def stop(self):
+    def stop(self, *, only_wake=False):
         raise OSError("boom")
 
     def status(self):
@@ -202,6 +215,7 @@ class WakeAudioTests(unittest.IsolatedAsyncioTestCase):
         ((path, kwargs),) = player.calls
         self.assertEqual(path, "C:/x/1.mp3")
         self.assertTrue(kwargs["loop"])  # a wake alarm must not play once
+        self.assertTrue(kwargs["wake"])  # ...and must be stoppable as an alarm
         self.assertEqual(kwargs["volume"], 90)
 
     async def test_playlist_song_preferred_over_cache(self):
@@ -255,6 +269,35 @@ class WakeAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(wake_audio.stop())
         self.assertFalse(wake_audio.stop())
 
+    async def test_answering_does_not_kill_music_the_character_put_on(self):
+        # The server stops wake audio on EVERY incoming message. If that stop
+        # didn't distinguish the two, asking for a song and then saying one
+        # more word would cut it off mid-chorus.
+        player = self._install([])
+        player.play("C:/x/song.mp3", label="Lemon / 米津玄師", loop=False, wake=False)
+        self.assertFalse(wake_audio.stop())
+        self.assertIsNotNone(player.status())
+        self.assertIsNone(wake_audio.ringing())
+        self.assertFalse(wake_audio.is_playing())
+
+    async def test_ringing_reports_the_alarm_song(self):
+        self._install([{"id": 1, "name": "朝", "artists": "誰か", "path": "p"}])
+        self.assertIsNone(wake_audio.ringing())
+        await wake_audio.start()
+        self.assertEqual(wake_audio.ringing(), "朝 / 誰か")
+
+    async def test_pick_and_play_are_separable(self):
+        # The server needs a point between "song in hand" and "sound starts"
+        # to bail out at, because the download in between can take seconds.
+        player = self._install(
+            [{"id": 1, "name": "朝", "artists": "誰か", "path": "C:/x/1.mp3"}]
+        )
+        choice = await wake_audio.pick()
+        self.assertEqual(choice, ("C:/x/1.mp3", "朝 / 誰か"))
+        self.assertEqual(player.calls, [])  # nothing rang yet
+        self.assertEqual(wake_audio.play(*choice), "朝 / 誰か")
+        self.assertEqual(len(player.calls), 1)
+
     async def test_missing_music_module_degrades_quietly(self):
         with mock.patch.object(wake_audio, "_load", lambda: None):
             self.assertIsNone(await wake_audio.start())
@@ -282,6 +325,377 @@ class WakeAudioTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertFalse(wake_audio.available())
             self.assertIsNone(await wake_audio.start())
+
+
+class PlayerStateTests(unittest.TestCase):
+    """The state file is the only thing that makes an alarm started by the
+    server stoppable by the MCP server. Everything here is about not lying in
+    it — a stop we didn't achieve, or a pid that isn't ours any more."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = pathlib.Path(tmp.name)
+        for name, value in (
+            ("STATE_FILE", self.dir / "playback.json"),
+            ("LOCK_FILE", self.dir / "playback.lock"),
+        ):
+            patcher = mock.patch.object(ncm_player, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.killed = []
+        patcher = mock.patch.object(ncm_player, "_kill", self.killed.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _write_state(self, **extra):
+        state = {"pid": 4242, "exe": "ffplay.exe", "label": "song", "wake": False}
+        state.update(extra)
+        ncm_player.STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
+
+    def _alive(self, *answers):
+        """Answer the liveness probe with a fixed sequence (before the kill,
+        then after it)."""
+        seq = iter(answers)
+        patcher = mock.patch.object(
+            ncm_player, "_process_alive", lambda state, *, unknown: next(seq)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _spawning(self, pid=999):
+        exe = str(self.dir / "ffplay.exe")
+        return (
+            mock.patch.object(ncm_player, "ffplay_path", lambda: exe),
+            mock.patch.object(
+                ncm_player.subprocess, "Popen", return_value=mock.Mock(pid=pid)
+            ),
+        )
+
+    def test_only_wake_leaves_ordinary_music_alone(self):
+        self._write_state(wake=False)
+        self.assertFalse(ncm_player.stop(only_wake=True))
+        self.assertEqual(self.killed, [])
+        self.assertTrue(ncm_player.STATE_FILE.exists())
+
+    def test_only_wake_stops_a_ringing_alarm(self):
+        self._write_state(wake=True)
+        self._alive(True, False)
+        self.assertTrue(ncm_player.stop(only_wake=True))
+        self.assertEqual(self.killed, [4242])
+        self.assertFalse(ncm_player.STATE_FILE.exists())
+
+    def test_plain_stop_stops_ordinary_music_too(self):
+        # music_stop, called by the character, means "stop whatever is on".
+        self._write_state(wake=False)
+        self._alive(True, False)
+        self.assertTrue(ncm_player.stop())
+        self.assertEqual(self.killed, [4242])
+
+    def test_a_kill_that_failed_is_not_reported_as_a_stop(self):
+        # And the state stays: dropping it would leave the music playing with
+        # nothing on record able to reach the process again.
+        self._write_state(wake=True)
+        self._alive(True, True)
+        self.assertFalse(ncm_player.stop(only_wake=True))
+        self.assertTrue(ncm_player.STATE_FILE.exists())
+
+    def test_a_player_that_already_exited_clears_the_state(self):
+        self._write_state(wake=True)
+        self._alive(False)
+        self.assertFalse(ncm_player.stop())
+        self.assertEqual(self.killed, [])
+        self.assertFalse(ncm_player.STATE_FILE.exists())
+
+    def test_nothing_playing_costs_nothing(self):
+        # This runs on every incoming message: no lock, no subprocess.
+        self.assertFalse(ncm_player.stop(only_wake=True))
+        self.assertFalse(ncm_player.LOCK_FILE.exists())
+
+    def test_corrupt_state_never_escapes(self):
+        ncm_player.STATE_FILE.write_text("{not json", encoding="utf-8")
+        self.assertFalse(ncm_player.stop())
+        self.assertIsNone(ncm_player.status())
+
+    def test_play_records_what_a_later_stop_will_need(self):
+        audio = self.dir / "s.mp3"
+        audio.write_bytes(b"x")
+        exe, popen = self._spawning()
+        with exe, popen:
+            state = ncm_player.play(audio, label="朝", loop=True, volume=90, wake=True)
+        self.assertEqual(state["pid"], 999)
+        self.assertEqual(state["exe"], "ffplay.exe")  # guards against pid reuse
+        self.assertTrue(state["wake"])
+        saved = json.loads(ncm_player.STATE_FILE.read_text("utf-8"))
+        self.assertEqual((saved["pid"], saved["wake"]), (999, True))
+
+    def test_play_replaces_the_previous_player(self):
+        self._write_state(pid=111, wake=True)
+        audio = self.dir / "s.mp3"
+        audio.write_bytes(b"x")
+        self._alive(True, False)
+        exe, popen = self._spawning()
+        with exe, popen:
+            ncm_player.play(audio, label="次", wake=False)
+        self.assertEqual(self.killed, [111])
+        saved = json.loads(ncm_player.STATE_FILE.read_text("utf-8"))
+        self.assertEqual((saved["pid"], saved["wake"]), (999, False))
+
+
+class ProcessIdentityTests(unittest.TestCase):
+    """stop() kills a whole process *tree*. Pids get recycled, so matching on
+    the pid alone could one day take down whatever inherited it."""
+
+    def test_right_pid_wrong_program_is_not_our_player(self):
+        state = {"pid": os.getpid(), "exe": "ffplay.exe"}
+        self.assertFalse(ncm_player._process_alive(state, unknown=False))
+        self.assertFalse(ncm_player._process_alive(state, unknown=True))
+
+    def test_no_pid_is_not_alive(self):
+        self.assertFalse(ncm_player._process_alive({}, unknown=True))
+        self.assertFalse(ncm_player._process_alive({"pid": "junk"}, unknown=True))
+
+    @unittest.skipUnless(sys.platform == "win32", "tasklist is Windows-only")
+    def test_a_live_process_is_recognised_by_its_own_image_name(self):
+        state = {"pid": os.getpid(), "exe": pathlib.Path(sys.executable).name}
+        self.assertTrue(ncm_player._process_alive(state, unknown=False))
+
+
+class PlayerLockTests(unittest.TestCase):
+    """Two processes share this player: the server starts the alarm, the MCP
+    server stops it. Without the lock they can each spawn one and orphan the
+    other's — music at wake volume with no pid on record to stop it."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patcher = mock.patch.object(
+            ncm_player, "LOCK_FILE", pathlib.Path(tmp.name) / "playback.lock"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_lock_is_taken_and_released(self):
+        with ncm_player._state_lock():
+            self.assertTrue(ncm_player.LOCK_FILE.exists())
+        self.assertFalse(ncm_player.LOCK_FILE.exists())
+
+    def test_giving_up_does_not_delete_a_lock_someone_else_holds(self):
+        ncm_player.LOCK_FILE.write_text("held", encoding="utf-8")
+        with mock.patch.object(ncm_player, "_LOCK_WAIT_S", 0.05):
+            with ncm_player._state_lock():
+                pass  # proceeds unlocked rather than blocking an alarm
+        self.assertTrue(ncm_player.LOCK_FILE.exists())
+
+    def test_a_stale_lock_is_taken_over(self):
+        ncm_player.LOCK_FILE.write_text("crashed holding it", encoding="utf-8")
+        with mock.patch.object(ncm_player, "_LOCK_STALE_S", -1):
+            with ncm_player._state_lock():
+                pass
+        self.assertFalse(ncm_player.LOCK_FILE.exists())
+
+    def test_an_error_inside_still_releases_it(self):
+        with self.assertRaises(ValueError):
+            with ncm_player._state_lock():
+                raise ValueError("boom")
+        self.assertFalse(ncm_player.LOCK_FILE.exists())
+
+
+class MusicToolContractTests(unittest.IsolatedAsyncioTestCase):
+    """The MCP client gives a tool call 30 seconds total, so the server's
+    budget has to cover the whole call rather than each step inside it."""
+
+    @classmethod
+    def setUpClass(cls):
+        import server as ncm_server  # noqa: PLC0415 — sys.path set at import
+
+        cls.server = ncm_server
+
+    async def test_every_tool_survived_the_timeout_wrapper(self):
+        tools = {t.name: t for t in await self.server.mcp.list_tools()}
+        self.assertEqual(
+            set(tools),
+            {
+                "music_search",
+                "music_play",
+                "music_playlists",
+                "music_play_playlist",
+                "music_now_playing",
+                "music_stop",
+            },
+        )
+        # Wrapping must not have eaten the signature or the docstring the
+        # model reads to decide how to call it.
+        self.assertEqual(
+            set(tools["music_play"].inputSchema["properties"]),
+            {"keyword", "song_id", "volume"},
+        )
+        self.assertIn("song_id", tools["music_play"].description)
+
+    async def test_one_budget_covers_the_whole_call(self):
+        async def _hang(*_args, **_kwargs):
+            await asyncio.sleep(30)
+
+        # music_play_playlist used to be three separate 25s steps — 75s worth
+        # of patience against a client that gives up at 30.
+        with (
+            mock.patch.object(self.server, "_TOOL_TIMEOUT", 0.05),
+            mock.patch.object(self.server._client, "user_playlists", _hang),
+        ):
+            started = time.monotonic()
+            out = await self.server.music_play_playlist("any")
+            elapsed = time.monotonic() - started
+        self.assertIn("タイムアウト", out)
+        self.assertLess(elapsed, 1.0)
+
+    async def test_failures_come_back_as_something_sayable(self):
+        async def _boom(*_args, **_kwargs):
+            raise RuntimeError("network on fire")
+
+        with mock.patch.object(self.server._client, "search", _boom):
+            out = await self.server.music_search("x")
+        self.assertIsInstance(out, str)
+        self.assertTrue(out.strip())
+
+
+class WakeRaceTests(unittest.IsolatedAsyncioTestCase):
+    """Choosing the song takes seconds — a download, sometimes. If あさひ
+    answers during them he is already awake, and starting the music at that
+    point would be noise arriving after the conversation moved on."""
+
+    def _handler(self):
+        from src.open_llm_vtuber.websocket_handler import (  # noqa: PLC0415
+            WebSocketHandler,
+        )
+
+        handler = WebSocketHandler.__new__(WebSocketHandler)
+        handler._wake_epoch = 0
+        handler._wake_timeout_task = None
+        return handler
+
+    def _patched(self, pick, played, ringing=None):
+        return (
+            mock.patch.object(wake_audio, "pick", pick),
+            mock.patch.object(wake_audio, "ringing", lambda: ringing),
+            mock.patch.object(wake_audio, "stop", lambda: False),
+            mock.patch.object(
+                wake_audio,
+                "play",
+                lambda path, label, *a, **k: (played.append(label), label)[1],
+            ),
+        )
+
+    async def test_answering_during_the_download_cancels_the_ringing(self):
+        handler = self._handler()
+        played = []
+
+        async def _slow_pick(playlist=""):
+            handler.stop_wake_audio("user replied")  # he answers mid-download
+            return ("C:/x/1.mp3", "朝 / 誰か")
+
+        a, b, c, d = self._patched(_slow_pick, played)
+        with a, b, c, d:
+            self.assertIsNone(await handler._start_wake_audio())
+        self.assertEqual(played, [])
+
+    async def test_an_undisturbed_alarm_still_rings(self):
+        handler = self._handler()
+        played = []
+
+        async def _pick(playlist=""):
+            return ("C:/x/1.mp3", "朝 / 誰か")
+
+        a, b, c, d = self._patched(_pick, played)
+        with a, b, c, d:
+            self.assertEqual(await handler._start_wake_audio(), "朝 / 誰か")
+        self.assertEqual(played, ["朝 / 誰か"])
+        self.assertIsNotNone(handler._wake_timeout_task)
+        handler._wake_timeout_task.cancel()
+
+    async def test_a_retry_does_not_restart_a_song_already_ringing(self):
+        # Re-rolling the song would also push the 15-minute backstop out.
+        handler = self._handler()
+        played = []
+
+        async def _pick(playlist=""):
+            raise AssertionError("should not have looked for a new song")
+
+        a, b, c, d = self._patched(_pick, played, ringing="朝 / 誰か")
+        with a, b, c, d:
+            self.assertEqual(await handler._start_wake_audio(), "朝 / 誰か")
+        self.assertEqual(played, [])
+
+
+class _FakeAlarmStore:
+    def __init__(self, pending=(), near=None):
+        self._pending = list(pending)
+        self._near = near
+
+    async def list_pending(self):
+        return list(self._pending)
+
+    async def find_near(self, fire_at_utc, within_seconds=300):
+        return self._near
+
+    async def add(self, *, fire_at_utc, note, wake=False):
+        return {
+            "id": "new",
+            "fire_at_utc": fire_at_utc.isoformat(),
+            "note": note,
+            "wake": wake,
+        }
+
+
+class AlarmWakeVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    """``wake`` is persisted correctly, but the model can only answer "which
+    of these will actually wake me" if the tool results carry it back."""
+
+    def _agent(self, store):
+        agent = BasicMemoryAgent.__new__(BasicMemoryAgent)
+        agent._alarm_store = store
+        agent._turn_inproc_calls = []
+        return agent
+
+    async def test_list_alarms_says_which_ones_ring(self):
+        store = _FakeAlarmStore(
+            [
+                {"id": "a", "fire_at_utc": "2026-07-27T22:00:00+00:00", "note": "薬"},
+                {
+                    "id": "b",
+                    "fire_at_utc": "2026-07-27T23:00:00+00:00",
+                    "note": "起床",
+                    "wake": True,
+                },
+            ]
+        )
+        _, result = await self._agent(store)._run_alarm_tool("list_alarms", {})
+        self.assertEqual([a["wake"] for a in result["alarms"]], [False, True])
+
+    async def test_a_silent_neighbour_does_not_quietly_block_a_wake_alarm(self):
+        store = _FakeAlarmStore(
+            near={"id": "old", "fire_at_utc": "2026-07-28T22:00:00+00:00", "note": "薬"}
+        )
+        _, result = await self._agent(store)._run_alarm_tool(
+            "set_alarm", {"note": "起きる", "at": "07:00", "wake": True}
+        )
+        self.assertEqual(result["status"], "duplicate_nearby")
+        self.assertIs(result["existing"]["wake"], False)
+        self.assertIn("音楽を鳴らさない", result["message"])
+
+    async def test_two_wake_alarms_need_no_extra_nudge(self):
+        store = _FakeAlarmStore(
+            near={
+                "id": "old",
+                "fire_at_utc": "2026-07-28T22:00:00+00:00",
+                "note": "起床",
+                "wake": True,
+            }
+        )
+        _, result = await self._agent(store)._run_alarm_tool(
+            "set_alarm", {"note": "起きる", "at": "07:00", "wake": True}
+        )
+        self.assertIs(result["existing"]["wake"], True)
+        self.assertNotIn("音楽を鳴らさない", result["message"])
 
 
 class LegacyAlarmTests(unittest.IsolatedAsyncioTestCase):
