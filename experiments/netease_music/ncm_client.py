@@ -5,15 +5,16 @@ makes, see :mod:`ncm_crypto`). No browser, no desktop client, no UI
 automation: a stale cookie or a slow page can't wedge it, and anything that
 breaks breaks as a JSON error we can read.
 
-Two settings this client always sends, both needed for it to work from Japan
-and both taken from the open-source NetEaseMusicWorldNext extension:
+Two settings this client always sends, both required for the API to return
+usable results, and both taken from the open-source NetEaseMusicWorldNext
+extension:
 
   * ``X-Real-IP`` — NetEase reads this request header when deciding which
     catalogue the caller gets, including whether a play URL is returned at
     all. ``_REAL_IP`` holds the address we report.
   * a CDN hostname rewrite — play URLs are handed back on
     ``mNNN.music.126.net``; the parallel ``mNNNc.music.126.net`` hosts serve
-    the same bytes and are the ones that answer reliably from here.
+    the same bytes and are the ones that answer reliably.
 
 Login is by QR code (``login.py``), which yields a ``MUSIC_U`` cookie that
 lasts months. Everything the character can reach is read-only: search, list,
@@ -58,7 +59,7 @@ _CACHE_KEEP = 40  # songs to keep on disk; the newest are also the alarm fallbac
 _NON_AUDIO_SUFFIXES = (".json", ".part")
 
 # Play URLs arrive on mNNN.music.126.net; the mNNNc.* hosts carry the same
-# bytes and are the ones that answer reliably from Japan.
+# bytes and are the ones that answer reliably.
 _CDN_RE = re.compile(r"(m\d+?)(?!c)\.music\.126\.net")
 
 
