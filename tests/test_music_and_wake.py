@@ -7,6 +7,7 @@ a stubbed player.
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import pathlib
@@ -293,6 +294,17 @@ class WakeAudioTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(wake_audio.stop())
         self.assertTrue(wake_audio.is_playing())  # and it is still ringing
 
+    async def test_a_residual_player_is_not_mistaken_for_the_alarm(self):
+        # It is audible, so status() reports it — but it is a leftover nobody
+        # chose. Counting it as the alarm would short-circuit the next real one.
+        player = self._install(
+            [{"id": 1, "name": "朝", "artists": "誰か", "path": "p"}]
+        )
+        await wake_audio.start()
+        self.assertIsNotNone(wake_audio.ringing())
+        player.state["residual"] = True
+        self.assertIsNone(wake_audio.ringing())
+
     async def test_a_stale_ringing_record_does_not_suppress_the_next_alarm(self):
         # The player answers "still running" when the OS won't say — safe when
         # deciding whether to keep trying to stop something, dangerous here,
@@ -383,7 +395,9 @@ class PlayerStateTests(unittest.TestCase):
         then after it)."""
         seq = iter(answers)
         patcher = mock.patch.object(
-            ncm_player, "_process_alive", lambda state: next(seq)
+            ncm_player,
+            "_probe_process",
+            lambda state: ncm_player.ALIVE if next(seq) else ncm_player.DEAD,
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -456,8 +470,14 @@ class PlayerStateTests(unittest.TestCase):
                 return False
             return True
 
-        with mock.patch.object(ncm_player, "_process_alive", _probe):
-            self.assertIsNone(ncm_player.status())
+        with mock.patch.object(
+            ncm_player,
+            "_probe_process",
+            lambda entry: (ncm_player.ALIVE if _probe(entry) else ncm_player.DEAD),
+        ):
+            reported = ncm_player.status()
+        self.assertIsNotNone(reported)
+        self.assertEqual(reported["pid"], 222)
         survived = json.loads(ncm_player.STATE_FILE.read_text("utf-8"))
         self.assertEqual(survived["pid"], 222)
         self.assertNotEqual(survived["pid"], stale["pid"])
@@ -481,12 +501,92 @@ class PlayerStateTests(unittest.TestCase):
         self.assertEqual(sorted(self.killed), [111, 222])
         self.assertFalse(ncm_player.STATE_FILE.exists())
 
+    def test_status_promotes_a_live_orphan_when_the_current_song_ends(self):
+        self._write_state(
+            pid=222,
+            started_at=2.0,
+            orphans=[
+                {
+                    "pid": 111,
+                    "exe": "ffplay.exe",
+                    "started_at": 1.0,
+                    "label": "residual",
+                    "wake": True,
+                }
+            ],
+        )
+
+        def _probe(entry):
+            return (
+                ncm_player.ALIVE
+                if ncm_player._state_pid(entry) == 111
+                else ncm_player.DEAD
+            )
+
+        with mock.patch.object(ncm_player, "_probe_process", _probe):
+            state = ncm_player.status()
+        self.assertIsNotNone(state)
+        self.assertEqual(state["pid"], 111)
+        saved = json.loads(ncm_player.STATE_FILE.read_text("utf-8"))
+        self.assertEqual(saved["pid"], 111)
+        self.assertTrue(saved["wake"])
+        # Promoted, but still a leftover: whoever reads this must be able to
+        # tell it apart from an alarm somebody actually started.
+        self.assertTrue(saved["residual"])
+
+    def test_a_promoted_leftover_is_not_labelled_an_alarm(self):
+        # A residual from an ordinary song must not inherit "wake". Marking it
+        # so would make the next real alarm see "already ringing" and stay
+        # silent — the one outcome this whole feature exists to prevent.
+        self._write_state(
+            pid=222,
+            wake=False,
+            label="Lemon",
+            started_at=2.0,
+            orphans=[{"pid": 111, "exe": "ffplay.exe", "started_at": 1.0}],
+        )
+
+        def _probe(entry):
+            return (
+                ncm_player.ALIVE
+                if ncm_player._state_pid(entry) == 111
+                else ncm_player.DEAD
+            )
+
+        with mock.patch.object(ncm_player, "_probe_process", _probe):
+            state = ncm_player.status()
+        self.assertEqual(state["pid"], 111)
+        self.assertFalse(state.get("wake"))
+        self.assertTrue(state["residual"])
+
+    def test_a_promoted_leftover_is_still_reaped_by_an_incoming_message(self):
+        # The other half of the split: not an alarm, but nobody asked for it
+        # either, so answering must still silence it.
+        self._write_state(pid=111, wake=False, residual=True, started_at=1.0)
+        self._alive(True, False)
+        self.assertEqual(ncm_player.stop(only_wake=True), ncm_player.STOPPED)
+        self.assertEqual(self.killed, [111])
+
     def test_orphans_are_reaped_even_on_the_wake_only_path(self):
         # Nobody chose to keep a leftover playing, whatever it was.
         self._write_state(pid=222, wake=False, orphans=[{"pid": 111}])
-        self._alive(False, True, False)
+        self._alive(True, False)
         self.assertEqual(ncm_player.stop(only_wake=True), ncm_player.STOPPED)
         self.assertEqual(self.killed, [111])
+
+    def test_wake_only_reaps_orphan_but_preserves_current_requested_song(self):
+        self._write_state(
+            pid=222,
+            wake=False,
+            started_at=2.0,
+            orphans=[{"pid": 111, "exe": "ffplay.exe", "started_at": 1.0}],
+        )
+        self._alive(True, False)  # orphan before/after kill; current is untouched
+        self.assertEqual(ncm_player.stop(only_wake=True), ncm_player.STOPPED)
+        self.assertEqual(self.killed, [111])
+        saved = json.loads(ncm_player.STATE_FILE.read_text("utf-8"))
+        self.assertEqual(saved["pid"], 222)
+        self.assertFalse(saved["wake"])
 
     def test_play_records_what_a_later_stop_will_need(self):
         audio = self.dir / "s.mp3"
@@ -512,19 +612,76 @@ class PlayerStateTests(unittest.TestCase):
         saved = json.loads(ncm_player.STATE_FILE.read_text("utf-8"))
         self.assertEqual((saved["pid"], saved["wake"]), (999, False))
 
+    def test_play_never_drops_survivors_to_fit_an_orphan_cap(self):
+        self._write_state(
+            pid=100,
+            started_at=1.0,
+            orphans=[
+                {"pid": pid, "exe": "ffplay.exe", "started_at": float(pid)}
+                for pid in range(101, 105)
+            ],
+        )
+        audio = self.dir / "s.mp3"
+        audio.write_bytes(b"x")
+        self._alive(*([True, True] * 5))
+        exe, popen = self._spawning(pid=999)
+        with exe, popen:
+            state = ncm_player.play(audio, label="次")
+        self.assertEqual(
+            [entry["pid"] for entry in state["orphans"]], list(range(100, 105))
+        )
+
+    def test_play_fails_closed_when_the_state_lock_is_unavailable(self):
+        audio = self.dir / "s.mp3"
+        audio.write_bytes(b"x")
+
+        @contextlib.contextmanager
+        def _unavailable():
+            yield False
+
+        exe, popen = self._spawning(pid=999)
+        with (
+            exe,
+            popen as popen_mock,
+            mock.patch.object(ncm_player, "_state_lock", _unavailable),
+            self.assertRaises(ncm_player.PlaybackError),
+        ):
+            ncm_player.play(audio, label="次")
+        popen_mock.assert_not_called()
+
+    def test_unpersisted_new_player_is_terminated_through_its_handle(self):
+        audio = self.dir / "s.mp3"
+        audio.write_bytes(b"x")
+        proc = mock.Mock(pid=999)
+        exe = mock.patch.object(
+            ncm_player, "ffplay_path", lambda: str(self.dir / "ffplay.exe")
+        )
+        popen = mock.patch.object(ncm_player.subprocess, "Popen", return_value=proc)
+        with (
+            exe,
+            popen,
+            mock.patch.object(ncm_player, "_write_state", return_value=False),
+            self.assertRaises(ncm_player.PlaybackError),
+        ):
+            ncm_player.play(audio, label="次")
+        proc.kill.assert_called_once_with()
+        proc.wait.assert_called_once()
+
 
 class ProcessIdentityTests(unittest.TestCase):
     """stop() kills a whole process *tree*. Pids get recycled, so matching on
     the pid alone could one day take down whatever inherited it."""
 
     def test_right_pid_wrong_program_is_not_our_player(self):
-        # This process exists, but it is not ffplay.
+        # tasklist succeeded but its image-name filter found no matching row.
         state = {"pid": os.getpid(), "exe": "ffplay.exe"}
-        self.assertFalse(ncm_player._process_alive(state))
+        no_match = mock.Mock(returncode=0, stdout="INFO: No tasks are running...\n")
+        with mock.patch.object(ncm_player.subprocess, "run", return_value=no_match):
+            self.assertEqual(ncm_player._probe_process(state), ncm_player.DEAD)
 
     def test_no_pid_is_not_alive(self):
-        self.assertFalse(ncm_player._process_alive({}))
-        self.assertFalse(ncm_player._process_alive({"pid": "junk"}))
+        self.assertEqual(ncm_player._probe_process({}), ncm_player.DEAD)
+        self.assertEqual(ncm_player._probe_process({"pid": "junk"}), ncm_player.DEAD)
 
     @unittest.skipUnless(sys.platform == "win32", "the returncode path is Windows")
     def test_a_failing_tasklist_is_not_read_as_a_dead_process(self):
@@ -534,7 +691,20 @@ class ProcessIdentityTests(unittest.TestCase):
         # happened gets reported as done.
         failed = mock.Mock(returncode=1, stdout="")
         with mock.patch.object(ncm_player.subprocess, "run", return_value=failed):
-            self.assertTrue(ncm_player._process_alive({"pid": 5}))
+            self.assertEqual(ncm_player._probe_process({"pid": 5}), ncm_player.UNKNOWN)
+
+    @unittest.skipUnless(sys.platform == "win32", "the returncode path is Windows")
+    def test_an_unknown_pid_is_preserved_but_never_killed(self):
+        failed = mock.Mock(returncode=1, stdout="")
+        killed = []
+        with (
+            mock.patch.object(ncm_player.subprocess, "run", return_value=failed),
+            mock.patch.object(ncm_player, "_kill", killed.append),
+        ):
+            did_kill, survivors = ncm_player._reap_entries([{"pid": 5}])
+        self.assertFalse(did_kill)
+        self.assertEqual([entry["pid"] for entry in survivors], [5])
+        self.assertEqual(killed, [])
 
     @unittest.skipUnless(sys.platform == "win32", "the returncode path is Windows")
     def test_a_stop_after_a_failing_probe_is_not_claimed_as_done(self):
@@ -564,12 +734,15 @@ class ProcessIdentityTests(unittest.TestCase):
         # The real thing: exit code 0 with an informational line, no CSV row.
         empty = mock.Mock(returncode=0, stdout="INFO: No tasks are running...\n")
         with mock.patch.object(ncm_player.subprocess, "run", return_value=empty):
-            self.assertFalse(ncm_player._process_alive({"pid": 5}))
+            self.assertEqual(ncm_player._probe_process({"pid": 5}), ncm_player.DEAD)
 
     @unittest.skipUnless(sys.platform == "win32", "tasklist is Windows-only")
     def test_a_live_process_is_recognised_by_its_own_image_name(self):
-        state = {"pid": os.getpid(), "exe": pathlib.Path(sys.executable).name}
-        self.assertTrue(ncm_player._process_alive(state))
+        pid = os.getpid()
+        state = {"pid": pid, "exe": pathlib.Path(sys.executable).name}
+        found = mock.Mock(returncode=0, stdout=f'"python.exe","{pid}","Console"\n')
+        with mock.patch.object(ncm_player.subprocess, "run", return_value=found):
+            self.assertEqual(ncm_player._probe_process(state), ncm_player.ALIVE)
 
 
 class PlayerLockTests(unittest.TestCase):
@@ -587,29 +760,33 @@ class PlayerLockTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_lock_is_taken_and_released(self):
-        with ncm_player._state_lock():
+        with ncm_player._state_lock() as acquired:
+            self.assertTrue(acquired)
             self.assertTrue(ncm_player.LOCK_FILE.exists())
-        self.assertFalse(ncm_player.LOCK_FILE.exists())
+        # The inode persists; only the OS lock is released.
+        with ncm_player._state_lock() as acquired_again:
+            self.assertTrue(acquired_again)
 
-    def test_giving_up_does_not_delete_a_lock_someone_else_holds(self):
-        ncm_player.LOCK_FILE.write_text("held", encoding="utf-8")
-        with mock.patch.object(ncm_player, "_LOCK_WAIT_S", 0.05):
-            with ncm_player._state_lock():
-                pass  # proceeds unlocked rather than blocking an alarm
+    def test_contention_reports_failure_instead_of_pretending_to_hold_the_lock(self):
+        with ncm_player._state_lock() as outer:
+            self.assertTrue(outer)
+            with mock.patch.object(ncm_player, "_LOCK_WAIT_S", 0.05):
+                with ncm_player._state_lock() as inner:
+                    self.assertFalse(inner)
         self.assertTrue(ncm_player.LOCK_FILE.exists())
 
-    def test_a_stale_lock_is_taken_over(self):
+    def test_a_stale_lock_file_without_an_os_owner_is_harmless(self):
         ncm_player.LOCK_FILE.write_text("crashed holding it", encoding="utf-8")
-        with mock.patch.object(ncm_player, "_LOCK_STALE_S", -1):
-            with ncm_player._state_lock():
-                pass
-        self.assertFalse(ncm_player.LOCK_FILE.exists())
+        with ncm_player._state_lock() as acquired:
+            self.assertTrue(acquired)
 
     def test_an_error_inside_still_releases_it(self):
         with self.assertRaises(ValueError):
-            with ncm_player._state_lock():
+            with ncm_player._state_lock() as acquired:
+                self.assertTrue(acquired)
                 raise ValueError("boom")
-        self.assertFalse(ncm_player.LOCK_FILE.exists())
+        with ncm_player._state_lock() as acquired_again:
+            self.assertTrue(acquired_again)
 
 
 class MusicToolContractTests(unittest.IsolatedAsyncioTestCase):
@@ -706,6 +883,40 @@ class MusicToolContractTests(unittest.IsolatedAsyncioTestCase):
             out = await self.server.music_play(keyword="x")
         self.assertIn("確認できませんでした", out)
         self.assertNotIn("再生開始", out)
+
+    async def test_slow_lookup_cannot_let_outer_timeout_land_mid_player(self):
+        class _Song:
+            id = 42
+
+            def label(self):
+                return "X / Y"
+
+        async def _slow_search(*_args, **_kwargs):
+            await asyncio.sleep(0.07)
+            return [_Song()]
+
+        fetched = []
+        played = []
+
+        async def _fetch(song):
+            fetched.append(song.id)
+            return "C:/x/1.mp3"
+
+        def _play(*_args, **_kwargs):
+            played.append(True)
+
+        with (
+            mock.patch.object(self.server, "_TOOL_TIMEOUT", 0.12),
+            mock.patch.object(self.server, "_PLAYER_BUDGET_S", 0.08),
+            mock.patch.object(self.server, "_PLAYER_RETURN_MARGIN_S", 0.01),
+            mock.patch.object(self.server._client, "search", _slow_search),
+            mock.patch.object(self.server._client, "fetch_audio", _fetch),
+            mock.patch.object(ncm_player, "play", _play),
+        ):
+            out = await self.server.music_play(keyword="x")
+        self.assertIn("開始しませんでした", out)
+        self.assertEqual(fetched, [])
+        self.assertEqual(played, [])
 
 
 class WakeRaceTests(unittest.IsolatedAsyncioTestCase):

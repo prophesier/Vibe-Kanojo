@@ -245,6 +245,14 @@ def ringing() -> Optional[str]:
         return None
     if not state or not state.get("wake"):
         return None
+    if state.get("residual"):
+        # Audible, but not the alarm: a leftover player that would not die and
+        # has since been promoted into the primary slot. Answering a message
+        # still reaps it — but counting it as "already ringing" here would stop
+        # the real alarm from ever starting, and would have the character say
+        # it was playing a song nobody chose.
+        logger.info("[wake] a residual player is audible; that is not the alarm.")
+        return None
     try:
         playing_for = float(state.get("playing_for") or 0)
     except (TypeError, ValueError):

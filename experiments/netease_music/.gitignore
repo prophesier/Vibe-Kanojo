@@ -1,11 +1,15 @@
 # Local/sensitive runtime state — never commit.
 # ncm_session.json = the login cookie (MUSIC_U) for the user's account;
 # music_cache/     = downloaded audio + the song metadata beside it;
-# playback.json    = pid of the current ffplay child;
+# playback.json    = pid of the current ffplay child (.tmp = its atomic-write
+#                    scratch file, left behind only by a crash mid-write);
+# playback.lock    = persistent inode used for the OS-owned process lock;
 # login_qr.png     = a live login QR (scannable = usable), deleted on success;
 # ncm_mcp.log      = server log.
 ncm_session.json
 music_cache/
 playback.json
+.playback.json.*.tmp
+playback.lock
 login_qr.png
 ncm_mcp.log

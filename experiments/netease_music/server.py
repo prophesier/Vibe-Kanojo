@@ -69,6 +69,9 @@ _TOOL_TIMEOUT = 25  # seconds — under the MCP client's 30s read timeout
 # a timeout and the music would start anyway, a few seconds later. Giving the
 # step its own slice keeps the outer bound from ever landing mid-play.
 _PLAYER_BUDGET_S = 8.0
+# Leave enough event-loop time for the inner player timeout to be caught and
+# translated before the outer whole-tool timeout fires.
+_PLAYER_RETURN_MARGIN_S = 1.0
 _DEFAULT_VOLUME = 70
 
 # When the current tool call must be finished, so the steps inside it can
@@ -76,15 +79,17 @@ _DEFAULT_VOLUME = 70
 _deadline: contextvars.ContextVar[float] = contextvars.ContextVar("ncm_deadline")
 
 
-def _remaining(reserve: float = 0.0) -> float:
-    """Seconds left in this tool call, minus what the caller wants to keep in
-    hand. Never returns zero: a step with no time left should be allowed to
-    fail on its own terms rather than be handed an impossible deadline."""
+def _time_left() -> float:
+    """Raw seconds left in the current whole-tool budget."""
     try:
-        left = _deadline.get() - time.monotonic() - reserve
+        return _deadline.get() - time.monotonic()
     except LookupError:  # called outside a tool (tests, direct use)
-        left = _TOOL_TIMEOUT - reserve
-    return max(1.0, left)
+        return float(_TOOL_TIMEOUT)
+
+
+def _remaining(reserve: float = 0.0) -> float:
+    """Usable seconds left after reserving a later step."""
+    return max(0.0, _time_left() - reserve)
 
 
 _RESULT_NOTE = (
@@ -152,9 +157,28 @@ async def _player(fn, *args, **kwargs):
 async def _play_song(song: Song, volume: int) -> str:
     # Download under whatever is left of the budget, keeping the player's slice
     # in hand — the download can be cancelled cleanly, the start cannot.
-    path = await asyncio.wait_for(
-        _client.fetch_audio(song), timeout=_remaining(reserve=_PLAYER_BUDGET_S)
-    )
+    reserve = _PLAYER_BUDGET_S + _PLAYER_RETURN_MARGIN_S
+    fetch_budget = _remaining(reserve=reserve)
+    if fetch_budget <= 0:
+        return (
+            f"「{song.label()}」は検索に時間がかかり、"
+            "安全に再生を開始できる時間が残っていなかったため開始しませんでした。"
+        )
+    try:
+        path = await asyncio.wait_for(_client.fetch_audio(song), timeout=fetch_budget)
+    except asyncio.TimeoutError:
+        return (
+            f"「{song.label()}」の取得が時間内に終わらなかったため、"
+            "再生は開始しませんでした。"
+        )
+    # Earlier search/playlist calls share the outer budget and may have used
+    # more time than expected. Never dispatch an uncancellable thread unless
+    # its entire uncertainty window plus response margin still fits.
+    if _time_left() < reserve:
+        return (
+            f"「{song.label()}」は取得できましたが、安全に再生開始を確認できる"
+            "時間が残っていなかったため開始しませんでした。"
+        )
     try:
         await _player(
             ncm_player.play,
