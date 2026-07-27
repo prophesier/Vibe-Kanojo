@@ -516,7 +516,7 @@ def play(
     *,
     label: str = "",
     loop: bool = False,
-    volume: int = 70,
+    volume: int = 40,  # both callers pass their own; this is just a sane floor
     song_id: Optional[int] = None,
     wake: bool = False,
 ) -> Dict[str, Any]:

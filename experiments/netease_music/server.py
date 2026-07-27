@@ -73,7 +73,9 @@ _PLAYER_BUDGET_S = 8.0
 # Leave enough event-loop time for the inner player timeout to be caught and
 # translated before the outer whole-tool timeout fires.
 _PLAYER_RETURN_MARGIN_S = 1.0
-_DEFAULT_VOLUME = 70
+# Music in conversation is background, not an alarm: comfortably below the
+# wake volume. Calibrated on あさひ's speakers, where 55 is already loud.
+_DEFAULT_VOLUME = 40
 
 # When the current tool call must be finished, so the steps inside it can
 # divide up what's left rather than each assuming the whole budget.
@@ -247,9 +249,9 @@ async def music_play(
 @_tool
 async def music_playlists() -> str:
     """List the user's NetEase playlists, split into the ones he made himself
-    and the ones he collected from other people. His own — especially ♥, the
-    songs he hearted — say much more about his taste than a collected one
-    does, so prefer them when you are choosing rather than being told."""
+    and the ones he collected from other people. His own say much more about
+    his taste than a collected one does, so prefer them when you are choosing
+    rather than being told."""
     playlists = await _client.user_playlists()
     if not playlists:
         return "プレイリストが見つかりません（ログインが必要かも）。"
@@ -258,10 +260,7 @@ async def music_playlists() -> str:
     lines = []
     if mine:
         lines.append("自分で作ったもの:")
-        lines += [
-            f"- {p.name}（{p.count}曲）" + ("　♥ ハートを付けた曲" if p.liked else "")
-            for p in mine
-        ]
+        lines += [f"- {p.name}（{p.count}曲）" for p in mine]
     if theirs:
         lines.append("他の人から集めたもの:")
         lines += [f"- {p.name}（{p.count}曲）" for p in theirs]

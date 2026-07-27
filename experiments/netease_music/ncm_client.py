@@ -85,7 +85,12 @@ class Playlist:
     name: str
     count: int
     owned: bool = False  # created by this account, not collected from someone
-    liked: bool = False  # this account's own "♥" collection
+    # NetEase materialises "every song you hearted" as an auto-created playlist
+    # named "<nickname>喜欢的音乐" (specialType 5). Hearting is a per-song act;
+    # this playlist is just the aggregate, verified against song/like/get —
+    # same count, same ids. Used for tie-breaking and for reaching it by an
+    # alias, not shown as a badge.
+    liked: bool = False
 
 
 # Words that mean the ♥ collection without appearing in its name (which is

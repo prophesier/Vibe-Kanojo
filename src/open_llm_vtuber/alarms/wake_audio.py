@@ -37,7 +37,9 @@ from typing import Any, Optional, Tuple
 
 from loguru import logger
 
-DEFAULT_WAKE_VOLUME = 85
+# Loud enough to wake him, measured on his speakers rather than guessed:
+# あさひ 07-27 found 55 already noisy, so this sits just above that.
+DEFAULT_WAKE_VOLUME = 60
 # Longest a wake alarm may keep ringing unattended. Answering stops it sooner;
 # this is only the backstop for "nobody is home". It lives here rather than in
 # the server because it also bounds how long a *record* of ringing is believed
