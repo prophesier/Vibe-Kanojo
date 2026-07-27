@@ -84,6 +84,51 @@ class Playlist:
     id: int
     name: str
     count: int
+    owned: bool = False  # created by this account, not collected from someone
+    liked: bool = False  # this account's own "♥" collection
+
+
+# Words that mean the ♥ collection without appearing in its name (which is
+# "<nickname>喜欢的音乐").
+_LIKED_ALIASES = (
+    "小红心",
+    "红心",
+    "お気に入り",
+    "ハート",
+    "liked",
+    "favourite",
+    "favorite",
+)
+
+
+def find_playlist(playlists: List[Playlist], name: str) -> Optional[Playlist]:
+    """The playlist a spoken name refers to, or None.
+
+    Ownership is what breaks the ties that matter here. The list also holds
+    other people's playlists, and several of them are called
+    "<nickname>喜欢的音乐" — so a plain substring search for "喜欢的音乐" can
+    land on a stranger's ♥ collection instead of this account's own. Exact
+    names beat partial ones, and ours beats theirs at every tier.
+    """
+    wanted = (name or "").strip().lower()
+    if not wanted:
+        return None
+    asking_for_hearts = any(alias in wanted for alias in _LIKED_ALIASES)
+
+    def rank(playlist: Playlist):
+        low = playlist.name.lower()
+        if low == wanted:
+            tier = 0
+        elif wanted in low:
+            tier = 1
+        elif asking_for_hearts and playlist.liked:
+            tier = 2  # "小红心" appears in no playlist's name at all
+        else:
+            return None
+        return (tier, 0 if playlist.owned else 1, 0 if playlist.liked else 1)
+
+    scored = [(r, p) for p in playlists if (r := rank(p)) is not None]
+    return min(scored, key=lambda pair: pair[0])[1] if scored else None
 
 
 def _preferred_cdn_host(url: str) -> str:
@@ -228,14 +273,25 @@ class NeteaseClient:
         data = await self.post(
             "user/playlist", {"uid": uid, "limit": limit, "offset": 0}
         )
-        return [
-            Playlist(
-                id=int(p["id"]),
-                name=str(p.get("name", "")),
-                count=int(p.get("trackCount", 0)),
+        out: List[Playlist] = []
+        for p in data.get("playlist") or []:
+            # This endpoint returns collected playlists alongside created ones.
+            # ``subscribed`` says the same thing, but the owner id is the fact
+            # rather than a flag about it.
+            owned = p.get("userId") == uid
+            out.append(
+                Playlist(
+                    id=int(p["id"]),
+                    name=str(p.get("name", "")),
+                    count=int(p.get("trackCount", 0)),
+                    owned=owned,
+                    # specialType 5 is the auto-maintained "♥" playlist — but
+                    # collected ones carry it too (other people's hearts), so
+                    # ownership is what makes it this account's.
+                    liked=owned and p.get("specialType") == 5,
+                )
             )
-            for p in data.get("playlist") or []
-        ]
+        return out
 
     async def playlist_tracks(self, playlist_id: int, limit: int = 1000) -> List[Song]:
         data = await self.post(

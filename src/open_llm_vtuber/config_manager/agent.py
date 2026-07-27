@@ -133,12 +133,14 @@ class BasicMemoryAgentConfig(I18nMixin, BaseModel):
         "wake_playlist": Description(
             en=(
                 "Name of the NetEase playlist a wake alarm picks a random song "
-                "from (partial names match). Uncached songs are downloaded when "
-                "the alarm fires. Leave empty to play whatever is already "
-                "cached. (default: empty)"
+                "from (partial names match; your own playlists win ties, and "
+                "'小红心' reaches your hearted songs). Uncached songs are "
+                "downloaded when the alarm fires. Leave empty to play whatever "
+                "is already cached. (default: empty)"
             ),
             zh=(
-                "叫醒闹钟从哪个网易云歌单里随机选歌（支持部分匹配）。没缓存的歌"
+                "叫醒闹钟从哪个网易云歌单里随机选歌（支持部分匹配；同名时优先自己"
+                "创建的歌单，填「小红心」可指向自己点过红心的那个合集）。没缓存的歌"
                 "会在闹钟响时当场下载。留空则播放已缓存的任意歌曲。（默认：空）"
             ),
         ),

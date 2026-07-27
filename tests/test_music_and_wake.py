@@ -143,6 +143,48 @@ class CacheSidecarTests(unittest.TestCase):
         self.assertEqual([s["id"] for s in songs], [5])
 
 
+class PlaylistMatchTests(unittest.TestCase):
+    """The playlist list holds other people's playlists too, and NetEase names
+    every ♥ collection "<nickname>喜欢的音乐" — so a substring search for that
+    matches several, and only ownership says which one is his."""
+
+    def _lists(self):
+        P = ncm_client.Playlist
+        return [
+            P(1, "_init__喜欢的音乐", 1635, owned=True, liked=True),
+            P(2, "精选", 492, owned=True),
+            P(3, "纯音乐", 7, owned=True),
+            P(4, "nonosama喜欢的音乐", 2428),  # collected: someone else's ♥
+            P(5, "又失眠的猫喜欢的音乐", 1048),
+            P(6, "精选集：夜", 88),  # collected, and a superstring of "精选"
+        ]
+
+    def _find(self, name):
+        return ncm_client.find_playlist(self._lists(), name)
+
+    def test_his_own_hearts_win_over_a_strangers(self):
+        self.assertEqual(self._find("喜欢的音乐").id, 1)
+
+    def test_an_alias_reaches_the_hearts_without_naming_them(self):
+        for alias in ("小红心", "红心", "ハート", "liked"):
+            self.assertEqual(self._find(alias).id, 1, alias)
+
+    def test_an_exact_name_beats_a_longer_one_that_contains_it(self):
+        self.assertEqual(self._find("精选").id, 2)
+
+    def test_ownership_breaks_ties_at_every_tier(self):
+        # "音乐" is a substring of one owned and two collected names.
+        self.assertTrue(self._find("音乐").owned)
+
+    def test_a_collected_playlist_is_still_reachable_by_name(self):
+        self.assertEqual(self._find("nonosama").id, 4)
+
+    def test_no_match_and_empty_name(self):
+        self.assertIsNone(self._find("存在しない"))
+        self.assertIsNone(self._find(""))
+        self.assertIsNone(self._find("   "))
+
+
 class _StubPlayer:
     """Models the two distinctions the real player makes: a ringing alarm and a
     song the character put on are both "playing" but only the first answers to

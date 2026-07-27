@@ -44,6 +44,7 @@ from ncm_client import (  # noqa: E402
     NeteaseClient,
     NeteaseUnavailable,
     Song,
+    find_playlist,
 )
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -245,30 +246,41 @@ async def music_play(
 @mcp.tool()
 @_tool
 async def music_playlists() -> str:
-    """List the user's own NetEase playlists (name and track count), so you
-    can pick one to play with music_play_playlist."""
+    """List the user's NetEase playlists, split into the ones he made himself
+    and the ones he collected from other people. His own — especially ♥, the
+    songs he hearted — say much more about his taste than a collected one
+    does, so prefer them when you are choosing rather than being told."""
     playlists = await _client.user_playlists()
     if not playlists:
         return "プレイリストが見つかりません（ログインが必要かも）。"
-    listing = "\n".join(f"- {p.name}（{p.count}曲）" for p in playlists)
-    return f"プレイリスト:\n{listing}{_RESULT_NOTE}"
+    mine = [p for p in playlists if p.owned]
+    theirs = [p for p in playlists if not p.owned]
+    lines = []
+    if mine:
+        lines.append("自分で作ったもの:")
+        lines += [
+            f"- {p.name}（{p.count}曲）" + ("　♥ ハートを付けた曲" if p.liked else "")
+            for p in mine
+        ]
+    if theirs:
+        lines.append("他の人から集めたもの:")
+        lines += [f"- {p.name}（{p.count}曲）" for p in theirs]
+    return "プレイリスト:\n" + "\n".join(lines) + _RESULT_NOTE
 
 
 @mcp.tool()
 @_tool
 async def music_play_playlist(name: str, volume: int = _DEFAULT_VOLUME) -> str:
     """Play a random song from one of the user's playlists, matched by name
-    (partial names are fine). Use music_playlists first if you don't know
-    what exists."""
+    (partial names are fine; "小红心" or "ハート" reaches the ♥ collection).
+    Several collected playlists are also called "<someone>喜欢的音乐", so his
+    own always wins a tie. Use music_playlists first if you don't know what
+    exists."""
     playlists = await _client.user_playlists()
-    wanted = name.strip().lower()
-    match = next(
-        (p for p in playlists if wanted and wanted in p.name.lower()),
-        None,
-    )
+    match = find_playlist(playlists, name)
     if match is None:
-        available = "、".join(p.name for p in playlists[:10]) or "（なし）"
-        return f"「{name}」というプレイリストは見つかりません。候補: {available}"
+        available = "、".join(p.name for p in playlists if p.owned) or "（なし）"
+        return f"「{name}」というプレイリストは見つかりません。自分のもの: {available}"
 
     tracks = await _client.playlist_tracks(match.id)
     if not tracks:

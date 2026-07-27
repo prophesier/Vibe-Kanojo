@@ -168,9 +168,11 @@ character_config:
         enable_alarms: true
         # An alarm the character marks as a wake-up alarm also plays music
         # through this machine's speakers, on repeat, until you answer. This is
-        # the playlist it picks a random song from (partial name matches);
-        # uncached songs are downloaded when the alarm fires. Empty = play
-        # whatever is already cached. Needs experiments/netease_music set up.
+        # the playlist it picks a random song from (partial name matches; your
+        # own playlists beat ones you collected from other people, and
+        # "小红心" reaches the songs you hearted); uncached songs are
+        # downloaded when the alarm fires. Empty = play whatever is already
+        # cached. Needs experiments/netease_music set up.
         wake_playlist: ""
         # Let the character search its own facts/diaries (memory_search) and
         # add/update facts (memory_add/update). Deleting a fact requires your

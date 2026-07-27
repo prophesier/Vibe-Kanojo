@@ -20,7 +20,12 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from ncm_client import NeteaseClient, NeteaseUnavailable, cached_songs  # noqa: E402
+from ncm_client import (  # noqa: E402
+    NeteaseClient,
+    NeteaseUnavailable,
+    cached_songs,
+    find_playlist,
+)
 
 
 def _playlist_from_conf() -> str:
@@ -54,12 +59,12 @@ async def main() -> int:
         print(f"ログイン中: {who}")
 
         playlists = await client.user_playlists()
-        wanted = name.strip().lower()
-        match = next((p for p in playlists if wanted in p.name.lower()), None)
+        match = find_playlist(playlists, name)
         if match is None:
-            print(f"「{name}」が見つかりません。候補:")
-            for p in playlists[:20]:
-                print(f"  - {p.name}（{p.count}曲）")
+            print(f"「{name}」が見つかりません。自分のプレイリスト:")
+            for p in playlists:
+                if p.owned:
+                    print(f"  - {p.name}（{p.count}曲）" + ("  ♥" if p.liked else ""))
             return 1
 
         tracks = await client.playlist_tracks(match.id)

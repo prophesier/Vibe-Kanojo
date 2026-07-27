@@ -106,10 +106,12 @@ async def _from_playlist(playlist: str) -> Optional[Tuple[str, str]]:
     client = ncm_client.NeteaseClient()
     try:
         playlists = await client.user_playlists()
-        wanted = playlist.strip().lower()
-        match = next((p for p in playlists if wanted in p.name.lower()), None)
+        # Ownership decides ties: several collected playlists are also called
+        # "<someone>喜欢的音乐", and being woken by a stranger's ♥ collection
+        # is not what "my playlist" meant.
+        match = ncm_client.find_playlist(playlists, playlist)
         if match is None:
-            names = "、".join(p.name for p in playlists[:8]) or "(なし)"
+            names = "、".join(p.name for p in playlists if p.owned) or "(なし)"
             logger.warning(
                 f"[wake] playlist {playlist!r} not found; available: {names}"
             )
