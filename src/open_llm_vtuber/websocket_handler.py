@@ -100,6 +100,9 @@ class WebSocketHandler:
         self._alarm_delivery_lock = asyncio.Lock()
         # Set while a wake alarm is ringing; cancelled when the music stops.
         self._wake_timeout_task: Optional[asyncio.Task] = None
+        # In-flight "silence the alarm" threads. Held only so the tasks aren't
+        # garbage-collected mid-flight.
+        self._wake_stop_tasks: set = set()
         # Bumped by every stop request. Choosing the song can take seconds, and
         # this is how the code that finally starts it notices that the reason
         # for ringing expired while it was waiting.
@@ -777,21 +780,24 @@ class WebSocketHandler:
         uid = ready[-1]
         return uid, self._client_end_type.get(uid) == "proxy"
 
-    # Longest a wake alarm may keep ringing unattended. Answering stops it
-    # sooner; this is only the backstop for "nobody is home".
-    _WAKE_MAX_SECONDS = 900
+    # Backstop for "nobody is home". One source of truth with the audio module,
+    # which uses the same bound to decide when a "still ringing" record has
+    # stopped being believable.
+    _WAKE_MAX_SECONDS = wake_audio.MAX_RING_SECONDS
 
     async def _start_wake_audio(self) -> Optional[str]:
         """Ring the speakers for a wake alarm, independently of the reply.
         Never raises: a wake alarm that can't find a song still gets spoken."""
-        already = wake_audio.ringing()
-        if already:
-            # An earlier delivery attempt for this same alarm is still ringing.
-            # Restarting would re-roll the song and push the backstop timer
-            # out; the point is already being made.
-            return already
         epoch = self._wake_epoch
         try:
+            # Everything that touches the player shells out to the OS, so it
+            # all goes to a thread: the websocket loop must keep running.
+            already = await asyncio.to_thread(wake_audio.ringing)
+            if already:
+                # An earlier delivery attempt for this same alarm is still
+                # ringing. Restarting would re-roll the song and push the
+                # backstop timer out; the point is already being made.
+                return already
             bma = self._bma_cfg()
             playlist = str(getattr(bma, "wake_playlist", "") or "") if bma else ""
             # Downloading the song can take seconds. Only after it is in hand
@@ -804,7 +810,14 @@ class WebSocketHandler:
             if self._wake_epoch != epoch:
                 logger.info("[wake] he answered while the song loaded; not ringing.")
                 return None
-            label = wake_audio.play(choice[0], choice[1])
+            label = await asyncio.to_thread(wake_audio.play, choice[0], choice[1])
+            if label is not None and self._wake_epoch != epoch:
+                # He got a word in during the start itself. The stop that his
+                # message scheduled may have run before there was anything to
+                # stop, so undo it here rather than leave it ringing at him.
+                logger.info("[wake] he answered as it started; silencing it.")
+                await asyncio.to_thread(wake_audio.stop)
+                return None
         except Exception as e:
             logger.warning(f"[wake] could not start wake audio: {e}")
             return None
@@ -830,7 +843,8 @@ class WebSocketHandler:
         next sentence would cut off music he had just asked for.
 
         Runs on the path of EVERY incoming user message, so it swallows
-        everything: no message handling may fail because of the music."""
+        everything and blocks on nothing: no message handling may fail — or
+        stall — because of the music."""
         # Before anything else, so a wake alarm still choosing its song sees
         # that it has been called off.
         self._wake_epoch += 1
@@ -838,6 +852,25 @@ class WebSocketHandler:
             if self._wake_timeout_task is not None:
                 self._wake_timeout_task.cancel()
                 self._wake_timeout_task = None
+            # Killing the player means tasklist and taskkill. Off the loop:
+            # this is the single most important path in the feature and it
+            # runs on every message he sends.
+            try:
+                task = asyncio.create_task(
+                    asyncio.to_thread(self._stop_wake_now, reason)
+                )
+            except RuntimeError:
+                self._stop_wake_now(reason)  # no running loop — do it inline
+            else:
+                self._wake_stop_tasks.add(task)
+                task.add_done_callback(self._wake_stop_tasks.discard)
+        except Exception as e:
+            logger.warning(f"[wake] stop failed ({reason}): {e}")
+
+    def _stop_wake_now(self, reason: str) -> None:
+        """The blocking half of :meth:`stop_wake_audio`, run in a worker
+        thread. Never raises."""
+        try:
             if wake_audio.stop():
                 logger.info(f"[wake] stopped ({reason}).")
         except Exception as e:

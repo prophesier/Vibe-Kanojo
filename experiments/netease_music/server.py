@@ -26,10 +26,12 @@ Run (registered in mcp_servers.json):  python experiments/netease_music/server.p
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import pathlib
 import random
 import sys
+import time
 
 # Make sibling modules importable regardless of the launch cwd.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -61,7 +63,29 @@ def _setup_logging() -> None:
 # still working — and the song would then start playing well after the
 # character had already said something else about it.
 _TOOL_TIMEOUT = 25  # seconds — under the MCP client's 30s read timeout
+# Reserved at the end of that budget for starting the player itself. Starting
+# it runs in a thread, and a thread already inside a blocking OS call cannot
+# be cancelled — so if the outer timeout landed there, the tool would report
+# a timeout and the music would start anyway, a few seconds later. Giving the
+# step its own slice keeps the outer bound from ever landing mid-play.
+_PLAYER_BUDGET_S = 8.0
 _DEFAULT_VOLUME = 70
+
+# When the current tool call must be finished, so the steps inside it can
+# divide up what's left rather than each assuming the whole budget.
+_deadline: contextvars.ContextVar[float] = contextvars.ContextVar("ncm_deadline")
+
+
+def _remaining(reserve: float = 0.0) -> float:
+    """Seconds left in this tool call, minus what the caller wants to keep in
+    hand. Never returns zero: a step with no time left should be allowed to
+    fail on its own terms rather than be handed an impossible deadline."""
+    try:
+        left = _deadline.get() - time.monotonic() - reserve
+    except LookupError:  # called outside a tool (tests, direct use)
+        left = _TOOL_TIMEOUT - reserve
+    return max(1.0, left)
+
 
 _RESULT_NOTE = (
     "\n\n（メモ：この結果はあなたの参照用で会話履歴には残らない。"
@@ -84,6 +108,7 @@ def _tool(fn):
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs) -> str:
+        _deadline.set(time.monotonic() + _TOOL_TIMEOUT)
         try:
             return await asyncio.wait_for(fn(*args, **kwargs), timeout=_TOOL_TIMEOUT)
         except NeteaseUnavailable as e:
@@ -111,18 +136,40 @@ def _format(songs: list[Song]) -> str:
     )
 
 
-async def _play_song(song: Song, volume: int) -> str:
-    path = await _client.fetch_audio(song)
-    # The player shells out to the OS to clear the previous one; off the event
-    # loop so the tool's timeout can still fire while that happens.
-    await asyncio.to_thread(
-        ncm_player.play,
-        path,
-        label=song.label(),
-        loop=False,
-        volume=volume,
-        song_id=song.id,
+async def _player(fn, *args, **kwargs):
+    """Run a blocking player call off the event loop, bounded.
+
+    Raises ``asyncio.TimeoutError`` if it doesn't come back in time. A thread
+    already inside a blocking OS call cannot be cancelled, so the call may
+    still succeed afterwards — every caller therefore has to say "couldn't
+    confirm" rather than pick an outcome to report.
+    """
+    return await asyncio.wait_for(
+        asyncio.to_thread(fn, *args, **kwargs), timeout=_PLAYER_BUDGET_S
     )
+
+
+async def _play_song(song: Song, volume: int) -> str:
+    # Download under whatever is left of the budget, keeping the player's slice
+    # in hand — the download can be cancelled cleanly, the start cannot.
+    path = await asyncio.wait_for(
+        _client.fetch_audio(song), timeout=_remaining(reserve=_PLAYER_BUDGET_S)
+    )
+    try:
+        await _player(
+            ncm_player.play,
+            path,
+            label=song.label(),
+            loop=False,
+            volume=volume,
+            song_id=song.id,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"play {song.id} did not confirm within {_PLAYER_BUDGET_S}s")
+        return (
+            f"「{song.label()}」の再生を開始できたか確認できませんでした"
+            "（少し遅れて鳴り出すかもしれない）。"
+        )
     logger.info(f"playing {song.id} {song.label()}")
     return f"再生開始: {song.label()}"
 
@@ -210,7 +257,10 @@ async def music_play_playlist(name: str, volume: int = _DEFAULT_VOLUME) -> str:
 @_tool
 async def music_now_playing() -> str:
     """What is playing on the user's speakers right now, if anything."""
-    state = await asyncio.to_thread(ncm_player.status)
+    try:
+        state = await _player(ncm_player.status)
+    except asyncio.TimeoutError:
+        return "再生状況を確認できませんでした。"
     if state is None:
         return "今は何も再生していません。"
     elapsed = state.get("playing_for", 0)
@@ -224,8 +274,18 @@ async def music_now_playing() -> str:
 async def music_stop() -> str:
     """Stop whatever is playing on the user's speakers. This is also how an
     alarm that woke the user up gets silenced."""
-    stopped = await asyncio.to_thread(ncm_player.stop)
-    return "再生を止めました。" if stopped else "何も再生していません。"
+    try:
+        outcome = await _player(ncm_player.stop)
+    except asyncio.TimeoutError:
+        # Not "nothing was playing" and not "stopped": we genuinely don't know.
+        return "止められたか確認できませんでした（まだ鳴っているかもしれない）。"
+    if outcome == ncm_player.FAILED:
+        # Never fold this into "nothing was playing": the music is still
+        # audible, and the user needs to hear that rather than a shrug.
+        return "再生を止められませんでした（プレイヤーが応答しない）。まだ鳴っている。"
+    if outcome == ncm_player.STOPPED:
+        return "再生を止めました。"
+    return "今は何も再生していません。"
 
 
 if __name__ == "__main__":

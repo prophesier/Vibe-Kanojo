@@ -38,6 +38,11 @@ from typing import Any, Optional, Tuple
 from loguru import logger
 
 DEFAULT_WAKE_VOLUME = 85
+# Longest a wake alarm may keep ringing unattended. Answering stops it sooner;
+# this is only the backstop for "nobody is home". It lives here rather than in
+# the server because it also bounds how long a *record* of ringing is believed
+# — see ``ringing()``.
+MAX_RING_SECONDS = 900
 # Cap on the "fetch a fresh song" path so a slow network delays the alarm by
 # seconds, not minutes; on timeout we fall back to the cache.
 _FETCH_TIMEOUT_S = 25
@@ -201,21 +206,31 @@ async def start(playlist: str = "", volume: int = DEFAULT_WAKE_VOLUME) -> Option
 
 
 def stop() -> bool:
-    """Stop a ringing wake alarm. True if one was actually playing.
+    """Stop a ringing wake alarm. True if one was actually stopped.
 
     Only the alarm: music the character started in conversation keeps playing.
     This runs on the path of every incoming user message, so without that
     distinction あさひ's next sentence would kill any song he had asked for.
     Never raises.
+
+    Blocking — it shells out to the OS. Callers on an event loop should hand
+    it to a thread.
     """
     mods = _load()
     if mods is None:
         return False
+    player = mods[0]
     try:
-        return bool(mods[0].stop(only_wake=True))
+        outcome = player.stop(only_wake=True)
     except Exception as e:
         logger.warning(f"[wake] could not stop playback: {e}")
         return False
+    if outcome == player.FAILED:
+        # Worth shouting about: the alarm is still audible and he is probably
+        # standing in front of it wondering why talking didn't help.
+        logger.error("[wake] the alarm would not stop — it is still ringing.")
+        return False
+    return outcome == player.STOPPED
 
 
 def ringing() -> Optional[str]:
@@ -229,6 +244,17 @@ def ringing() -> Optional[str]:
     except Exception:
         return None
     if not state or not state.get("wake"):
+        return None
+    try:
+        playing_for = float(state.get("playing_for") or 0)
+    except (TypeError, ValueError):
+        playing_for = 0.0
+    if playing_for > MAX_RING_SECONDS:
+        # Past the backstop, so this isn't something still ringing — it's a
+        # record we failed to clear (the player reports "still running" when
+        # the OS won't answer, which is the safe guess for stopping and the
+        # unsafe one here). Don't let it suppress the next alarm forever.
+        logger.warning(f"[wake] ignoring a {playing_for:.0f}s-old ringing record.")
         return None
     return str(state.get("label") or "") or "音楽"
 
