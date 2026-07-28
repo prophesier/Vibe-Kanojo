@@ -16,7 +16,10 @@ dependencies = [
     "httpx>=0.28.1",
     "langdetect>=1.0.9",
     "loguru>=0.7.2",
-    "mcp[cli]>=1.6.0",
+    # Upper bound deliberate: mcp 2.0 renames McpError -> MCPError and breaks
+    # importers. 2026-07-29 the `time` MCP server died on exactly this, because
+    # it asks for mcp>=1.23.0 with no ceiling and got 2.0.
+    "mcp[cli]>=1.6.0,<2",
     "numpy>=1.26.4,<2",
     "onnxruntime>=1.20.1",
     "openai>=1.57.4",

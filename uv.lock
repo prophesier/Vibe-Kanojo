@@ -5271,7 +5271,7 @@ requires-dist = [
     { name = "langdetect", specifier = ">=1.0.9" },
     { name = "letta-client", specifier = ">=0.1.100" },
     { name = "loguru", specifier = ">=0.7.2" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.6.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.6.0,<2" },
     { name = "numpy", specifier = ">=1.26.4,<2" },
     { name = "onnxruntime", specifier = ">=1.20.1" },
     { name = "openai", specifier = ">=1.57.4" },
