@@ -76,12 +76,13 @@ class NativeFetchRemovalTests(unittest.IsolatedAsyncioTestCase):
 
         tools = captured["body"].get("tools", [])
         types = [t.get("type", "") for t in tools]
-        self.assertTrue(
-            any(t.startswith("web_search") for t in types), f"search missing: {types}"
-        )
+        # Both native web server tools are retired on this path (08-08):
+        # web_fetch is absent on Opus 5, and server web_search results were
+        # replay bulk immune to protocol truncation. Search and fetch are
+        # client tools declared by the agent, never auto-injected here.
         self.assertFalse(
-            any(str(t).startswith("web_fetch") for t in types),
-            f"native web_fetch must never be injected: {types}",
+            any(str(t).startswith(("web_search", "web_fetch")) for t in types),
+            f"native web tools must never be injected: {types}",
         )
 
     def test_replay_cap_resolution(self):
@@ -214,15 +215,22 @@ class ThinkingReplayCapTests(unittest.IsolatedAsyncioTestCase):
         return agent
 
     async def test_over_cap_turn_not_carried(self):
+        # Per-round semantics (08-09): a single-round turn over the cap loses
+        # its thinking; what remains (text only) isn't worth carrying, so the
+        # observable outcome matches the old whole-turn gate — plus the drop
+        # notice is staged for the next user payload.
         agent = await self._run(thinking_tokens=3000, cap=2000)
         self.assertNotIn("claude_protocol", agent._memory[-1])
         self.assertIsNone(agent.pop_thinking_seed())
+        self.assertTrue(agent._pending_thinking_drop_notice)
 
     async def test_under_cap_turn_carried_with_count(self):
         agent = await self._run(thinking_tokens=500, cap=2000)
         self.assertIn("claude_protocol", agent._memory[-1])
         seed = agent.pop_thinking_seed()
         self.assertEqual(seed["thinking_tokens"], 500)
+        self.assertEqual(seed["round_thinking"], [500])
+        self.assertFalse(agent._pending_thinking_drop_notice)
 
     async def test_cap_zero_disables(self):
         agent = await self._run(thinking_tokens=99999, cap=0)

@@ -420,6 +420,9 @@ class PersistentMemoryManager:
         # the character's own memory_* edits, hand edits) busts the prompt
         # cache. Disk stays the live truth for writes and RAG retrieval.
         self._header_snapshot: Optional[List[Dict[str, Any]]] = None
+        # Frozen diaries-block snapshot, same discipline and lifecycle as the
+        # facts snapshot above (rendered string — no downstream consumers).
+        self._diaries_snapshot: Optional[str] = None
         os.makedirs(self._diaries_dir, exist_ok=True)
         # Run the importance migrations unconditionally (not only when facts
         # RAG is on) so the llm→high rename reaches every setup.
@@ -479,7 +482,24 @@ class PersistentMemoryManager:
         return f"{header}\n\n{body}"
 
     def get_diaries_prompt(self) -> str:
-        """Return the diary block for the system prompt (empty string if no diaries)."""
+        """Return the diary block for the system prompt (empty string if no diaries).
+
+        Uses a FROZEN snapshot like the facts header — a diary written by
+        startup backfill AFTER the first turn (overdue alarm firing at boot)
+        must not change the system prompt mid-session (cache discipline,
+        08-07 turn-2 hit 13%). Zero information loss: a backfilled diary
+        summarizes a sliding-window session whose full text is already in
+        context, and diary RAG excludes in-window sessions anyway.
+        """
+        if self._diaries_snapshot is None:
+            self._diaries_snapshot = self._render_diaries_prompt()
+            logger.info(
+                "[memory] diaries header frozen for this session "
+                f"({len(self._diaries_snapshot)} chars)."
+            )
+        return self._diaries_snapshot
+
+    def _render_diaries_prompt(self) -> str:
         diaries = self._load_recent_diaries()
         if not diaries:
             return ""
@@ -574,8 +594,11 @@ class PersistentMemoryManager:
         memory_* tools) rewrote the prompt and busted the prefix cache
         (observed 90%→17%). New/edited facts remain immediately reachable
         through facts RAG and memory_search; the header catches up on the
-        next restart. Backfill resets the snapshot when it settles (before
-        the first turn), so startup-extracted facts still make it in.
+        next restart. Startup-backfill facts make it in only when backfill
+        settles before the first build — once a turn has shipped the header,
+        it stays frozen even through backfill (an overdue alarm can fire
+        before backfill settles; resetting then cost turn-2 87% of its
+        cache, 08-07).
         """
         if self._header_snapshot is None:
             self._header_snapshot = [dict(f) for f in self._header_facts()]
@@ -797,35 +820,71 @@ class PersistentMemoryManager:
             "note": "保存した。検索には即時反映、常駐の事実リストへは次回起動から。",
         }
 
-    async def update_fact_manual(self, fact_id: str, new_text: str) -> Dict[str, Any]:
-        """Rewrite one fact's text (memory_update). Allowed on ALL tiers,
-        including ``user`` (あさひ 2026-07-09: content is editable; what stays
-        forbidden is CREATING user-tier facts and DELETING them). The tier
-        itself is preserved."""
+    async def update_fact_manual(
+        self,
+        fact_id: str,
+        new_text: str = "",
+        importance: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Rewrite a fact's text and/or change its importance (memory_update).
+
+        Text edits are allowed on ALL tiers, including ``user`` (あさひ
+        2026-07-09: content is editable; what stays forbidden is CREATING
+        user-tier facts and DELETING them). The TIER of a user-tier fact is
+        equally the user's own — the character may not promote or demote it
+        (あさひ 2026-08-09: importance change added for high/low; ``user``
+        stays manual-only in both directions)."""
         new_text = " ".join((new_text or "").split())
-        if not new_text:
-            return {"status": "error", "message": "新しい本文が空。"}
+        importance = (importance or "").strip().lower() or None
+        if importance == "llm":  # legacy spelling of "high"
+            importance = "high"
+        if importance is not None and importance not in ("high", "low"):
+            return {
+                "status": "error",
+                "message": "importance は high / low のみ（user は本人管理で指定不可）。",
+            }
+        if not new_text and importance is None:
+            return {
+                "status": "error",
+                "message": "新しい本文か importance のどちらかが必要。",
+            }
         facts = self._load_facts()
         for f in facts:
             if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
                 old = f["fact"]
-                f["fact"] = new_text
+                old_tier = f.get("importance") or "low"
+                if importance is not None and old_tier == "user":
+                    return {
+                        "status": "error",
+                        "message": (
+                            "userレベルの記憶の優先度は本人管理のため変更"
+                            "できない（本文の修正は可）。"
+                        ),
+                    }
+                if new_text:
+                    f["fact"] = new_text
+                if importance is not None:
+                    f["importance"] = importance
                 f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._save_facts(facts)
                 await self._sync_facts_index()
-                new_id = self._fact_id(new_text)
+                new_id = self._fact_id(f["fact"])
                 # Full old/new text on purpose — recovery trail for accidental
                 # edits (restore by hand from the log if needed).
                 logger.info(
-                    f"[memory_tool] fact UPDATED {fact_id}→{new_id}:\n"
-                    f"  OLD: {old}\n  NEW: {new_text}"
+                    f"[memory_tool] fact UPDATED {fact_id}→{new_id} "
+                    f"(tier {old_tier}→{f.get('importance') or 'low'}):\n"
+                    f"  OLD: {old}\n  NEW: {f['fact']}"
                 )
-                return {
-                    "status": "ok",
-                    "id": new_id,
-                    "note": "更新した（idは内容ハッシュのため変わった）。"
-                    "常駐リストへの反映は次回起動から。",
-                }
+                notes = []
+                if new_text:
+                    notes.append("本文を更新した（idは内容ハッシュのため変わった）。")
+                else:
+                    notes.append("本文は変更なし（idも不変）。")
+                if importance is not None and importance != old_tier:
+                    notes.append(f"importance を {old_tier}→{importance} に変更。")
+                notes.append("常駐リストへの反映は次回起動から。")
+                return {"status": "ok", "id": new_id, "note": " ".join(notes)}
         return {
             "status": "error",
             "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
@@ -1517,10 +1576,19 @@ class PersistentMemoryManager:
             logger.warning(f"[memory] Backfill failed: {e}", exc_info=True)
         finally:
             PersistentMemoryManager._backfill_in_progress.discard(conf_uid)
-            # Re-freeze the header snapshot now that startup extraction has
-            # settled (the user waits for backfill before talking, so this
-            # lands before the first turn — no mid-session prompt change).
-            self._header_snapshot = None
+            # If the header hasn't been built yet (the usual case — the user
+            # talks minutes after boot), the first build simply reads the
+            # settled disk state. But when a turn already shipped this
+            # session's header — an OVERDUE ALARM can fire within seconds of
+            # boot, beating backfill — resetting here would change the system
+            # prompt mid-session and bust the prefix cache (08-07: turn-2 hit
+            # 13%). The settled facts stay RAG-reachable and enter the header
+            # on the next boot, same as any mid-session memory_* write.
+            if self._header_snapshot is not None:
+                logger.info(
+                    "[memory] backfill settled after the first turn — header "
+                    "keeps the boot snapshot (new facts reach RAG only)."
+                )
         # Reached only by the call that actually ran (the early-return above
         # exits first). True even if the work errored — facts are in their
         # final state for this startup either way, so the prompt is settled.

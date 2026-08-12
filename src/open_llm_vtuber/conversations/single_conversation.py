@@ -22,6 +22,21 @@ from ..service_context import ServiceContext
 from ..agent.output_types import SentenceOutput, AudioOutput
 
 
+def _no_speech_reason(seed: Dict[str, Any]) -> str:
+    """Classify a silent turn by what its transcript actually contains."""
+    kinds = {
+        block.get("type")
+        for message in (seed.get("protocol") or [])
+        for block in (message.get("content") or [])
+        if isinstance(block, dict)
+    }
+    if "thinking" in kinds or "redacted_thinking" in kinds:
+        return "think-only"
+    if "tool_use" in kinds:
+        return "tool-only"
+    return "unknown"
+
+
 async def process_single_conversation(
     context: ServiceContext,
     websocket_send: WebSocketSend,
@@ -158,23 +173,45 @@ async def process_single_conversation(
             client_uid=client_uid,
         )
 
-        if context.history_uid and full_response:  # Check full_response before storing
+        if context.history_uid:
             # Claude path: the agent stages the turn's final assistant message
             # (signed thinking + text) for on-disk persistence — the restart
             # cold-start seed. One-shot; None for non-Claude agents and
             # thinking-less turns.
             pop_seed = getattr(context.agent_engine, "pop_thinking_seed", None)
             thinking_seed = pop_seed() if callable(pop_seed) else None
-            store_message(
-                conf_uid=context.character_config.conf_uid,
-                history_uid=context.history_uid,
-                role="ai",
-                content=full_response,
-                name=context.character_config.character_name,
-                avatar=context.character_config.avatar,
-                thinking_seed=thinking_seed,
-            )
-            logger.info(f"AI response: {full_response}")
+            # API-error turns tag their visible notice so the disk record
+            # survives for review but never re-enters the assembled context
+            # (あさひ 08-05). One-shot, None on normal turns.
+            pop_excluded = getattr(context.agent_engine, "pop_context_excluded", None)
+            context_excluded = pop_excluded() if callable(pop_excluded) else None
+            # A silent turn (think-only / tool-only, empty text) is still a
+            # real turn and MUST be persisted (あさひ 08-07): dropping it
+            # collapses the reload into two adjacent user turns — the exact
+            # shape that seeded the 08-05 hallucinated-input incident. The
+            # empty-content record carries the seed so a same-model restart
+            # replays the turn verbatim.
+            if full_response or thinking_seed:
+                store_message(
+                    conf_uid=context.character_config.conf_uid,
+                    history_uid=context.history_uid,
+                    role="ai",
+                    content=full_response,
+                    name=context.character_config.character_name,
+                    avatar=context.character_config.avatar,
+                    thinking_seed=thinking_seed,
+                    context_excluded=context_excluded,
+                )
+                logger.info(f"AI response: {full_response}")
+            if not full_response and thinking_seed:
+                reason = _no_speech_reason(thinking_seed)
+                logger.info(f"[no-speech] silent turn persisted ({reason}).")
+                try:
+                    await websocket_send(
+                        json.dumps({"type": "turn-no-speech", "reason": reason})
+                    )
+                except Exception as e:
+                    logger.debug(f"turn-no-speech send failed: {e}")
 
         return full_response  # Return accumulated full_response
 

@@ -120,9 +120,13 @@ class ClaudeThinkingReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output, ["final answer"])
         self.assertEqual(len(llm.calls), 2)
         self.assertEqual(llm.calls[1][-2], first_assistant)
+        # The round is replay-stable, so the moving breakpoint (08-09) rides
+        # the live tool_result message; content bytes are TOOL_RESULT exactly.
+        sent_result = llm.calls[1][-1]
+        self.assertEqual(sent_result["role"], "user")
         self.assertEqual(
-            llm.calls[1][-1],
-            {"role": "user", "content": [TOOL_RESULT]},
+            sent_result["content"],
+            [{**TOOL_RESULT, "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
         )
 
         stored = agent._memory[-1]

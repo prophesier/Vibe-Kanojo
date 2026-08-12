@@ -23,7 +23,10 @@ from ...web_tools import web_search, web_fetch
 from ...alarms import resolve_fire_at, format_local
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
-from ..stateless_llm.claude_llm import AsyncLLM as ClaudeAsyncLLM
+from ..stateless_llm.claude_llm import (
+    AsyncLLM as ClaudeAsyncLLM,
+    _budget_tokens_removed,
+)
 from ..stateless_llm.openai_compatible_llm import (
     CACHE_SEAM_MARKER,
     AsyncLLM as OpenAICompatibleAsyncLLM,
@@ -31,6 +34,7 @@ from ..stateless_llm.openai_compatible_llm import (
 from ...chat_history_manager import (
     get_history,
     get_recent_histories,
+    mark_last_message_excluded,
     pop_last_message,
     search_history,
     split_search_keywords,
@@ -184,6 +188,14 @@ class BasicMemoryAgent(AgentInterface):
         self._session_injected_fact_ids: Set[str] = set()
         self._pending_facts_block: str = ""
         self._sliding_window_uids: Set[str] = set()
+        # Claude-path history split (あさひ 08-02): entries below this index
+        # came from PAST sessions. They are lifted out of `messages` and sent
+        # as one frozen system transcript block instead, so the messages
+        # segment holds only the current session — thinking-parameter changes
+        # (forced/adaptive hot-toggle) then invalidate only that small tail
+        # of the cache. Both are fixed at load time and stable per session.
+        self._past_history_cut: int = 0
+        self._past_transcript: str = ""
         # Fingerprint of the last system prompt, for diagnosing prompt-cache
         # drops: a change between turns is exactly what busts the prefix cache.
         self._last_system_fp: str = ""
@@ -384,6 +396,15 @@ class BasicMemoryAgent(AgentInterface):
     # text. Chars, not tokens: cheap and close enough (JA≈1, EN≈4 chars/tok).
     _PROTOCOL_RESULT_MAX_CHARS = 400
     _PROTOCOL_TRUNCATION_MARKER = "…[truncated for replay]"
+    # One-shot notice injected at the top of the NEXT user payload after a
+    # round's thinking blocks were dropped from replay (per-round cap,
+    # あさひ 08-09): without it, the missing-thinking precedent reads as
+    # "think less" — the same imitation channel as the zero-thinking /
+    # silent-turn cascades. Wording is あさひ's draft near-verbatim.
+    _THINKING_DROP_NOTICE = (
+        "【通知: 前のターンの思考は長すぎたため、コスト節約のため以後の文脈から"
+        "外した。だからといって、以後の思考を減らしたり短くしたりする必要はない。】"
+    )
 
     # Cold-start transcript seeds (あさひ's design 07-23, revised 07-26):
     # persist a turn's verbatim transcript to chat history whenever it carries
@@ -408,16 +429,41 @@ class BasicMemoryAgent(AgentInterface):
     _conf_uid: str = ""
     _history_uid: str = ""
 
+    # One-shot context_excluded tag for the turn's on-disk AI record (set by
+    # the API-error path, consumed by the conversation layer's store_message).
+    # Class-level default so __new__-constructed test instances read None.
+    _pending_context_excluded: Optional[str] = None
+    # Class-level default for the same reason (__init__ assigns per instance):
+    # _to_messages reads it to spot the banner-pending first turn.
+    _current_session_banner_added = False
+    # One-shot flag: a just-finished turn had thinking dropped from replay
+    # (per-round cap); the next stored user payload carries
+    # _THINKING_DROP_NOTICE. Class-level default for __new__-built tests.
+    _pending_thinking_drop_notice = False
+
+    def pop_context_excluded(self) -> Optional[str]:
+        """One-shot getter for the just-completed turn's context_excluded tag.
+
+        Non-None only after an API-error turn: the conversation layer stores
+        the visible error notice to disk with this tag so the record survives
+        for the human reader but never re-enters the assembled context."""
+        tag = self._pending_context_excluded
+        self._pending_context_excluded = None
+        return tag
+
     def pop_thinking_seed(self) -> Optional[Dict[str, Any]]:
         """One-shot getter for the just-completed turn's thinking seed.
 
-        Returns {"model": ..., "protocol": [messages]} — the turn's full
-        transcript verbatim (signed thinking included; tool_result content
+        Returns {"model": ..., "protocol": [messages], "thinking_tokens": N,
+        "round_thinking": [...]} — the turn's transcript after the per-round
+        trim (signed thinking kept for under-cap rounds; tool_result content
         truncated with a marker), or None when the turn produced neither
-        thinking nor tool calls. The whole transcript is kept so a replayed
-        tool turn still shows real tool calls — rewriting it into a "results
-        without calls" shape would teach fabrication. The conversation layer
-        attaches it to the on-disk history record (store_message).
+        thinking nor tool calls. round_thinking aligns with the protocol's
+        assistant messages so a reload can re-trim if the cap shrank. The
+        whole transcript is kept so a replayed tool turn still shows real
+        tool calls — rewriting it into a "results without calls" shape would
+        teach fabrication. The conversation layer attaches it to the on-disk
+        history record (store_message).
         """
         seed = self._last_thinking_seed
         self._last_thinking_seed = None
@@ -433,8 +479,10 @@ class BasicMemoryAgent(AgentInterface):
         for the log/warning only, never to withhold transcripts: a withheld
         tool transcript makes an honest turn look fabricated. Seeds from a
         different model are skipped (other models ignore foreign thinking
-        blocks but still bill their tokens), as are oversized-thinking seeds
-        (replay cap).
+        blocks but still bill their tokens). The replay cap applies PER ROUND
+        (08-09): seeds carrying a round_thinking breakdown are re-trimmed
+        against the current cap; legacy whole-turn seeds over the cap are
+        skipped outright (no per-round data to trim by).
         """
         if not self._is_claude_llm() or not self._memory:
             return
@@ -466,15 +514,6 @@ class BasicMemoryAgent(AgentInterface):
         for idx, seed in candidates:
             if idx not in attach_window:
                 continue
-            # Fat-thinking seeds are skipped for the same reason they were
-            # never stored live (field present on seeds written after 07-25).
-            seed_thinking = seed.get("thinking_tokens")
-            if (
-                replay_cap
-                and isinstance(seed_thinking, (int, float))
-                and seed_thinking > replay_cap
-            ):
-                continue
             protocol = seed.get("protocol")
             if not (
                 isinstance(protocol, list)
@@ -486,6 +525,29 @@ class BasicMemoryAgent(AgentInterface):
                 if not (isinstance(content, list) and content):
                     continue
                 protocol = [{"role": "assistant", "content": content}]
+            seed_round_thinking = seed.get("round_thinking")
+            if isinstance(seed_round_thinking, list):
+                # Per-round seeds (08-09+): already trimmed at store time; the
+                # re-trim only bites when the cap shrank between store and
+                # reload (idempotent otherwise — dropped rounds are zeroed in
+                # the stored alignment). No drop notice on reload: these are
+                # old turns, not a precedent the model just set.
+                protocol, _, _ = self._trim_protocol_per_round(
+                    protocol, seed_round_thinking, replay_cap
+                )
+                if not protocol or not self._claude_protocol_worth_carrying(protocol):
+                    continue
+            else:
+                # Legacy whole-turn seeds carry no per-round breakdown, so the
+                # old fat-seed skip is the only safe rule for them (field
+                # present on seeds written after 07-25).
+                seed_thinking = seed.get("thinking_tokens")
+                if (
+                    replay_cap
+                    and isinstance(seed_thinking, (int, float))
+                    and seed_thinking > replay_cap
+                ):
+                    continue
             seed_model = seed.get("model") or ""
             if seed_model and model and seed_model != model:
                 continue
@@ -558,6 +620,69 @@ class BasicMemoryAgent(AgentInterface):
                 return block
             return {**block, "content": new_blocks or marker}
         return block
+
+    @classmethod
+    def _trim_protocol_per_round(
+        cls,
+        protocol: List[Dict[str, Any]],
+        round_thinking: List[int],
+        cap: int,
+    ) -> tuple:
+        """Per-round replay trim (あさひ 08-09 rulings, probe-proven).
+
+        The two dimensions are INDEPENDENT: tool_result content is truncated
+        to the protocol cap as before, and any loop round whose billed
+        thinking exceeded ``cap`` loses ONLY its thinking blocks — the
+        _tool_thinking_replay_probe showed completed historical rounds accept
+        partial and full thinking removal (the immutable-latest-assistant 400
+        governs only the ACTIVE loop tail). This retires the whole-turn
+        "over cap → drop the entire transcript" hammer: long-thinking turns
+        now keep their tool calls and text.
+
+        ``round_thinking`` aligns with assistant messages in protocol order
+        (missing entries count as 0 = keep). An assistant message emptied by
+        the drop (thinking-only final round) is omitted entirely — the only
+        API-legal shape for a block-less message.
+
+        Returns ``(trimmed, kept_round_thinking, dropped)``:
+        ``kept_round_thinking`` aligns with the assistant messages REMAINING
+        in ``trimmed``, with dropped rounds zeroed — so a seed re-trimmed on
+        reload (cap may have shrunk since store time) stays aligned and the
+        operation is idempotent. ``dropped`` counts rounds that actually lost
+        thinking blocks (drives the drop notice).
+        """
+        thinking_types = {"thinking", "redacted_thinking"}
+        out: List[Dict[str, Any]] = []
+        kept_rounds: List[int] = []
+        dropped = 0
+        ai = 0
+        for msg in cls._truncate_protocol_tool_results(protocol):
+            if msg.get("role") != "assistant":
+                out.append(msg)
+                continue
+            tokens = round_thinking[ai] if ai < len(round_thinking) else 0
+            ai += 1
+            if not isinstance(tokens, (int, float)):
+                tokens = 0
+            content = msg.get("content")
+            has_thinking = isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") in thinking_types for b in content
+            )
+            if cap and tokens > cap and has_thinking:
+                dropped += 1
+                new_content = [
+                    b
+                    for b in content
+                    if not (isinstance(b, dict) and b.get("type") in thinking_types)
+                ]
+                if not new_content:
+                    continue
+                out.append({**msg, "content": new_content})
+                kept_rounds.append(0)
+            else:
+                out.append(msg)
+                kept_rounds.append(int(tokens))
+        return out, kept_rounds, dropped
 
     @staticmethod
     def _claude_protocol_has_tool_use(
@@ -848,9 +973,11 @@ class BasicMemoryAgent(AgentInterface):
     _HISTORY_NOTE = (
         "【以下の会話履歴について】\n\n"
         "ここから後に続くユーザーとアシスタントのやりとりは、"
-        "**複数の過去セッションが時系列順に連結されたもの**。"
-        "必ずしも今日の出来事だけではなく、数日前〜数週間前の古いやりとりと、"
-        "直近のやりとりが一つのストリームに混在している。"
+        "**現在進行中のセッション**のもの。"
+        "それ以前の会話は、システム欄の【過去セッションの転記】ブロックに"
+        "時系列順で転記されている（初回起動などで存在しない場合もある）。"
+        "転記も現在のやりとりも、必ずしも今日の出来事だけではなく、"
+        "数日前〜数週間前の古いやりとりを含み得る。"
         "各ターンが「いつ」発生したかは、冒頭の "
         "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
         "各セッションの最初のメッセージには `【セッション開始: 日時】` または "
@@ -957,20 +1084,24 @@ class BasicMemoryAgent(AgentInterface):
     # minus the 4.6-era eagerness patches (measured on Opus 5 07-25:
     # 1000-2000 billed thinking tokens per turn with frequent tool calls —
     # and every extra tool round pays another full round of thinking).
-    # Dropped: the [Thinking] always-think nudge (thinking is adaptive-on and
-    # eager) and the [Strict rules on executing tools] no-false-report block
+    # Dropped: the [Strict rules on executing tools] no-false-report block
     # (あさひ 07-25: redundant for 5-series; _check_stateful_claims still
     # polices stateful claims mechanically). Slimmed: web-tool encouragement →
     # availability + honesty only. Kept verbatim: session/banner semantics,
     # the strict time rules (compressed 07-25, restored in full 07-26 — time
     # errors persisted on Opus 5 and are not effort-correlated), RAG-block
-    # semantics, divergence note.
+    # semantics, divergence note. The [Thinking] always-think nudge, dropped
+    # 07-25 as redundant for adaptive thinking, was RESTORED verbatim 08-09
+    # (あさひ: Opus 5 still occasionally skips thinking and errs; measure via
+    # the thinking_tokens=0 rate).
     _HISTORY_NOTE_LEAN = (
         "【以下の会話履歴について】\n\n"
         "ここから後に続くユーザーとアシスタントのやりとりは、"
-        "**複数の過去セッションが時系列順に連結されたもの**。"
-        "必ずしも今日の出来事だけではなく、数日前〜数週間前の古いやりとりと、"
-        "直近のやりとりが一つのストリームに混在している。"
+        "**現在進行中のセッション**のもの。"
+        "それ以前の会話は、システム欄の【過去セッションの転記】ブロックに"
+        "時系列順で転記されている（初回起動などで存在しない場合もある）。"
+        "転記も現在のやりとりも、必ずしも今日の出来事だけではなく、"
+        "数日前〜数週間前の古いやりとりを含み得る。"
         "各ターンが「いつ」発生したかは、冒頭の "
         "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
         "各セッションの最初のメッセージには `【セッション開始: 日時】` または "
@@ -1033,7 +1164,14 @@ class BasicMemoryAgent(AgentInterface):
         "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
         "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
-        "囲みの後にあるユーザーの実際の発言に対して返答すること。"
+        "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
+        "[Thinking]\n\n"
+        "Engage your thinking mode for every reply, no matter how small or "
+        "trivial the matter seems. Do not skip it because a message looks like "
+        "light chat, a one-line answer, or a simple acknowledgement. Even an "
+        "inconsequential reply very easily slips in a factual error, a mistake "
+        "about time or dates, or a hallucination — and those are exactly the "
+        "turns where such errors go unnoticed. Think first, every time."
     )
 
     # Model families whose default thinking/tool eagerness no longer needs the
@@ -1059,10 +1197,6 @@ class BasicMemoryAgent(AgentInterface):
         right before it encounters the data they apply to.
         """
         parts = [self._system, self._TIMESTAMP_NOTE] + self._tool_capability_notes()
-        # Resident Steam library digest — set once before the first turn and
-        # never changed mid-session, so it is as cache-stable as the notes.
-        if self._steam_digest:
-            parts.append(self._steam_digest)
         if self._openai_explicit_cache():
             # Static persona block ends here; the responses transport splits
             # on this marker and breakpoints the static part, so a facts/
@@ -1077,6 +1211,12 @@ class BasicMemoryAgent(AgentInterface):
                 parts.append(mem_block)
             facts_fp = self._short_hash(facts_text)
             diaries_fp = self._short_hash(diaries_text)
+        # Steam digest is session-scoped (playtime moves between sessions),
+        # so it lives on the volatile side of the seam with facts/diaries —
+        # in the static block it silently busted the persona cache on every
+        # digest change (08-12, same fix as the Claude block-2 move).
+        if self._steam_digest:
+            parts.append(self._steam_digest)
         parts.append(self._history_note())
         system = "\n\n".join(parts)
 
@@ -1105,6 +1245,27 @@ class BasicMemoryAgent(AgentInterface):
 
     def _is_claude_llm(self) -> bool:
         return isinstance(self._llm, ClaudeAsyncLLM)
+
+    def set_thinking_mode(self, mode: str) -> Dict[str, Any]:
+        """Runtime forced/adaptive thinking toggle (Discord /thinking).
+
+        Volatile by design (あさひ 08-02): touches only the live LLM
+        instance, never conf.yaml — a restart returns to the configured
+        value. ``effective`` reports the request-layer reality: asking for
+        ``forced`` on a model without budget_tokens support silently runs
+        adaptive (claude_llm falls back per request), so the caller can
+        tell the user the truth instead of echoing the wish.
+        """
+        if mode not in ("forced", "adaptive"):
+            return {"ok": False, "error": f"unknown mode: {mode!r}"}
+        if not self._is_claude_llm():
+            return {"ok": False, "error": "active LLM is not Claude"}
+        self._llm.set_thinking_force(mode == "forced")
+        model = getattr(self._llm, "model", "") or ""
+        effective = (
+            "adaptive" if mode == "forced" and _budget_tokens_removed(model) else mode
+        )
+        return {"ok": True, "requested": mode, "effective": effective, "model": model}
 
     def _openai_explicit_cache(self) -> bool:
         """Whether the active LLM runs /v1/responses with explicit prompt
@@ -1141,15 +1302,48 @@ class BasicMemoryAgent(AgentInterface):
                 break
         return messages
 
+    # Header line of the past-session transcript system block. Wording is
+    # aligned with _HISTORY_NOTE ("ユーザー/アシスタント", session banners) —
+    # the transcript entries below it carry their banners and timestamp tags
+    # verbatim, so every rule in _HISTORY_NOTE applies to them unchanged.
+    _PAST_TRANSCRIPT_HEADER = (
+        "【過去セッションの転記】\n"
+        "以下は前回までの会話セッションの記録（時系列順の転記）。"
+        "現在進行中のセッションのやりとりは、この後のメッセージ欄に続く。\n"
+    )
+
+    def _render_past_transcript(self) -> str:
+        """Text transcript of the past-session entries (_memory[:cut]).
+
+        Claude path only. Entry content — session banners, time banners,
+        timestamp tags — is carried verbatim; only the role becomes a
+        ユーザー:/アシスタント: label. Rendered once at load time and frozen
+        (see set_memory_from_recent_histories).
+        """
+        if not self._past_history_cut:
+            return ""
+        lines = []
+        for entry in self._memory[: self._past_history_cut]:
+            label = "ユーザー" if entry.get("role") == "user" else "アシスタント"
+            content = entry.get("content", "")
+            if content:
+                lines.append(f"{label}: {content}")
+        if not lines:
+            return ""
+        return self._PAST_TRANSCRIPT_HEADER + "\n" + "\n\n".join(lines)
+
     def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
         """Return system prompt in the right shape for the active LLM.
 
         For Claude, returns up to 3 separately cache-controlled blocks
         followed by one un-cached positional block:
-          1. Persona + minimal timestamp note (ultra-stable, changes only
-             on character edit)
-          2. Facts (changes only on fact extraction)
-          3. Diaries (changes only when a new diary is generated)
+          1. Persona + minimal timestamp note + capability notes
+             (ultra-stable, changes only on character/code edit)
+          2. Facts + diaries + Steam digest (all change only at session
+             boundaries, so they share one breakpoint — merged 08-02 to
+             free a slot for 3.; digest moved here 08-12)
+          3. Past-session transcript (frozen at load; the sliding-window
+             history that used to live in `messages`)
           + HISTORY_NOTE (appended last, no cache_control). Sits right
              before the message history so its strict timestamp / history
              rules are the closest instructions to the data they govern.
@@ -1157,7 +1351,11 @@ class BasicMemoryAgent(AgentInterface):
 
         With (1)/(2)/(3) cache markers plus the last-message marker from
         _attach_cache_breakpoint, this uses all 4 of Anthropic's allowed
-        cache checkpoints; HISTORY_NOTE adds no extra marker.
+        cache checkpoints; HISTORY_NOTE adds no extra marker. The payoff of
+        keeping past sessions here instead of in `messages`: thinking-mode
+        hot-toggles (and other message-level cache invalidations) only
+        rewrite the current-session tail, and the transcript sits behind its
+        own breakpoint, untouched.
 
         For other LLMs, returns the plain combined string.
         """
@@ -1168,34 +1366,40 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "text",
                 "text": "\n\n".join(
-                    [self._system, self._TIMESTAMP_NOTE]
-                    + self._tool_capability_notes()
-                    # Steam digest: set once before the first turn, immutable
-                    # for the session, so it belongs in this cached block.
-                    + ([self._steam_digest] if self._steam_digest else [])
+                    [self._system, self._TIMESTAMP_NOTE] + self._tool_capability_notes()
                 ),
                 "cache_control": self._CACHE_CONTROL_1H,
             }
         ]
+        # Session-scoped content shares block 2: facts and diaries change at
+        # session boundaries, and the Steam digest does too (playtime moves
+        # between sessions). The digest sat in block 1 until 08-12 — あさひ
+        # caught that a within-1h restart should HIT the persona block but
+        # never did: a changed digest invalidated block 1 and everything
+        # after it, silently converting quick restarts into full rewrites.
+        session_scoped = []
         if self._memory_manager:
-            facts_text = self._memory_manager.get_facts_prompt()
-            if facts_text:
-                blocks.append(
-                    {
-                        "type": "text",
-                        "text": facts_text,
-                        "cache_control": self._CACHE_CONTROL_1H,
-                    }
-                )
-            diaries_text = self._memory_manager.get_diaries_prompt()
-            if diaries_text:
-                blocks.append(
-                    {
-                        "type": "text",
-                        "text": diaries_text,
-                        "cache_control": self._CACHE_CONTROL_1H,
-                    }
-                )
+            session_scoped.append(self._memory_manager.get_facts_prompt())
+            session_scoped.append(self._memory_manager.get_diaries_prompt())
+        if self._steam_digest:
+            session_scoped.append(self._steam_digest)
+        memory_text = "\n\n".join(t for t in session_scoped if t)
+        if memory_text:
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": memory_text,
+                    "cache_control": self._CACHE_CONTROL_1H,
+                }
+            )
+        if self._past_transcript:
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": self._past_transcript,
+                    "cache_control": self._CACHE_CONTROL_1H,
+                }
+            )
         # Trailing block — no cache_control on purpose. Stays right next
         # to the message history for maximum instruction-following effect.
         blocks.append({"type": "text", "text": self._history_note()})
@@ -1223,6 +1427,11 @@ class BasicMemoryAgent(AgentInterface):
             candidate = new_messages[index]
             if candidate.get("claude_protocol") or candidate.get("thinking_blocks"):
                 continue
+            # Silent-turn placeholders (empty content, 08-07) can't take the
+            # marker: wrapping "" into a text block would send an empty text
+            # block, which the API rejects.
+            if not candidate.get("content"):
+                continue
 
             content = candidate.get("content")
             if isinstance(content, str):
@@ -1237,9 +1446,31 @@ class BasicMemoryAgent(AgentInterface):
                     ],
                 }
             elif isinstance(content, list) and content:
+                # Image blocks are never cached: _add_message keeps only the
+                # text, so an image exists for exactly one request — a prefix
+                # containing it can never re-occur. But the LEADING text
+                # blocks (payload rides first by construction) are stored
+                # verbatim, so the marker goes on the last text block BEFORE
+                # the first non-text block (あさひ 08-09): the whole prior
+                # prefix — a tool turn's protocol replay included — direct-
+                # writes on this request, and only the image itself rides
+                # fresh. Next turn the message replays text-only and the
+                # cached span still matches (string ↔ wrapped-block
+                # equivalence is production-proven). The old whole-message
+                # skip parked the marker on an already-cached boundary and
+                # re-paid the protocol replay as fresh — compounding across
+                # consecutive image turns. A message with no leading text
+                # (bare image) still cannot be marked at all.
+                cut = len(content)
+                for i, block in enumerate(content):
+                    if not (isinstance(block, dict) and block.get("type") == "text"):
+                        cut = i
+                        break
+                if cut == 0:
+                    continue
                 new_content = [dict(block) for block in content]
-                new_content[-1] = {
-                    **new_content[-1],
+                new_content[cut - 1] = {
+                    **new_content[cut - 1],
                     "cache_control": self._CACHE_CONTROL_1H,
                 }
                 replacement = {**candidate, "content": new_content}
@@ -1251,15 +1482,50 @@ class BasicMemoryAgent(AgentInterface):
         return new_messages
 
     @staticmethod
-    def _session_header_text(uid: str, is_current: bool = False) -> str:
+    def _strip_cache_marker(message: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a copy of ``message`` with any ``cache_control`` removed
+        (no-op passthrough when none present). Used by the tool loop's moving
+        breakpoint: the API allows at most 4 breakpoints per request, so the
+        message-level one must MOVE, not multiply. The server-side cache
+        entry written while the old marker was in place survives — it stays
+        a lookback target for later requests."""
+        content = message.get("content")
+        if not isinstance(content, list) or not any(
+            isinstance(b, dict) and "cache_control" in b for b in content
+        ):
+            return message
+        return {
+            **message,
+            "content": [
+                {k: v for k, v in b.items() if k != "cache_control"}
+                if isinstance(b, dict)
+                else b
+                for b in content
+            ],
+        }
+
+    def _session_header_text(self, uid: str, is_current: bool = False) -> str:
         """Format a session-boundary banner from a history UID.
 
         UID format: ``YYYY-MM-DD_HH-MM-SS_<hex>``. The banner is prepended
         to the first message of each session so the LLM can distinguish
         independent sessions in the otherwise-flat message stream.
+
+        The CURRENT-session banner also names the running model (あさひ
+        08-10: facts can lag a model switch and leave the character unsure
+        what she runs on; the banner never reaches disk — chat_history
+        stores the clean input — so this stays in-memory only, and a resume
+        under a new model shows the new one). Past-session banners stay
+        model-free. Bytes are stable within a session: the model comes from
+        conf and is fixed for the process lifetime.
         """
         weekdays = ["月", "火", "水", "木", "金", "土", "日"]
         label = "現在進行中のセッション" if is_current else "セッション"
+        suffix = ""
+        if is_current:
+            model = getattr(getattr(self, "_llm", None), "model", "") or ""
+            if model:
+                suffix = f" | モデル: {model}"
         parts = uid.split("_")
         if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
             try:
@@ -1267,10 +1533,10 @@ class BasicMemoryAgent(AgentInterface):
                 timestamp = (
                     f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}"
                 )
-                return f"【{label}開始: {timestamp}】"
+                return f"【{label}開始: {timestamp}{suffix}】"
             except ValueError:
                 pass
-        return f"【{label}開始: {uid}】"
+        return f"【{label}開始: {uid}{suffix}】"
 
     def _msg_from_history_record(self, msg: Dict[str, Any]) -> Optional[Dict[str, str]]:
         """Convert a stored history record into a memory entry.
@@ -1279,9 +1545,22 @@ class BasicMemoryAgent(AgentInterface):
         each turn occurred.  Omitting them from assistant turns prevents the
         model from mimicking the format in its own replies.
         """
+        # Records tagged by the API-error path stay on disk for the human
+        # reader but never re-enter the assembled context (あさひ 08-05).
+        if msg.get("context_excluded"):
+            return None
         role = "user" if msg["role"] == "human" else "assistant"
         content = msg.get("content")
         if not isinstance(content, str) or not content:
+            # Silent turns (think-only / tool-only, 08-07): an empty AI record
+            # carrying a thinking seed is a real turn. Let it through so the
+            # seed can re-attach and the turn replays verbatim; dropping it
+            # would collapse the reload into two adjacent user turns — the
+            # 08-05 hallucination-seed shape. (A foreign-model seed still gets
+            # skipped later; the bare empty assistant is then omitted at
+            # request-build time, which is the honest degradation.)
+            if role == "assistant" and isinstance(msg.get("thinking_seed"), dict):
+                return {"role": "assistant", "content": ""}
             return None
         if role == "assistant":
             # Strip tool-execution markers so the model doesn't see (and imitate)
@@ -1298,6 +1577,11 @@ class BasicMemoryAgent(AgentInterface):
         """Load memory from a single chat history file."""
         messages = get_history(conf_uid, history_uid)
         self._memory = []
+        # Single-session load: there is no past-session window here, so the
+        # system-transcript split must be cleared or a stale cut would slice
+        # current-session entries out of `messages`.
+        self._past_history_cut = 0
+        self._past_transcript = ""
         for msg in messages:
             entry = self._msg_from_history_record(msg)
             if entry:
@@ -1402,6 +1686,14 @@ class BasicMemoryAgent(AgentInterface):
                 self._memory.append(entry)
                 if not had_banner:
                     _maybe_collect_seed(msg, entry)
+
+        # Everything loaded so far came from past sessions. Freeze the cut
+        # index and the transcript text NOW — the Claude path sends these
+        # entries as one system block, and that block must stay byte-stable
+        # for the whole session (cache discipline). Entries appended after
+        # this point (current session + live turns) stay in `messages`.
+        self._past_history_cut = len(self._memory)
+        self._past_transcript = self._render_past_transcript()
 
         # Always append the current session last so conversation continuity
         # is preserved even for clients that join mid-session.
@@ -1519,12 +1811,11 @@ class BasicMemoryAgent(AgentInterface):
 
     def _to_messages(self, input_data: BatchInput) -> List[Dict[str, Any]]:
         """Prepare messages for LLM API call."""
-        messages = self._memory.copy()
-        # Cache breakpoint goes on the newest safe historical block. Exact
-        # Claude assistant transcripts with signed thinking are skipped, so
-        # their preceding user block becomes the breakpoint instead. The fresh
-        # user input appended below stays uncached. No-op for non-Claude.
-        messages = self._attach_cache_breakpoint(messages)
+        # Claude path: past-session entries ride in the frozen system
+        # transcript block, so the message list starts at the current
+        # session. Other LLMs keep the full window in messages.
+        past_cut = self._past_history_cut if self._is_claude_llm() else 0
+        messages = self._memory[past_cut:].copy()
         if self._openai_explicit_cache():
             messages = self._tag_explicit_cache_seam(messages)
         user_content = []
@@ -1560,6 +1851,41 @@ class BasicMemoryAgent(AgentInterface):
             payload_text = f"{rag_block}\n\n{text_prompt}"
         else:
             payload_text = rag_block or text_prompt
+
+        skip_memory = bool(
+            input_data.metadata and input_data.metadata.get("skip_memory", False)
+        )
+        # Thinking-drop notice (あさひ 08-09): the previous turn lost thinking
+        # from replay (per-round cap); tell the model ONCE so the missing
+        # precedent isn't imitated as "think less". Same contract as the
+        # banner: rides the outgoing payload and is stored verbatim
+        # (stored == sent), and skip_memory turns don't consume it (nothing
+        # persists, so the precedent would be lost). Injected BEFORE the
+        # banner block below, so when both fire the banner ends up on top.
+        if payload_text and not skip_memory and self._pending_thinking_drop_notice:
+            payload_text = f"{self._THINKING_DROP_NOTICE}\n{payload_text}"
+            self._pending_thinking_drop_notice = False
+        # The session banner rides the OUTGOING payload of a fresh session's
+        # first user message (あさひ 08-09: intended behavior — it was
+        # previously prepended only at store time by _add_message, so the
+        # first message was sent bannerless and stored != sent; under
+        # direct-write caching that rewrote the whole span on turn 2, the
+        # 66393w/61678r case). Setting the flag here makes _add_message's own
+        # injection skip, so the stored text is byte-identical to this one.
+        # skip_memory turns must not consume the banner: nothing gets stored,
+        # so the session's visible first message is still to come.
+        if (
+            payload_text
+            and not skip_memory
+            and not self._current_session_banner_added
+            and self._memory_manager is not None
+        ):
+            current_uid = getattr(self._memory_manager, "_current_session_uid", "")
+            if current_uid:
+                banner = self._session_header_text(current_uid, is_current=True)
+                payload_text = f"{banner}\n{payload_text}"
+                self._current_session_banner_added = True
+
         if payload_text:
             user_content.append({"type": "text", "text": payload_text})
 
@@ -1590,10 +1916,6 @@ class BasicMemoryAgent(AgentInterface):
             user_message = {"role": "user", "content": user_content}
             messages.append(user_message)
 
-            skip_memory = False
-            if input_data.metadata and input_data.metadata.get("skip_memory", False):
-                skip_memory = True
-
             if not skip_memory:
                 # Store the SAME text we send (including any RAG block) so the
                 # conversation in _memory stays append-only — OpenAI's prefix
@@ -1607,6 +1929,22 @@ class BasicMemoryAgent(AgentInterface):
         else:
             logger.warning("No content generated for user message.")
 
+        # Cache breakpoint rides on the OUTGOING user message, so this turn's
+        # payload (timestamp + RAG blocks + text) is written to cache on its
+        # own request instead of riding uncached and being re-paid as next
+        # turn's cache write (fresh 1x + write 2x → write 2x). Safe because
+        # stored == sent (above): later requests replay the exact bytes, so
+        # the entry keeps hitting. Exact Claude protocol entries with signed
+        # thinking are never marked (skip logic inside). Inside the tool
+        # loop this marker MOVES per round when the round is judged
+        # replay-stable in-round (thinking ≤ per-round cap, results
+        # truncation-stable) — see _claude_tool_interaction_loop; unstable
+        # rounds stop the migration so bytes that change post-turn are never
+        # cached (single-call net-loss veto, あさひ 08-08). No-op for
+        # non-Claude. The fresh-session first message is safe to mark too:
+        # its banner is injected into the outgoing payload above, so
+        # stored == sent holds from the very first turn.
+        messages = self._attach_cache_breakpoint(messages)
         return messages
 
     async def _inject_memory_rags(self, input_data: BatchInput) -> None:
@@ -1835,6 +2173,26 @@ class BasicMemoryAgent(AgentInterface):
         lines.append("［関連する事実終了］")
         return "\n".join(lines)
 
+    @staticmethod
+    def _inproc_result_is_error(result: Any) -> bool:
+        """is_error detection across BOTH in-proc result shapes.
+
+        Every in-proc tool returns a dict ({"error": ...} / {"status":
+        "error"}) EXCEPT web_search, whose web_tools contract is a list —
+        results on success, a single-element [{"error": ...}] on failure
+        (deliberate: the model reads the error without special-casing).
+        Calling .get on that list crashed the whole tool loop out of the
+        agent stream (08-09, 'list' object has no attribute 'get') — the
+        shape must be branched on, not assumed.
+        """
+        if isinstance(result, dict):
+            return bool(result.get("error")) or result.get("status") == "error"
+        if isinstance(result, list):
+            return bool(result) and all(
+                isinstance(r, dict) and r.get("error") for r in result
+            )
+        return False
+
     async def _claude_tool_interaction_loop(
         self,
         initial_messages: List[Dict[str, Any]],
@@ -1851,16 +2209,66 @@ class BasicMemoryAgent(AgentInterface):
         # different tool-loop requests must never be flattened together.
         claude_protocol: List[Dict[str, Any]] = []
         protocol_is_exact = True
-        # Billed thinking across the whole turn (all loop rounds) — compared
-        # against thinking_replay_max_tokens to decide whether this turn's
-        # transcript may enter later requests at all.
+        # Billed thinking across the whole turn (log/stats and the seed's
+        # legacy field). Replay gating is PER ROUND since 08-09: each loop
+        # round is judged against thinking_replay_max_tokens on its own —
+        # see round_thinking / _trim_protocol_per_round.
         turn_thinking_tokens = 0
+        # Billed thinking per protocol assistant message, in append order
+        # (loop rounds now, the final assistant at turn end). Drives both the
+        # in-loop stability judgement and the turn-end per-round trim.
+        round_thinking: List[int] = []
+        replay_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
+        # Moving message-level breakpoint (bp④). _to_messages marked the
+        # outgoing user message; each loop round whose replay stability is
+        # already knowable IN-ROUND (thinking ≤ cap AND tool results
+        # truncation-stable → the post-turn protocol preserves its bytes
+        # exactly) migrates the marker onto that round's tool_result message,
+        # so the round's tokens are written to cache at 2x once instead of
+        # riding fresh and being re-paid. The marker lives ONLY in the
+        # `messages` list copies — claude_protocol stays clean, since replays
+        # must not multiply breakpoints. First unstable round stops marking
+        # for the rest of the turn (its bytes change post-turn, so entries
+        # written after it would be invalidated — the single-call net-loss
+        # あさひ vetoed). An interrupted/inexact turn orphans at most the
+        # rounds already marked: bounded, accepted (PROJECT.md 边角).
+        bp_index: Optional[int] = None
+        for i in range(len(messages) - 1, -1, -1):
+            content = messages[i].get("content")
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and "cache_control" in b for b in content
+            ):
+                bp_index = i
+                break
+        # Any non-text block (an image) in the initial prefix taints every
+        # entry a mid-loop breakpoint would write: images never persist to
+        # replay, so next turn's prefix diverges at the image and the entry
+        # can never be read again — a pure 2x loss. The leading-text marker
+        # from _to_messages already covered the cacheable span; keep the
+        # marker parked there for the whole turn.
+        prefix_has_image = any(
+            isinstance(m.get("content"), list)
+            and any(
+                not (isinstance(b, dict) and b.get("type") == "text")
+                for b in m["content"]
+            )
+            for m in messages
+        )
+        marking_active = not prefix_has_image
+        if prefix_has_image:
+            logger.debug(
+                "[cache] non-text block in prefix — in-loop breakpoint "
+                "migration disabled this turn."
+            )
         # Set when the safety classifier declines a request (stop_reason
         # "refusal"); handled after the stream ends.
         refusal_info: Optional[Dict[str, Any]] = None
-        # Per-turn budget for the client-side web_fetch tool.
+        # Per-turn budgets for the client-side web tools.
         web_fetch_budget = {
             "left": max(0, int(getattr(self._llm, "_max_web_fetches", 5) or 0))
+        }
+        web_search_budget = {
+            "left": max(0, int(getattr(self._llm, "_max_web_searches", 3) or 0))
         }
 
         while True:
@@ -1940,13 +2348,10 @@ class BasicMemoryAgent(AgentInterface):
                     break
                 elif event["type"] == "error":
                     logger.error(f"LLM API Error: {event['message']}")
-                    yield f"[Error from LLM: {event['message']}]"
-                    # Keep whatever she already said in context — text only, no
-                    # protocol (the turn is incomplete, so the transcript can't
-                    # be replayed safely). The user heard this text; dropping it
-                    # would make her forget her own words next turn.
-                    if current_turn_text:
-                        self._add_message(current_turn_text, "assistant")
+                    # あさひ 08-05: the whole failed turn (input + any partial
+                    # reply) leaves the context; disk keeps tagged records for
+                    # review. See _handle_api_error_turn.
+                    yield self._handle_api_error_turn(event["message"])
                     return
 
             turn_thinking_tokens += request_thinking_tokens
@@ -1999,6 +2404,7 @@ class BasicMemoryAgent(AgentInterface):
                     }
                     messages.append(deepcopy(assistant_protocol_message))
                     claude_protocol.append(deepcopy(assistant_protocol_message))
+                    round_thinking.append(request_thinking_tokens)
 
                 # Split: in-process tools (alarms + self-check + steam) are
                 # handled here, provider-agnostic; everything else goes to the
@@ -2012,6 +2418,8 @@ class BasicMemoryAgent(AgentInterface):
                     inproc_names.update(self._MEMORY_TOOL_NAMES)
                 if getattr(self._llm, "_enable_web_fetch", False):
                     inproc_names.add("web_fetch")
+                if getattr(self._llm, "_enable_web_search", False):
+                    inproc_names.add("web_search")
                 inproc_calls = [
                     c for c in pending_tool_calls if c.get("name") in inproc_names
                 ]
@@ -2026,6 +2434,10 @@ class BasicMemoryAgent(AgentInterface):
                     if cname == "web_fetch":
                         marker, result = await self._run_claude_web_fetch(
                             c.get("input") or {}, web_fetch_budget
+                        )
+                    elif cname == "web_search":
+                        marker, result = await self._run_claude_web_search(
+                            c.get("input") or {}, web_search_budget
                         )
                     elif cname == self._MODEL_HEALTH_TOOL_NAME:
                         marker, result = await self._run_model_health_tool(
@@ -2053,8 +2465,7 @@ class BasicMemoryAgent(AgentInterface):
                             "type": "tool_result",
                             "tool_use_id": c["id"],
                             "content": json.dumps(result, ensure_ascii=False),
-                            "is_error": bool(result.get("error"))
-                            or result.get("status") == "error",
+                            "is_error": self._inproc_result_is_error(result),
                         }
                     )
 
@@ -2110,6 +2521,67 @@ class BasicMemoryAgent(AgentInterface):
                     }
                     messages.append(deepcopy(tool_result_message))
                     claude_protocol.append(deepcopy(tool_result_message))
+                    if marking_active:
+                        # In-round stability: will the post-turn protocol
+                        # preserve this round byte-identically? Thinking under
+                        # the per-round cap (and signed), an exact snapshot,
+                        # and every tool_result already truncation-stable
+                        # (identity check mirrors the post-turn trim). If yes,
+                        # entries written now can never be invalidated → move
+                        # bp④ here; if not, this round's bytes change after
+                        # the turn, so stop marking from here on.
+                        thinking_stable = not (
+                            replay_cap and request_thinking_tokens > replay_cap
+                        )
+                        results_stable = all(
+                            self._truncate_tool_result_block(b) is b
+                            for b in tool_results_for_llm
+                            if isinstance(b, dict) and b.get("type") == "tool_result"
+                        )
+                        round_stable = (
+                            protocol_is_exact
+                            and current_assistant_message_is_exact
+                            and bool(assistant_content_for_replay)
+                            and self._claude_thinking_blocks_replayable(
+                                assistant_content_for_replay
+                            )
+                            and thinking_stable
+                            and results_stable
+                        )
+                        if round_stable:
+                            if bp_index is not None:
+                                messages[bp_index] = self._strip_cache_marker(
+                                    messages[bp_index]
+                                )
+                            marked = messages[-1]  # loop-private deepcopy
+                            last_block = marked["content"][-1]
+                            if isinstance(last_block, dict):
+                                marked["content"][-1] = {
+                                    **last_block,
+                                    "cache_control": self._CACHE_CONTROL_1H,
+                                }
+                                bp_index = len(messages) - 1
+                                logger.debug(
+                                    "[cache] tool round stable "
+                                    f"(thinking={request_thinking_tokens} tok) "
+                                    "— breakpoint moved to its tool_result."
+                                )
+                        else:
+                            marking_active = False
+                            reasons = []
+                            if not thinking_stable:
+                                reasons.append(
+                                    f"thinking {request_thinking_tokens} tok "
+                                    f"> cap {replay_cap}"
+                                )
+                            if not results_stable:
+                                reasons.append("tool result over protocol cap")
+                            logger.info(
+                                "[cache] tool round not replay-stable "
+                                f"({'; '.join(reasons) or 'inexact snapshot'})"
+                                " — in-loop cache marking stops; later "
+                                "rounds ride fresh."
+                            )
                 continue
             else:
                 if not current_turn_text:
@@ -2150,12 +2622,35 @@ class BasicMemoryAgent(AgentInterface):
                             "role": "assistant",
                             "content": deepcopy(current_assistant_message_content),
                         }
-                        # Truncate stored tool_result content (user-role
-                        # messages only — assistant messages stay verbatim).
-                        protocol_for_memory = self._truncate_protocol_tool_results(
-                            claude_protocol + [final_assistant]
+                        round_thinking.append(request_thinking_tokens)
+                        # Per-round trim (08-09, replaces the 07-25 whole-turn
+                        # gate): tool_result content truncated as before, and
+                        # each round's thinking dropped ONLY if that round
+                        # exceeded the cap — probe-proven safe on completed
+                        # turns. A long-thinking turn keeps its tool calls and
+                        # text instead of losing the whole transcript.
+                        (
+                            protocol_for_memory,
+                            kept_rounds,
+                            dropped_rounds,
+                        ) = self._trim_protocol_per_round(
+                            claude_protocol + [final_assistant],
+                            round_thinking,
+                            replay_cap,
                         )
-                        # Stage the WHOLE truncated protocol as the on-disk
+                        if dropped_rounds:
+                            # Next turn's user payload opens with the drop
+                            # notice (see _to_messages) so the missing
+                            # precedent isn't imitated as "think less".
+                            self._pending_thinking_drop_notice = True
+                            logger.info(
+                                f"[thinking_replay] dropped thinking from "
+                                f"{dropped_rounds} round(s) over cap "
+                                f"{replay_cap} (turn total "
+                                f"{turn_thinking_tokens} tok) — notice staged "
+                                "for next turn."
+                            )
+                        # Stage the WHOLE trimmed protocol as the on-disk
                         # cold-start seed (あさひ 07-24: replaying a tool turn
                         # without its tool machinery rewrites history into a
                         # "results without calls" shape — with the precedent
@@ -2163,32 +2658,18 @@ class BasicMemoryAgent(AgentInterface):
                         # tool_result content is already truncated above with
                         # an explanatory marker; those are unsigned client
                         # messages, so truncation cannot trip validation.
+                        # round_thinking (kept-round alignment) lets
+                        # _apply_thinking_seeds re-trim against a cap that
+                        # shrank between store and reload.
                         if self._claude_protocol_worth_carrying(protocol_for_memory):
                             self._last_thinking_seed = {
                                 "model": getattr(self._llm, "model", "") or "",
                                 "protocol": deepcopy(protocol_for_memory),
                                 "thinking_tokens": turn_thinking_tokens,
+                                "round_thinking": list(kept_rounds),
                             }
-                    # Oversized-thinking gate (あさひ 07-25): a turn whose
-                    # billed thinking exceeds the cap is NOT carried into
-                    # later requests at all — neither in-session nor as a
-                    # seed — so a single reasoning spree can't squat in the
-                    # cache prefix for the rest of the session.
-                    replay_cap = (
-                        getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
-                    )
-                    if (
-                        protocol_for_memory is not None
-                        and replay_cap
-                        and turn_thinking_tokens > replay_cap
-                    ):
-                        logger.info(
-                            f"[thinking_replay] turn thinking "
-                            f"{turn_thinking_tokens} tok > cap {replay_cap} — "
-                            "transcript not carried into context."
-                        )
-                        protocol_for_memory = None
-                        self._last_thinking_seed = None
+                        else:
+                            protocol_for_memory = None
                     self._add_message(
                         current_turn_text,
                         "assistant",
@@ -2486,6 +2967,12 @@ class BasicMemoryAgent(AgentInterface):
                     # Client-side web_fetch (native server tool retired —
                     # absent on Opus 5; one shared fetcher for both paths).
                     claude_tools.extend(self._build_web_fetch_tool_claude())
+                if getattr(self._llm, "_enable_web_search", False):
+                    # Client-side web_search (native server tool retired —
+                    # its result blocks were replay bulk immune to protocol
+                    # truncation, parking 10-16k tokens per search in every
+                    # later request of the session).
+                    claude_tools.extend(self._build_web_search_tool_claude())
                 if claude_tools:
                     logger.debug(
                         f"Starting Claude tool loop with {len(claude_tools)} tools."
@@ -2578,6 +3065,22 @@ class BasicMemoryAgent(AgentInterface):
                     claude_assistant_message = None
             plain_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
             if plain_cap and plain_thinking_tokens > plain_cap:
+                # Single-request turn = single round, so the per-round rule
+                # degenerates to the old behavior: drop the thinking. What
+                # remains (visible text) carries no thinking/tool blocks, so
+                # no protocol is worth storing — but the drop notice still
+                # fires when signed thinking was actually removed.
+                if (
+                    claude_assistant_message is not None
+                    and self._claude_protocol_has_thinking([claude_assistant_message])
+                ):
+                    self._pending_thinking_drop_notice = True
+                    logger.info(
+                        f"[thinking_replay] turn thinking "
+                        f"{plain_thinking_tokens} tok > cap {plain_cap} — "
+                        "thinking dropped from replay; notice staged for "
+                        "next turn."
+                    )
                 claude_assistant_message = None
             if complete_response or claude_assistant_message is not None:
                 if (
@@ -2769,6 +3272,48 @@ class BasicMemoryAgent(AgentInterface):
             tool_name, content
         )
 
+    def _handle_api_error_turn(self, error_message: str) -> str:
+        """Clean up after an API error and build the visible notice.
+
+        あさひ 08-05 ruling (post-hallucination incident): the WHOLE failed
+        turn leaves the LLM context — the user input is popped from memory
+        (else the context shows two consecutive user turns, the exact shape
+        that seeded hallucinated inputs), and both sides stay on DISK tagged
+        ``context_excluded`` so a human can review what happened while the
+        assembler skips them (unlike the safety-refusal path, which deletes
+        the input from disk too — a refused input would re-poison every
+        restart; an errored one is harmless to keep). Any partial text she
+        said before the error goes with the turn: it never reached a clean
+        stop and the user is told to resend, so replaying half a reply
+        against a re-sent input would desync the exchange. The notice is
+        yielded as the turn's visible output and stored to disk WITH the tag
+        (via pop_context_excluded), so it too stays out of future context —
+        teaching her to narrate API errors is how the [Error from LLM] line
+        got imitated into record #123 today."""
+        short = str(error_message or "").strip()
+        if len(short) > 160:
+            short = short[:160] + "…"
+        if self._memory and self._memory[-1].get("role") == "user":
+            self._memory.pop()
+        marked_disk = False
+        try:
+            if self._conf_uid and self._history_uid:
+                marked_disk = mark_last_message_excluded(
+                    self._conf_uid, self._history_uid, "human", "api_error"
+                )
+        except Exception as e:
+            logger.warning(f"[api_error] disk tagging failed: {e}")
+        self._pending_context_excluded = "api_error"
+        logger.warning(
+            f"[api_error] turn excluded from context (disk_tagged={marked_disk}): "
+            f"{short}"
+        )
+        return (
+            f"\n⚠️ APIエラーで応答できなかった（{short}）。"
+            "この往復は文脈に残らない——直前のメッセージは届いていないので、"
+            "もう一度送ってほしい。\n"
+        )
+
     def _handle_safety_refusal(self, info: Dict[str, Any]) -> str:
         """Clean up after a safety-classifier refusal and build the notice.
 
@@ -2846,6 +3391,59 @@ class BasicMemoryAgent(AgentInterface):
         cfg = getattr(self, "_web_tools_config", None) or {}
         max_chars = int(cfg.get("max_fetch_chars", 20000) or 20000)
         result = await web_fetch(url, max_chars=max_chars)
+        return marker, result
+
+    @staticmethod
+    def _build_web_search_tool_claude() -> List[Dict[str, Any]]:
+        """Claude schema for the CLIENT-side web_search tool.
+
+        Runs in-process via web_tools.web_search (brave/tavily) — the same
+        backend the OpenAI path uses — replacing Anthropic's native server
+        tool. Server search results were replay bulk no truncation could
+        touch; client results are ordinary tool_result blocks capped by
+        _truncate_protocol_tool_results once the turn ends."""
+        return [
+            {
+                "name": "web_search",
+                "description": (
+                    "Search the web for current information, news, or facts "
+                    "you're unsure about. Returns a list of results with "
+                    "titles, URLs, and snippets."
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Search query.",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            }
+        ]
+
+    async def _run_claude_web_search(
+        self, args: Dict[str, Any], budget: Dict[str, int]
+    ) -> tuple:
+        """Client-side web_search for the Claude tool loop.
+
+        Same brave/tavily backend as the OpenAI path; the per-turn budget
+        comes from the claude_llm max_web_searches setting."""
+        self._turn_inproc_calls.append("web_search")
+        query = str(args.get("query", "")).strip()
+        if budget.get("left", 0) <= 0:
+            return None, {"error": "web search limit reached this turn"}
+        budget["left"] -= 1
+        logger.info(f"[web_search] query: {query or '(empty)'}")
+        marker = f"\n🔍 *Web検索: {query[:80] or '...'}*\n"
+        cfg = getattr(self, "_web_tools_config", None) or {}
+        result = await web_search(
+            query,
+            provider=cfg.get("provider", "brave"),
+            api_key=cfg.get("api_key", ""),
+            max_results=5,
+        )
         return marker, result
 
     @staticmethod
@@ -3390,10 +3988,11 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_update",
                     "description": (
-                        "Rewrite an existing fact (correction or addition). "
+                        "Rewrite an existing fact and/or change its importance. "
                         "Confirm the target id with memory_search before using "
-                        "this. importance is unchanged (content of user-tier "
-                        "facts may still be corrected)."
+                        "this. user-tier facts: content may be corrected, but "
+                        "their importance is the user's own and cannot be "
+                        "changed."
                     ),
                     "parameters": {
                         "type": "object",
@@ -3404,10 +4003,24 @@ class BasicMemoryAgent(AgentInterface):
                             },
                             "new_fact": {
                                 "type": "string",
-                                "description": "The new text (replaces the whole fact).",
+                                "description": (
+                                    "The new text (replaces the whole fact). "
+                                    "Omit to keep the text and change only the "
+                                    "importance."
+                                ),
+                            },
+                            "importance": {
+                                "type": "string",
+                                "enum": ["high", "low"],
+                                "description": (
+                                    "New tier: high = resident in the system "
+                                    "prompt from the next startup / low = "
+                                    "enters context only via search or recall. "
+                                    "Omit to keep the current tier."
+                                ),
                             },
                         },
-                        "required": ["fact_id", "new_fact"],
+                        "required": ["fact_id"],
                     },
                 },
             },
@@ -3416,7 +4029,10 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_delete",
                     "description": (
-                        "Delete one fact. Two-phase: calling it without "
+                        "Delete one fact. If the user's current message itself "
+                        "explicitly asks for the deletion (消して/削除して/"
+                        "删掉 etc.), a single call without confirmed executes "
+                        "immediately. Otherwise two-phase: calling it without "
                         "confirmed files a deletion request, at which point you "
                         "ask the user whether that memory may be deleted. In the "
                         "turn immediately after he consents, call again with "
@@ -3653,10 +4269,29 @@ class BasicMemoryAgent(AgentInterface):
     # Approval phrases あさひ might actually type (JA/ZH/EN). Matched against
     # the TAIL of his latest real message — the second factor behind the
     # model's confirmed=true claim. Staged deletions expire after 15 min.
+    # いい/消してもいい added 08-09 — あさひ's actual replies kept missing the
+    # old list (いいよ/消していい didn't cover them) and he had to fall back
+    # to typing "ok". Bare いい is deliberately loose; the regex only gates a
+    # confirmed=true call answering a question he was just asked.
     _MEMORY_APPROVE_RE = re.compile(
-        r"(同意|承認|許可|いいよ|いいです|ええよ|構わない|かまわない|どうぞ|"
-        r"消していい|消しちゃっていい|削除していい|削除して構わない|オーケー|"
-        r"删吧|删了吧|删掉|可以删|同意删除|はい|OK|ok|Ok)"
+        r"(同意|承認|許可|いいよ|いいです|いい|ええよ|構わない|かまわない|どうぞ|"
+        r"消していい|消してもいい|消しちゃっていい|削除していい|削除して構わない|"
+        r"オーケー|删吧|删了吧|删掉|可以删|同意删除|はい|OK|ok|Ok)"
+    )
+    # Deletion-EXPLICIT phrases: when the user's OWN current message already
+    # says "delete it", the first memory_delete call executes directly — no
+    # second confirmation round (あさひ 08-09: the round-trip doubled the
+    # work, and edit turns often think past the replay cap, dropping the
+    # fact_id from context and forcing a full redo). Deliberately narrower
+    # than _MEMORY_APPROVE_RE: generic approvals (はい/OK/いいよ…) only
+    # unlock a deletion the user has SEEN in the two-phase flow — a stray
+    # "OK" must not authorize a deletion the model decided on by itself.
+    # Lookbehinds keep 取り消して ("cancel that") from reading as delete
+    # consent while やっぱり消して still matches.
+    _MEMORY_DELETE_DIRECT_RE = re.compile(
+        r"((?<!取り)消して|(?<!取り)消せ|消そう|消してもいい|消しちゃって|"
+        r"削除して|削除しよう|删吧|删了|删掉|可以删|同意删除|"
+        r"delete (it|that|this))"
     )
     _MEMORY_DELETE_TTL_S = 900.0
 
@@ -4379,6 +5014,7 @@ class BasicMemoryAgent(AgentInterface):
                 result = await mgr.update_fact_manual(
                     str(args.get("fact_id", "")).strip(),
                     str(args.get("new_fact", "")),
+                    importance=(str(args.get("importance", "")).strip() or None),
                 )
             elif name == "memory_delete":
                 result = await self._memory_delete_flow(args)
@@ -4556,6 +5192,15 @@ class BasicMemoryAgent(AgentInterface):
                     "status": "error",
                     "message": "userレベルの記憶は本人管理のため削除できない。",
                 }
+            # Fast path: his own current message explicitly asks for the
+            # deletion — the confirm round-trip would be pure friction.
+            tail = self._latest_user_text()[-200:]
+            if self._MEMORY_DELETE_DIRECT_RE.search(tail):
+                logger.info(
+                    f"[memory_tool] delete DIRECT ({fact_id}) — user's own "
+                    f"message asks for it: {fact.get('fact', '')[:80]}"
+                )
+                return await mgr.delete_fact_manual(fact_id)
             self._pending_memory_deletes[fact_id] = {
                 "fact": fact.get("fact", ""),
                 "staged_at": now,

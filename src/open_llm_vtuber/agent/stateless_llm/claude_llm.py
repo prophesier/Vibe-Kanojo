@@ -109,8 +109,12 @@ class AsyncLLM(StatelessLLMInterface):
             base_url (str): Base URL for Claude API
             llm_api_key (str): Claude API key
             system (str): System prompt
-            enable_web_search (bool): Declare Anthropic's native web_search
-                server tool so Claude can search the web on its own decision.
+            enable_web_search (bool): Advertise the CLIENT-side web_search
+                tool on the Claude chat path (executed in-process by the agent
+                via web_tools.web_search — brave/tavily). The native Anthropic
+                server tool is no longer declared: its result blocks are
+                replay bulk nothing may edit, while client results obey the
+                agent's 400-char protocol truncation after the turn.
             max_web_searches (int): Cap on searches per reply when enabled.
             enable_web_fetch (bool): Advertise the CLIENT-side web_fetch tool
                 on the Claude chat path (executed in-process by the agent via
@@ -136,11 +140,15 @@ class AsyncLLM(StatelessLLMInterface):
                 thinking is on the reply gets whatever reasoning leaves. One-
                 shot utility calls (memory, diary, fact extraction) pass their
                 own value and are unaffected.
-            thinking_replay_max_tokens (int): If a turn's billed thinking
-                exceeds this, the agent does NOT carry that turn's transcript
-                (thinking blocks + tool machinery) into later requests — the
-                turn falls back to plain text in context, keeping oversized
-                reasoning out of the cache prefix. 0 disables the cap.
+            thinking_replay_max_tokens (int): PER-ROUND replay cap (semantics
+                changed 08-09 from per-turn). Each tool-loop round whose
+                billed thinking exceeds this loses ONLY its thinking blocks
+                from later requests — the round's tool calls, results
+                (protocol-truncated) and text stay in the replayed
+                transcript, keeping oversized reasoning out of the cache
+                prefix without erasing the turn. The agent also uses it
+                in-round to decide when the moving cache breakpoint may
+                advance. 0 disables the cap.
         """
         self.model = model
         self.system = system
@@ -154,9 +162,9 @@ class AsyncLLM(StatelessLLMInterface):
         self._thinking_force = thinking_force
         self._thinking_budget = self._resolve_thinking_budget(thinking_budget)
         self._max_tokens = self._resolve_max_tokens(max_tokens)
-        # Public: read by the agent when deciding whether to carry a turn's
-        # thinking transcript into later requests. Echoed at startup for the
-        # usual typo'd-conf-key detection.
+        # Public: read by the agent as the PER-ROUND replay/marking cap for
+        # thinking transcripts. Echoed at startup for the usual
+        # typo'd-conf-key detection.
         try:
             self.thinking_replay_max_tokens = max(0, int(thinking_replay_max_tokens))
         except (TypeError, ValueError):
@@ -171,7 +179,9 @@ class AsyncLLM(StatelessLLMInterface):
         )
         if enable_web_search:
             logger.info(
-                f"Claude native web search enabled (max {max_web_searches}/reply)."
+                f"Claude web search enabled — CLIENT-side tool routed through "
+                f"web_tools.web_search (max {max_web_searches}/reply). The "
+                "native server tool is retired (uncacheable replay bulk)."
             )
         if enable_web_fetch:
             logger.info(
@@ -218,6 +228,23 @@ class AsyncLLM(StatelessLLMInterface):
 
         logger.info(f"Initialized Claude AsyncLLM with model: {self.model}")
         logger.debug(f"Base URL: {base_url}")
+
+    def set_thinking_force(self, force: bool) -> None:
+        """Runtime thinking-mode toggle (Discord /thinking).
+
+        Volatile by design — only this instance changes, conf.yaml stays the
+        source of truth for the next restart. Takes effect on the next API
+        request (thinking params are built per request).
+        """
+        self._thinking_force = bool(force)
+        if self._thinking_force and not _budget_tokens_removed(self.model):
+            mode = f"forced, budget={self._thinking_budget}"
+        else:
+            mode = f"adaptive, effort={self._thinking_effort}"
+        logger.info(
+            f"[thinking] runtime toggle: force={self._thinking_force} "
+            f"→ effective mode: {mode} (not persisted)"
+        )
 
     def _spawn_usage_log(
         self, out_toks: int, think_toks: Any, visible_text: str
@@ -490,32 +517,18 @@ class AsyncLLM(StatelessLLMInterface):
             # convert the remaining generic message blocks.
             converted_messages = self._convert_messages_format(messages)
 
-            # Build the tool list: caller-supplied tools plus Anthropic's
-            # native server tools when enabled. Both web_search and
-            # web_fetch run server-side within this same stream — no client
-            # round-trip — so we just declare them and parse the extra
-            # result blocks below.
-            #
-            # disable_server_tools=True skips auto-injection: callers that
-            # do one-shot non-chat work (fact extraction, diary creation,
-            # fact pruning, consolidation) don't want or need web tools,
-            # and we'd otherwise pay a couple hundred wasted tokens per
-            # call shipping the unused tool defns.
+            # Tool list comes entirely from the caller. Anthropic's native
+            # server tools are fully retired on this path: web_fetch because
+            # Claude Opus 5 dropped it, web_search because its result blocks
+            # are replay bulk nothing may edit — a single search parked
+            # 10-16k tokens in every later request of the session, immune to
+            # the agent's tool_result truncation. Both now run client-side
+            # through web_tools (see _build_web_fetch_tool_claude /
+            # _build_web_search_tool_claude in the agent), so results are
+            # ordinary tool_result blocks capped at 400 chars once the turn
+            # ends. The server-tool streaming handlers below stay as
+            # defensive parsing only.
             final_tools = list(tools) if tools else []
-            if not disable_server_tools and self._enable_web_search:
-                final_tools.append(
-                    {
-                        "type": "web_search_20250305",
-                        "name": "web_search",
-                        "max_uses": self._max_web_searches,
-                    }
-                )
-            # web_fetch is deliberately NOT declared as a native server tool
-            # anymore: Claude Opus 5 dropped the tool entirely, and we run our
-            # own client-side fetch (web_tools.web_fetch) on both provider
-            # paths instead — one implementation, one behavior. The agent
-            # advertises it as a regular client tool (see
-            # _build_web_fetch_tool_claude) gated on enable_web_fetch.
 
             logger.debug(f"Sending messages to Claude API: {converted_messages}")
             logger.debug(f"Tools provided: {final_tools}")

@@ -62,6 +62,9 @@ class SeedCaptureTests(unittest.IsolatedAsyncioTestCase):
                 "model": "claude-opus-4-6",
                 "protocol": [FINAL],
                 "thinking_tokens": 0,
+                # Per-round breakdown (08-09): one entry per protocol
+                # assistant message, for reload re-trimming.
+                "round_thinking": [0],
             },
         )
         self.assertIsNone(agent.pop_thinking_seed(), "pop must be one-shot")

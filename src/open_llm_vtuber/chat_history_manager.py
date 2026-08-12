@@ -99,6 +99,7 @@ def store_message(
     name: str | None = None,
     avatar: str | None = None,
     thinking_seed: dict | None = None,
+    context_excluded: str | None = None,
 ):
     """Store a message in a specific history file
 
@@ -113,6 +114,11 @@ def store_message(
             ({"model": ..., "content": [blocks]}) persisted alongside the
             visible text so a restart can re-seed thinking precedent
             (see basic_memory_agent._apply_thinking_seeds)
+        context_excluded: Reason tag (e.g. "api_error") marking a record that
+            stays on disk for the human reader but is NEVER assembled into
+            the LLM context (あさひ 08-05: an API-error turn must not reload
+            — an invisible hole taught the model that user turns can repeat,
+            seeding hallucinated inputs)
     """
     if not conf_uid or not history_uid:
         if not conf_uid:
@@ -147,6 +153,8 @@ def store_message(
         new_item["avatar"] = avatar
     if thinking_seed is not None:
         new_item["thinking_seed"] = thinking_seed
+    if context_excluded:
+        new_item["context_excluded"] = context_excluded
 
     history_data.append(new_item)
 
@@ -185,6 +193,42 @@ def pop_last_message(
     logger.info(
         f"Removed last '{expected_role}' message from history {history_uid} "
         f"({len(str(removed.get('content', '')))} chars)."
+    )
+    return True
+
+
+def mark_last_message_excluded(
+    conf_uid: str,
+    history_uid: str,
+    expected_role: Literal["human", "ai"],
+    reason: str,
+) -> bool:
+    """Tag the NEWEST message with ``context_excluded`` if it matches
+    ``expected_role``.
+
+    Used by the API-error path: the failed turn's user input stays on disk
+    for the human reader, but must never be assembled back into the LLM
+    context (see store_message's context_excluded). The role guard makes a
+    mistimed call a no-op. Returns True when a record was tagged."""
+    if not conf_uid or not history_uid:
+        return False
+    filepath = _get_safe_history_path(conf_uid, history_uid)
+    if not os.path.exists(filepath):
+        return False
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            history_data = json.load(f)
+    except Exception:
+        logger.error(f"Failed to load history file: {filepath}")
+        return False
+    if not history_data or history_data[-1].get("role") != expected_role:
+        return False
+    history_data[-1]["context_excluded"] = reason
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(history_data, f, ensure_ascii=False, indent=2)
+    logger.info(
+        f"Marked last '{expected_role}' message of history {history_uid} "
+        f"context_excluded={reason!r}."
     )
     return True
 

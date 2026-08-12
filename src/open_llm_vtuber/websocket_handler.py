@@ -37,6 +37,7 @@ from .alarms import get_alarm_store
 from .alarms import wake_audio
 from .alarms.scheduler import AlarmScheduler
 from .alarms.prompts import build_fire_prompt
+from .pidfile import read_backfill_settled_at
 
 
 class MessageType(Enum):
@@ -80,6 +81,9 @@ class WebSocketHandler:
         self.default_context_cache = default_context_cache
         self.received_data_buffers: Dict[str, np.ndarray] = {}
 
+        # Process start time — reference point for the alarm/backfill gate
+        # (ignores settle markers left on disk by a previous run).
+        self._server_started_at: float = time.time()
         # Global session registry: one active session per conf_uid shared across
         # all connected clients (web + proxy).  Prevents a second client from
         # auto-creating a duplicate session when another is already running.
@@ -148,6 +152,7 @@ class WebSocketHandler:
             "expression-capture-begin": self._handle_expression_capture_begin,
             "expression-capture-chunk": self._handle_expression_capture_chunk,
             "expression-capture-done": self._handle_expression_capture_done,
+            "set-thinking-mode": self._handle_set_thinking_mode,
         }
 
     async def handle_new_connection(
@@ -876,10 +881,42 @@ class WebSocketHandler:
         except Exception as e:
             logger.warning(f"[wake] stop failed ({reason}): {e}")
 
+    # Alarm-vs-backfill window (あさひ 08-07): an overdue alarm fired 20s after
+    # boot, beating startup backfill by 39s — backfill then rewrote the facts
+    # header and turn 2 kept only 13% of its prompt cache. Delivery defers
+    # (the scheduler already retries every 20s) until the settle marker is
+    # fresh, plus a grace for trailing file/index writes. Fail-open after a
+    # ceiling: a wake alarm that never rings is worse than a cache rewrite.
+    _ALARM_BACKFILL_GRACE_S = 10.0
+    _ALARM_BACKFILL_MAX_WAIT_S = 180.0
+
+    def _alarm_backfill_gate(self) -> bool:
+        """True when alarm delivery may proceed (startup backfill settled,
+        grace elapsed, or the fail-open ceiling passed). Covers both alarm
+        shapes: already overdue at boot, and coming due inside the window."""
+        waited = time.time() - self._server_started_at
+        if waited > self._ALARM_BACKFILL_MAX_WAIT_S:
+            return True
+        if not any(
+            getattr(ctx, "memory_manager", None)
+            for ctx in self.client_contexts.values()
+        ):
+            return True  # no persistent memory → no backfill window to avoid
+        settled_at = read_backfill_settled_at()
+        if settled_at is not None and settled_at >= self._server_started_at:
+            return (time.time() - settled_at) >= self._ALARM_BACKFILL_GRACE_S
+        logger.info(
+            "[alarm] delivery deferred: startup backfill not settled yet "
+            f"({waited:.0f}s since boot; scheduler will retry)."
+        )
+        return False
+
     async def _deliver_alarms(self, due: List[dict]) -> bool:
         """Scheduler callback: speak the due alarm(s) on the best end. Returns
         False if nothing could receive it (the scheduler retries later)."""
         async with self._alarm_delivery_lock:
+            if not self._alarm_backfill_gate():
+                return False
             if self._pick_alarm_target() is None:
                 return False
             prompt = build_fire_prompt(due)
@@ -1153,6 +1190,27 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error sending heartbeat acknowledgment: {e}")
 
+    async def _handle_set_thinking_mode(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Runtime forced/adaptive thinking toggle (Discord ``/thinking``).
+
+        Volatile: only the live LLM instance changes — conf.yaml remains the
+        source of truth for the next restart. The agent is shared across
+        contexts, so one toggle applies globally.
+        """
+        context = self.client_contexts.get(client_uid)
+        agent = getattr(context, "agent_engine", None) if context else None
+        setter = getattr(agent, "set_thinking_mode", None)
+        if callable(setter):
+            result = setter(str(data.get("mode") or ""))
+        else:
+            result = {"ok": False, "error": "agent has no thinking-mode support"}
+        logger.info(f"[thinking] set-thinking-mode via {client_uid}: {result}")
+        await websocket.send_text(
+            json.dumps({"type": "thinking-mode-result", **result})
+        )
+
     async def _handle_request_expression_capture(
         self, websocket: WebSocket, client_uid: str, data: WSMessage
     ) -> None:
@@ -1209,7 +1267,11 @@ class WebSocketHandler:
         try:
             if os.path.isdir(out_dir):
                 for name in os.listdir(out_dir):
-                    if name.endswith(".png"):
+                    # manual_<idx>.png are Discord-only expressions, placed by
+                    # hand (no Live2D counterpart, so the frontend can never
+                    # regenerate them) — the refresh only owns its own
+                    # captures (<idx>.png).
+                    if name.endswith(".png") and not name.startswith("manual_"):
                         os.remove(os.path.join(out_dir, name))
             os.makedirs(out_dir, exist_ok=True)
         except Exception as e:

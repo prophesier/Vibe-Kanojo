@@ -186,7 +186,6 @@ class HistoryNoteRoutingTests(unittest.TestCase):
     def test_opus5_gets_lean_note(self):
         note = self._agent_with_model("claude-opus-5")._history_note()
         self.assertIs(note, BasicMemoryAgent._HISTORY_NOTE_LEAN)
-        self.assertNotIn("[Thinking]", note)
 
     def test_opus46_keeps_full_note(self):
         note = self._agent_with_model("claude-opus-4-6")._history_note()
@@ -202,11 +201,15 @@ class HistoryNoteRoutingTests(unittest.TestCase):
             "web_fetch",
             # Full strict time rules restored 07-26 (time errors persisted).
             "時間に関する厳格なルール",
+            # [Thinking] restored to the lean note 08-09 (あさひ: Opus 5
+            # still occasionally skips thinking and errs) — verbatim copy.
+            "[Thinking]",
+            "Think first, every time.",
         ):
             self.assertIn(anchor, note)
-        # 4.6-era nudges must be absent from the lean variant (and present in
-        # the full one).
-        for dropped in ("[Thinking]", "Strict rules on executing tools"):
+        # The no-false-report block stays dropped from the lean variant (and
+        # present in the full one).
+        for dropped in ("Strict rules on executing tools",):
             self.assertNotIn(dropped, note)
             self.assertIn(dropped, BasicMemoryAgent._HISTORY_NOTE)
 

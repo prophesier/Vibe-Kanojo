@@ -102,7 +102,13 @@ class ProtocolTruncationTests(unittest.TestCase):
 
 
 class ErrorPathCommitTests(unittest.IsolatedAsyncioTestCase):
-    async def test_partial_text_survives_stream_error(self):
+    async def test_stream_error_drops_the_whole_turn(self):
+        """あさひ 08-05 (hallucination incident): an errored turn leaves the
+        context entirely — partial text included (the user is told to resend,
+        so replaying half a reply against the re-sent input would desync).
+        The old behavior (partial text committed + raw [Error from LLM] line)
+        is exactly what seeded record #123. Full spec: test_api_error_turn."""
+
         class _ErrLLM:
             async def chat_completion(self, messages, system=None, tools=None):
                 yield {"type": "text_delta", "text": "前半だけ話した。"}
@@ -110,7 +116,7 @@ class ErrorPathCommitTests(unittest.IsolatedAsyncioTestCase):
 
         agent = BasicMemoryAgent.__new__(BasicMemoryAgent)
         agent._llm = _ErrLLM()
-        agent._memory = []
+        agent._memory = [{"role": "user", "content": "hi"}]
         agent._memory_manager = None
         agent._build_system_for_llm = lambda: "system"
         agent._check_stateful_claims = lambda text: None
@@ -121,11 +127,10 @@ class ErrorPathCommitTests(unittest.IsolatedAsyncioTestCase):
                 [{"role": "user", "content": "hi"}], []
             )
         ]
-        self.assertEqual(output, ["前半だけ話した。", "[Error from LLM: boom]"])
-        self.assertEqual(
-            agent._memory[-1],
-            {"role": "assistant", "content": "前半だけ話した。"},
-        )
+        self.assertEqual(output[0], "前半だけ話した。")
+        self.assertIn("⚠️ APIエラー", output[1])
+        self.assertEqual(agent._memory, [], "errored turn must leave no trace")
+        self.assertEqual(agent.pop_context_excluded(), "api_error")
 
 
 if __name__ == "__main__":
