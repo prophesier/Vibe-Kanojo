@@ -13,6 +13,7 @@ backup/
 # local launcher copies (tracked templates: *.example.bat)
 start_all.bat
 start_all_resume.bat
+start_all_lite.bat
 restart.bat
 
 # ignore non-default background images
@@ -84,6 +85,13 @@ openapi_memgpt.json
 # memory log
 mem.json
 conf.yaml.backup
+*.backup
+
+# one-shot diagnostic probes and their dumps (underscore convention):
+# _-prefixed files under experiments/ are throwaway forensics, never repo
+# content — they may quote personal data (store ids, session shapes).
+experiments/_*
+experiments/*/_*
 
 *.exe
 
