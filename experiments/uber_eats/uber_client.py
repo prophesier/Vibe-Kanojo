@@ -180,6 +180,20 @@ def _item_endorsement(it: Dict[str, Any]) -> Dict[str, Any]:
     return {"like_rate": "", "num_ratings": 0, "top_liked_rank": 0}
 
 
+def _item_promo(it: Dict[str, Any]) -> Dict[str, Any]:
+    """A catalog item's promo badge — the red card label (「30% オフ」,
+    「写真のアップロードで ￥446 分の Uber Cash を獲得」…), which the parsers
+    silently dropped until 08-11 (あさひ spotted a discount ヒロ couldn't see).
+    Specimen-verified shape: ``promoInfo.promoBadge.accessibilityText`` holds
+    the full human-readable text. Only promoted items carry promoInfo, so
+    plain items add nothing to the tool output. Reverse gap documented in
+    PROJECT.md: app-targeted offers (店舗限定オファー) never appear in this
+    web-session payload at all — this parses only what the surface sends."""
+    badge = (it.get("promoInfo") or {}).get("promoBadge") or {}
+    text = str(badge.get("accessibilityText") or "").strip()
+    return {"promo": text} if text else {}
+
+
 def _parse_store_card(st: Dict[str, Any]) -> Dict[str, Any]:
     """Pull the search-card fields out of a getSearchFeedV1 store object: name,
     rating (+ review count), delivery fee, ETA, sponsored flag, and promos."""
@@ -625,6 +639,7 @@ class UberEatsClient:
                             "sold_out": bool(it.get("isSoldOut")),
                             "customizable": bool(it.get("hasCustomizations")),
                             **_item_endorsement(it),
+                            **_item_promo(it),
                         }
                     )
                     total += 1
@@ -738,6 +753,7 @@ class UberEatsClient:
                         "sold_out": bool(it.get("isSoldOut")),
                         "customizable": bool(it.get("hasCustomizations")),
                         **_item_endorsement(it),
+                        **_item_promo(it),
                     }
                 )
                 if len(items) >= max_items:
@@ -829,6 +845,9 @@ class UberEatsClient:
             "sold_out": bool(d.get("isSoldOut")),
             "tags": tags + dietary,
             "customizations": _parse_customizations(d.get("customizationsList")),
+            # getMenuItemV1's promoInfo shape is unverified (no specimen yet);
+            # the read is harmless — absent field → no key in the output.
+            **_item_promo(d),
         }
 
     async def close(self) -> None:
