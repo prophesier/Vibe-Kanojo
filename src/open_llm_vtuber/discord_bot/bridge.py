@@ -37,6 +37,10 @@ class TurnResult:
     # Expression index for the face to attach on Discord: the LLM-marked primary
     # if any, otherwise the first expression seen this turn.
     face_index: Optional[int] = None
+    # Set when the server reports a deliberately silent turn ("think-only" /
+    # "tool-only"): she produced a transcript but chose not to speak. Lets the
+    # bot show an honest notice instead of a bare "(no reply)".
+    no_speech_reason: Optional[str] = None
 
     @property
     def text(self) -> str:
@@ -88,6 +92,8 @@ class OLVBridge:
         self._turn_lock = asyncio.Lock()
         # Resolves when an expression-capture-complete arrives (for /refresh-faces).
         self._capture_future: Optional[asyncio.Future] = None
+        # Resolves when a thinking-mode-result arrives (for /thinking).
+        self._thinking_future: Optional[asyncio.Future] = None
         # Server-initiated (proactive) turns — e.g. a fired alarm or a cache
         # keepalive — arrive with no pending request. Buffer their text + face
         # and flush on chain-end.
@@ -156,6 +162,27 @@ class OLVBridge:
             return await asyncio.wait_for(self._capture_future, timeout=timeout)
         finally:
             self._capture_future = None
+
+    async def request_thinking_mode(
+        self, mode: str, *, timeout: float = 10.0
+    ) -> dict[str, Any]:
+        """Toggle forced/adaptive thinking on the server (volatile, not
+        persisted — a restart returns to conf.yaml). Returns the server's
+        result dict (``ok``/``requested``/``effective``/``model``/``error``).
+        Raises on timeout or if the bridge is not connected.
+        """
+        if self._ws is None:
+            raise RuntimeError("bridge not connected")
+        loop = asyncio.get_running_loop()
+        self._thinking_future = loop.create_future()
+        try:
+            async with self._send_lock:
+                await self._ws.send(
+                    json.dumps({"type": "set-thinking-mode", "mode": mode})
+                )
+            return await asyncio.wait_for(self._thinking_future, timeout=timeout)
+        finally:
+            self._thinking_future = None
 
     async def send_text(
         self,
@@ -294,6 +321,19 @@ class OLVBridge:
             if fut is not None and not fut.done():
                 fut.set_result(
                     {"count": data.get("count", 0), "error": data.get("error")}
+                )
+            return
+
+        if msg_type == "thinking-mode-result":
+            fut = self._thinking_future
+            if fut is not None and not fut.done():
+                fut.set_result(dict(data))
+            return
+
+        if msg_type == "turn-no-speech":
+            if self._current_turn is not None:
+                self._current_turn.result.no_speech_reason = (
+                    data.get("reason") or "unknown"
                 )
             return
 

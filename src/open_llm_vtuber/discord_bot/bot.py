@@ -28,6 +28,10 @@ from .bridge import OLVBridge, TurnResult
 from ..chat_history_manager import get_recent_histories
 
 _IMAGE_MIME_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+# Per-attempt cap for one attachment download. A healthy CDN serves a phone
+# photo in <2s; without this cap a hung response is only reaped by aiohttp's
+# default 300s total timeout.
+_ATTACHMENT_TIMEOUT_S = 15.0
 # Longest side (px) of the expression face sent to Discord. Downscaled from the
 # higher-res cache on send (keeps detail); tune for size vs sharpness.
 _FACE_SEND_MAX_DIM = 280
@@ -46,29 +50,62 @@ _CONSOLIDATION_LLM_PROVIDERS = frozenset(
 )
 
 
+async def _read_attachment(att: discord.Attachment) -> bytes:
+    """Download attachment bytes with per-attempt timeouts and a proxy fallback.
+
+    2026-07-31 two phone uploads hung on the primary CDN url until aiohttp's
+    default 300s total timeout (TCP connected, response never came), so the
+    channel sat silent for five minutes and the turn was then sent without the
+    image. The media-proxy url (``use_cached=True``) is a different domain and
+    a separate path to the same bytes, so it is worth one retry there.
+    """
+    try:
+        return await asyncio.wait_for(att.read(), timeout=_ATTACHMENT_TIMEOUT_S)
+    except Exception as e:
+        logger.warning(
+            f"Attachment {att.filename!r} failed via CDN url "
+            f"({type(e).__name__}: {e}); retrying via media proxy"
+        )
+    return await asyncio.wait_for(
+        att.read(use_cached=True), timeout=_ATTACHMENT_TIMEOUT_S
+    )
+
+
 async def _collect_images(
     attachments: list[discord.Attachment],
-) -> list[dict]:
-    """Download image attachments and return base64-encoded OLV image dicts."""
-    result = []
+) -> tuple[list[dict], list[str]]:
+    """Download image attachments.
+
+    Returns ``(images, failed)`` — base64-encoded OLV image dicts for the
+    attachments that downloaded, and filenames of the ones that did not
+    (the caller owns telling the user; a silently dropped image reads as
+    the character ignoring it).
+    """
+    result: list[dict] = []
+    failed: list[str] = []
     for att in attachments:
         mime = (att.content_type or "").split(";")[0].strip()
         if mime not in _IMAGE_MIME_TYPES:
             continue
         try:
-            data = await att.read()
-            encoded = base64.b64encode(data).decode()
-            result.append(
-                {
-                    "source": "upload",
-                    # basic_memory_agent expects a data URL, not raw base64.
-                    "data": f"data:{mime};base64,{encoded}",
-                    "mime_type": mime,
-                }
-            )
+            data = await _read_attachment(att)
         except Exception as e:
-            logger.warning(f"Failed to download attachment {att.filename!r}: {e}")
-    return result
+            logger.warning(
+                f"Failed to download attachment {att.filename!r}: "
+                f"{type(e).__name__}: {e}"
+            )
+            failed.append(att.filename)
+            continue
+        encoded = base64.b64encode(data).decode()
+        result.append(
+            {
+                "source": "upload",
+                # basic_memory_agent expects a data URL, not raw base64.
+                "data": f"data:{mime};base64,{encoded}",
+                "mime_type": mime,
+            }
+        )
+    return result, failed
 
 
 def _allowed(value: object, whitelist: Iterable[int]) -> bool:
@@ -287,6 +324,69 @@ class DiscordVTuberBot(discord.Client):
             if len(msgs) > 1:
                 lines.append(f"末条: {_preview(msgs[-1])}")
             await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+        @self._tree.command(
+            name="thinking",
+            description="思考モード熱切替: forced=毎ターン強制思考 / adaptive=自動判断 (admin only)",
+        )
+        @app_commands.describe(
+            mode="切替先モード。保存はされない — 再起動すると conf.yaml の設定に戻る"
+        )
+        async def thinking_cmd(
+            interaction: discord.Interaction,
+            mode: Literal["forced", "adaptive"],
+        ) -> None:
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                result = await self._bridge.request_thinking_mode(mode)
+            except Exception as e:
+                await interaction.followup.send(
+                    f"切替失敗: {type(e).__name__}: {e}", ephemeral=True
+                )
+                return
+            if not result.get("ok"):
+                await interaction.followup.send(
+                    f"切替失敗: {result.get('error')}", ephemeral=True
+                )
+                return
+            effective = result.get("effective")
+            desc = "毎ターン強制思考" if effective == "forced" else "自動判断"
+            lines = [f"思考モードを **{effective}**（{desc}）に切り替えた。"]
+            if effective != result.get("requested"):
+                lines.append(
+                    f"※ このモデル（{result.get('model')}）では forced が"
+                    "使えないため adaptive として動作する。"
+                )
+            lines.append("この切替は保存されない — 再起動後は conf.yaml の設定に戻る。")
+            await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+        @self._tree.command(
+            name="wake",
+            description="PC 定時起動: arm=次の wake アラームに合わせ登録 / status / cancel (admin only)",
+        )
+        @app_commands.describe(
+            action="arm: 24h以内で最も早い wake=true アラームに登録 / status: 確認 / cancel: 解除",
+            lead_minutes="アラームの何分前に PC を起こすか (arm のみ, 既定 10)",
+        )
+        async def wake_cmd(
+            interaction: discord.Interaction,
+            action: Literal["arm", "status", "cancel"],
+            lead_minutes: app_commands.Range[int, 1, 120] = 10,
+        ) -> None:
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                out = await self._run_wake_script(action, lead_minutes)
+            except Exception as e:
+                out = f"wake script failed: {type(e).__name__}: {e}"
+            if action == "arm" and "arm: OK" in out:
+                out += "\n手順: このあとサーバーを止めて、スリープしてよい。"
+            await interaction.followup.send(f"```\n{out[:1800]}\n```", ephemeral=True)
 
         @self._tree.command(
             name="status",
@@ -701,6 +801,34 @@ class DiscordVTuberBot(discord.Client):
             return f"{m}m {s}s"
         return f"{s}s"
 
+    async def _run_wake_script(self, action: str, lead_minutes: int) -> str:
+        """Shell out to scripts/wake_task.ps1 (the single wake-task impl).
+
+        The script owns all logic (arm/status/cancel + the wake-time action);
+        this is a thin relay so the same behavior is reachable from a terminal
+        when the server stack is down. Script output is UTF-8 by contract
+        (it sets [Console]::OutputEncoding itself).
+        """
+        script = Path(__file__).resolve().parents[3] / "scripts" / "wake_task.ps1"
+        args = [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            action,
+        ]
+        if action == "arm":
+            args += ["-LeadMinutes", str(lead_minutes)]
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        return out.decode("utf-8", errors="replace").strip() or "(no output)"
+
     async def _request_restart(
         self, interaction: discord.Interaction, *, resume: bool
     ) -> None:
@@ -1013,11 +1141,19 @@ class DiscordVTuberBot(discord.Client):
         self._remember_proactive_channel(message.channel.id)
 
         content = (message.content or "").strip()
-        images = (
-            await _collect_images(message.attachments) if message.attachments else []
+        images, failed_images = (
+            await _collect_images(message.attachments)
+            if message.attachments
+            else ([], [])
         )
 
         if not content and not images:
+            # An image-only message whose downloads all failed would otherwise
+            # vanish without a trace — no OLV turn, no reply, nothing.
+            if failed_images:
+                await self._notify_failed_images(
+                    message, failed_images, delivered=False
+                )
             return
 
         if self._mentions_only:
@@ -1037,8 +1173,12 @@ class DiscordVTuberBot(discord.Client):
         logger.info(
             f"[discord→olv] guild={message.guild and message.guild.id} "
             f"channel={message.channel.id} user={message.author.id} "
-            f"req={request_id} text={content!r} images={len(images)}"
+            f"req={request_id} text={content!r} images={len(images)} "
+            f"failed_images={len(failed_images)}"
         )
+
+        if failed_images:
+            await self._notify_failed_images(message, failed_images, delivered=True)
 
         async def _on_reply(result: TurnResult) -> None:
             await self._post_reply(message, result)
@@ -1065,7 +1205,15 @@ class DiscordVTuberBot(discord.Client):
             await self._safe_reply(source, f"(error: {result.error})")
             return
         if not result.text:
-            await self._safe_reply(source, "(no reply)")
+            # Silent-by-choice turns get an honest notice (08-07 think-only
+            # incident: a bare "(no reply)" reads as a malfunction and invites
+            # "did you say nothing?" confusion). Anything else keeps the
+            # legacy marker — genuinely empty turns are still anomalies.
+            notice = {
+                "think-only": "(思考のみ、発話なし)",
+                "tool-only": "(ツール実行のみ、発話なし)",
+            }.get(result.no_speech_reason or "", "(no reply)")
+            await self._safe_reply(source, notice)
             return
 
         delivered = True
@@ -1296,7 +1444,15 @@ class DiscordVTuberBot(discord.Client):
         if self._full_config is None:
             return
         conf_uid = self._full_config.character_config.conf_uid
-        path = Path("cache") / "discord_faces" / conf_uid / f"{face_index}.png"
+        faces_dir = Path("cache") / "discord_faces" / conf_uid
+        # Discord-only expressions come first: manual_<idx>.png, hand-placed
+        # for emotionMap keys that point at out-of-range Live2D indices (the
+        # frontend no-ops on those, so Discord is their only surface). They
+        # survive both /refresh-faces and the cache wipe. Fall back to the
+        # frontend-captured <idx>.png.
+        path = faces_dir / f"manual_{face_index}.png"
+        if not path.is_file():
+            path = faces_dir / f"{face_index}.png"
         if not path.is_file():
             return
         try:
@@ -1321,6 +1477,22 @@ class DiscordVTuberBot(discord.Client):
             self._last_face_index = face_index
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to send expression face {face_index}: {e}")
+
+    async def _notify_failed_images(
+        self, source: discord.Message, failed: list[str], *, delivered: bool
+    ) -> None:
+        """Tell the user which attachments never reached the character.
+
+        Without this the failure is invisible from Discord: the text half of
+        the message still gets a normal reply, so the character just seems to
+        have ignored the image (2026-07-31, IMG_8860.png ×2 — the user had to
+        read server logs to find out).
+        """
+        names = ", ".join(failed)
+        outcome = "画像抜きで送信" if delivered else "メッセージは送信されない"
+        await self._safe_reply(
+            source, f"(画像のダウンロードに失敗した: {names} — {outcome})"
+        )
 
     async def _safe_reply(self, source: discord.Message, content: str) -> bool:
         """Send a message to the channel, retrying transient failures.

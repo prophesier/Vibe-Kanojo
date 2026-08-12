@@ -60,7 +60,7 @@ if exist pids\discord.pid (
 
 echo Re-launching OLV and Discord bot from local code...
 start "OLV" /D "%PROJECT_DIR%" cmd /c "call conda activate %CONDA_ENV% && python run_server.py %OLV_ARGS%"
-start "Discord" /D "%PROJECT_DIR%" cmd /c "timeout /t 5 /nobreak >nul && call conda activate %CONDA_ENV% && python scripts\run_discord_bot.py"
+start "Discord" /D "%PROJECT_DIR%" cmd /c "timeout /t 15 /nobreak >nul && call conda activate %CONDA_ENV% && python scripts\run_discord_bot.py"
 
 endlocal
 exit /b 0

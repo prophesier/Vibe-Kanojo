@@ -23,4 +23,4 @@ if "%OLV_DIR:~-1%"=="\" set "OLV_DIR=%OLV_DIR:~0,-1%"
 
 REM Only OLV needs the resume flag (--resume); Discord + TTS launch normally and
 REM adopt the continued session automatically when they connect.
-wt new-tab --title OLV -d "%OLV_DIR%" cmd /k "call conda activate %CONDA_ENV% && python run_server.py --resume" ; new-tab --title Discord -d "%OLV_DIR%" cmd /k "timeout /t 5 && call conda activate %CONDA_ENV% && python scripts\run_discord_bot.py" ; new-tab --title TTS -d "%TTS_DIR%" cmd /k "runtime\python.exe api_v2.py"
+wt new-tab --title OLV -d "%OLV_DIR%" cmd /k "call conda activate %CONDA_ENV% && python run_server.py --resume" ; new-tab --title Discord -d "%OLV_DIR%" cmd /k "timeout /t 15 && call conda activate %CONDA_ENV% && python scripts\run_discord_bot.py" ; new-tab --title TTS -d "%TTS_DIR%" cmd /k "runtime\python.exe api_v2.py"
