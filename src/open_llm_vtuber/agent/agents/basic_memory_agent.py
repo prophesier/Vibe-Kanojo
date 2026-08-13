@@ -399,9 +399,31 @@ class BasicMemoryAgent(AgentInterface):
     # Cap on tool_result content stored in the cross-turn protocol. The live
     # tool loop always sees full results; this trims only what later turns
     # replay, where the useful content already lives in the visible reply
-    # text. Chars, not tokens: cheap and close enough (JA≈1, EN≈4 chars/tok).
-    _PROTOCOL_RESULT_MAX_CHARS = 400
+    # text. Counted in EFFECTIVE TOKENS, not chars (あさひ 08-13: the old
+    # 400-char cap silently metered English by the LETTER — 400 chars is
+    # ~360 tok of Japanese but only ~105 tok of English, so web_search got
+    # 3.5× less through). Integer milli-token weights keep the cut position
+    # deterministic: CJK-range chars ≈0.9 tok, everything else ≈1/3.8 tok.
+    # 500 was picked from the 08-10..13 log survey (68/108 calls truncated):
+    # it lets set_alarm confirmations (448–535 JA chars) through whole —
+    # alarm honesty evidence, the 07-26 lesson — and web_search's EN median
+    # (~380 tok-equiv) survives intact, while the uber/memory whales still
+    # trim hard.
+    _PROTOCOL_RESULT_BUDGET_MILLITOK = 500 * 1000
+    _MILLITOK_CJK = 900  # chars above U+2E7F
+    _MILLITOK_OTHER = 263  # ≈1/3.8 tok per char
     _PROTOCOL_TRUNCATION_MARKER = "…[truncated for replay]"
+
+    @classmethod
+    def _token_cut(cls, text: str, budget_millitok: int) -> tuple:
+        """(cut_index, consumed) — cut_index is -1 when ``text`` fits."""
+        acc = 0
+        for i, ch in enumerate(text):
+            w = cls._MILLITOK_CJK if ord(ch) > 0x2E7F else cls._MILLITOK_OTHER
+            if acc + w > budget_millitok:
+                return i, acc
+            acc += w
+        return -1, acc
     # Tools whose results are exempt from the replay cap (あさひ 08-13:
     # reading a diary in full = injecting it — the content IS the point, so
     # it must survive replay verbatim). Exempt results are trivially
@@ -628,24 +650,25 @@ class BasicMemoryAgent(AgentInterface):
 
     @classmethod
     def _truncate_tool_result_block(cls, block: Dict[str, Any]) -> Dict[str, Any]:
-        limit = cls._PROTOCOL_RESULT_MAX_CHARS
+        budget = cls._PROTOCOL_RESULT_BUDGET_MILLITOK
         marker = cls._PROTOCOL_TRUNCATION_MARKER
         content = block.get("content")
         if isinstance(content, str):
             if cls._UBER_FACTS_END in content:
                 # The related-facts section persists whole; the replay budget
-                # applies to the payload after it (あさひ: 400字は facts の
+                # applies to the payload after it (あさひ: 予算は facts の
                 # 後から数える).
                 head, sep, tail = content.partition(cls._UBER_FACTS_END)
-                if len(tail) <= limit:
+                cut, _ = cls._token_cut(tail, budget)
+                if cut < 0:
                     return block
-                return {**block, "content": head + sep + tail[:limit] + marker}
-            if len(content) <= limit:
+                return {**block, "content": head + sep + tail[:cut] + marker}
+            cut, _ = cls._token_cut(content, budget)
+            if cut < 0:
                 return block
-            return {**block, "content": content[:limit] + marker}
+            return {**block, "content": content[:cut] + marker}
         if isinstance(content, list):
             new_blocks: List[Dict[str, Any]] = []
-            budget = limit
             changed = False
             for b in content:
                 if isinstance(b, dict) and b.get("type") == "text":
@@ -653,10 +676,13 @@ class BasicMemoryAgent(AgentInterface):
                     if budget <= 0:
                         changed = True
                         continue
-                    if len(text) > budget:
-                        b = {**b, "text": text[:budget] + marker}
+                    cut, consumed = cls._token_cut(text, budget)
+                    if cut >= 0:
+                        b = {**b, "text": text[:cut] + marker}
                         changed = True
-                    budget -= min(len(text), budget)
+                        budget = 0
+                    else:
+                        budget -= consumed
                     new_blocks.append(b)
                 else:
                     # Images and other non-text payloads are pure replay bulk
