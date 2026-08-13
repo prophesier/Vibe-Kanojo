@@ -66,6 +66,50 @@ _RERANK_SYSTEM = (
 )
 
 
+# Sentence-mode variant (diary RAG only; facts keep the whole-entry judge).
+# Same 07-24 strictness core, but the judge now picks SENTENCES inside each
+# relevant diary: ordering exists only at diary granularity (あさひ 08-13 —
+# intra-diary sentence order is chronology/semantics and must not be ranked),
+# sentences already in context are marked 注入済み and must not be re-picked,
+# and picking nothing from a masked diary is an explicitly normal outcome.
+_RERANK_SENTENCE_SYSTEM = (
+    "あなたは記憶検索の関連性判定ツールです。これは会話ではありません。"
+    "ロールプレイやキャラクターとしての応答はせず、判定結果のみを出力してください。\n\n"
+    "AIキャラクターへのユーザーの「最後のユーザー発言」と、自動検索された"
+    "「日記の候補」のリストが与えられます。各候補の本文は s1, s2, … と"
+    "文番号付きで示されます。あなたの仕事は、キャラクターがその発言に返答する"
+    "にあたって、**その文の具体的な中身を参照しなければ返答の質が落ちる・"
+    "事実を誤る**——という厳格な基準で、関連する日記と、その中の必要な文だけを"
+    "選ぶことです。\n\n"
+    "大原則:\n"
+    "- **判定対象は「最後のユーザー発言」ただ一つ**。添付される「最近の会話」は、"
+    "最後の発言に含まれる代名詞・指示語・省略を解決するための**参照解決専用**であり、"
+    "**関連性の根拠として使ってはならない**。\n"
+    "- **前の会話の話題と一致するだけの候補は選ばない**。最後の発言自身がその話題を"
+    "持ち出していない限り、それは過ぎた話題である。\n"
+    "- 関連 = 最後の発言に返答するとき、その文の中身を参照しないと"
+    "**返答が不正確になる・嘘をつく・的外れになる**もの。"
+    "「あれば会話が少し豊かになる」程度は関連ではない。\n"
+    "- **空配列が通常の結果である**。挨拶・相槌・スキンシップ・短い感情表現・"
+    "その場限りの雑談には、原則として何も要らない。\n"
+    "- 迷うときは**落とす**。\n\n"
+    "文の選び方:\n"
+    "- 日記単位では**関連度の高い順**に並べる。文単位の順序付けはしない"
+    "（文は日記内の番号で指定するだけでよい。提示順は原文順で復元される）。\n"
+    "- 関連する日記からは、核心の文に加えて、**その文が誤解なく読める分の"
+    "前後文も一緒に**選ぶ。1文だけの抜粋は場面・主語・経緯を失いやすい——"
+    "場面が伝わる最小のまとまり（目安2〜4文）で切り出すこと。\n"
+    "- 「注入済み」と表示された文は**既にキャラクターの文脈内にある**。"
+    "再選択してはならない。注入済みの部分だけで返答に足りるなら、"
+    "その日記からは何も選ばない（それも正常な結果である）。\n"
+    "- 関連する日記が複数あれば複数選んでよい。選択の合計はおおむね"
+    "{budget}文を目安にする（厳密な上限ではない）。\n\n"
+    "出力は関連する日記だけを関連度の高い順に並べ、各要素に候補番号・"
+    "選んだ文番号の配列・短い理由を一言添える。"
+    "関連するものが無ければ空配列を返す（それが通常の結果である）。"
+)
+
+
 def _schema(item: str) -> Dict[str, Any]:
     """Structured-output schema: ordered relevant items (1-based index + reason)."""
     return {
@@ -90,6 +134,50 @@ def _schema(item: str) -> Dict[str, Any]:
                             },
                         },
                         "required": ["index", "reason"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["relevant"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def _sentence_schema() -> Dict[str, Any]:
+    """Sentence-mode schema: ordered diaries, each with picked sentence numbers."""
+    return {
+        "name": "diary_sentence_relevance",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "relevant": {
+                    "type": "array",
+                    "description": (
+                        "Relevant diaries, most relevant first. Empty if none."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "index": {
+                                "type": "integer",
+                                "description": "1-based index of the diary candidate",
+                            },
+                            "sentences": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": (
+                                    "1-based sentence numbers (the sN labels) "
+                                    "picked from this diary"
+                                ),
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "short reason (a few words)",
+                            },
+                        },
+                        "required": ["index", "sentences", "reason"],
                         "additionalProperties": False,
                     },
                 }
@@ -184,3 +272,116 @@ class MemoryReranker:
                 picked["reason"] = str(item.get("reason", ""))[:60]
                 out.append(picked)
         return out
+
+    async def rerank_sentences(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+        context: str = "",
+        budget: int = 8,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Sentence-mode judge for diary RAG (あさひ 08-13 redesign).
+
+        ``candidates`` is ``[{"id", "date", "sents": [str, ...],
+        "injected": [int, ...]}, ...]`` — pre-split sentences (1-based sN
+        numbering matches the diary chunk index) plus the sentence numbers
+        already injected into context this session (the 既出 mask). Returns
+        ``[{"id", "date", "sents", "sentences": [int, ...], "reason"}, ...]``
+        in descending diary relevance, with ``sentences`` validated, deduped
+        and sorted ascending (intra-diary order is always original order).
+        ``[]`` means nothing relevant (the normal outcome). Returns ``None``
+        on any API/parse failure — the caller SKIPS injection this round
+        (宁缺勿整篇回退; no whole-diary fallback in sentence mode). Never
+        raises.
+        """
+        if not query or not candidates:
+            return []
+        blocks: List[str] = []
+        for i, c in enumerate(candidates):
+            mask = sorted({int(n) for n in (c.get("injected") or [])})
+            head = f"{i + 1}. [{c.get('date', '')}]"
+            if mask:
+                head += f"（注入済み: {_compact_sent_ranges(mask)}）"
+            body = "\n".join(
+                f"s{j + 1}: {s}" + ("　←注入済み" if (j + 1) in mask else "")
+                for j, s in enumerate(c.get("sents") or [])
+            )
+            blocks.append(f"{head}\n{body}")
+        parts = []
+        if context.strip():
+            parts.append(
+                "最近の会話（参照解決専用 — 関連性の根拠には使わないこと）:\n"
+                f"{context.strip()}"
+            )
+        parts.append(f"最後のユーザー発言（判定対象はこれのみ）:\n{query}")
+        parts.append("日記の候補:\n" + "\n\n".join(blocks))
+        user = "\n\n".join(parts)
+        try:
+            resp = await self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": _RERANK_SENTENCE_SYSTEM.format(budget=budget),
+                    },
+                    {"role": "user", "content": user},
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": _sentence_schema(),
+                },
+                temperature=0,
+                timeout=self._timeout,
+            )
+            data = json.loads(resp.choices[0].message.content or "{}")
+            relevant = data.get("relevant")
+            if not isinstance(relevant, list):
+                raise ValueError(f"malformed judge output: {data!r}")
+        except Exception as e:
+            logger.warning(f"[memory_rag] sentence rerank failed ({self._model}): {e}")
+            return None
+
+        out: List[Dict[str, Any]] = []
+        seen: set = set()
+        for item in relevant:
+            if not isinstance(item, dict):
+                continue
+            try:
+                idx = int(item.get("index", 0)) - 1
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= idx < len(candidates)) or idx in seen:
+                continue
+            seen.add(idx)
+            n_sents = len(candidates[idx].get("sents") or [])
+            nums: set = set()
+            for raw in item.get("sentences") or []:
+                try:
+                    n = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if 1 <= n <= n_sents:
+                    nums.add(n)
+            if not nums:
+                continue  # empty pick = the diary was not actually selected
+            picked = dict(candidates[idx])
+            picked["sentences"] = sorted(nums)
+            picked["reason"] = str(item.get("reason", ""))[:60]
+            out.append(picked)
+        return out
+
+
+def _compact_sent_ranges(nums: List[int]) -> str:
+    """``[1,2,3,5]`` → ``"s1-3, s5"`` — compact 既出 mask for prompts/labels."""
+    if not nums:
+        return ""
+    parts: List[str] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(f"s{start}" if start == prev else f"s{start}-{prev}")
+        start = prev = n
+    parts.append(f"s{start}" if start == prev else f"s{start}-{prev}")
+    return ", ".join(parts)

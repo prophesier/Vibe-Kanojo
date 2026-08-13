@@ -304,6 +304,25 @@ class VectorIndex:
                     self._meta[uid] = it.get("meta", self._meta[uid])
                     filled += 1
 
+            # Same id, different text → the stored vector no longer describes
+            # the item. Never fired while diaries were immutable and fact ids
+            # were content hashes, but a sentence-splitter change shifts diary
+            # chunk ids (uid#i is positional) — without this, those rows keep
+            # stale vectors AND stale text silently. Drop → re-embed below.
+            drifted = {
+                uid
+                for uid, it in wanted.items()
+                if uid in self._meta
+                and self._texts.get(uid)
+                and self._texts[uid] != it.get("text", "")
+            }
+            if drifted:
+                self._drop(drifted)
+                logger.info(
+                    f"[vector_index] {len(drifted)} entr(ies) changed text under "
+                    f"a stable id — re-embedding ({self._store_path})."
+                )
+
             missing = [uid for uid in wanted if uid not in self._meta]
             if not missing:
                 if removed or filled:

@@ -20,6 +20,8 @@ class DiaryRagConfig(I18nMixin):
     rerank_candidates: int = Field(12, alias="rerank_candidates")
     prefilter_floor: float = Field(0.3, alias="prefilter_floor")
     rerank_context_turns: int = Field(6, alias="rerank_context_turns")
+    sentence_budget: int = Field(8, alias="sentence_budget")
+    full_reads_per_turn: int = Field(5, alias="full_reads_per_turn")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "enabled": Description(
@@ -77,6 +79,14 @@ class DiaryRagConfig(I18nMixin):
         "rerank_context_turns": Description(
             en="How many recent conversation turns to give the LLM judge as context",
             zh="给 LLM 判官作为上下文的最近对话轮数",
+        ),
+        "sentence_budget": Description(
+            en="Per-turn budget of injected diary SENTENCES (packing is diary-atomic: a diary's picked sentences go in whole, so the last diary may slightly exceed the budget)",
+            zh="每轮注入日记句子的预算（装箱以篇为原子：某篇选中句整体装入，末篇可轻微超出预算）",
+        ),
+        "full_reads_per_turn": Description(
+            en="Max memory_read_diary full-text reads per turn (each read stays in context permanently — replay-exempt)",
+            zh="每轮 memory_read_diary 全文读取上限（读过的全文永驻上下文——回放豁免截断）",
         ),
     }
 

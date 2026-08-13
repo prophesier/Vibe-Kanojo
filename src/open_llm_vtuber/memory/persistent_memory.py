@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import unicodedata
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Set
 from loguru import logger
@@ -22,6 +23,38 @@ from .vector_index import VectorIndex, extract_keywords
 # Lazily-built Japanese sentence segmenter (pysbd) for diary chunking. Built on
 # first use so importing this module stays cheap when RAG is disabled.
 _JA_SEGMENTER = None
+
+
+_BRACKET_PAIRS = {"（": "）", "(": ")", "「": "」", "『": "』"}
+
+
+def _open_bracket_balance(text: str) -> int:
+    """Total unclosed opening brackets across all tracked pairs."""
+    total = 0
+    for o, c in _BRACKET_PAIRS.items():
+        total += max(0, text.count(o) - text.count(c))
+    return total
+
+
+def _merge_unbalanced_brackets(sents: List[str]) -> List[str]:
+    """Re-join segments pysbd split inside a bracketed span.
+
+    pysbd handles fullwidth （…）asides fine, but a period inside HALFWIDTH
+    parens shatters the span ("(note: x.) y" → "(note: x." / ") y" — the
+    bracket loses its closing half, あさひ's remembered landmine). A segment
+    left with unclosed brackets swallows following segments until balanced.
+    Capped at 4 merges so an unclosed-bracket typo can't glue a whole diary
+    into one "sentence"."""
+    out: List[str] = []
+    merged = 0
+    for s in sents:
+        if out and _open_bracket_balance(out[-1]) > 0 and merged < 4:
+            out[-1] += s
+            merged += 1
+        else:
+            out.append(s)
+            merged = 0
+    return out
 
 
 def _split_sentences(text: str) -> List[str]:
@@ -38,6 +71,7 @@ def _split_sentences(text: str) -> List[str]:
         sents = _JA_SEGMENTER.segment(text)
     except Exception:
         sents = [text]
+    sents = _merge_unbalanced_brackets([s for s in sents if s])
     return [s.strip() for s in sents if s and s.strip()]
 
 
@@ -45,6 +79,25 @@ def _split_sentences(text: str) -> List[str]:
 _TIMESTAMP_RE = re.compile(
     r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE
 )
+
+# Decoration characters stripped before store-title ↔ fact text matching
+# (uber_related_facts). Real Uber titles carry 「」quotes, ‼! flourishes and
+# full-width spaces; facts record names bare — NFKC + strip → both align.
+_MATCH_STRIP = "「」『』【】“”\"'‼！!？?・、。,．.　"
+
+
+def _norm_match_text(s: str) -> str:
+    """Normalize a store title or fact text for string matching."""
+    s = unicodedata.normalize("NFKC", s or "")
+    for ch in _MATCH_STRIP:
+        s = s.replace(ch, " ")
+    return " ".join(s.split())
+
+
+# Connector words that appear as standalone title tokens ("A アンド B") but
+# also inside unrelated compound names (クリスピーチキン「アンド」トマト) —
+# the one FP generator left on the 08-13 eval. Never discriminative.
+_MATCH_CONNECTOR_TOKENS = frozenset({"アンド", "and", "And", "AND", "the", "The"})
 
 
 _FACT_EXTRACT_SYSTEM = (
@@ -756,6 +809,129 @@ class PersistentMemoryManager:
         ]
         return out, candidates, keywords
 
+    async def uber_related_facts(
+        self,
+        query: str,
+        store_titles: List[str],
+        exclude_ids: Set[str],
+        cap: int,
+    ) -> List[Dict[str, Any]]:
+        """Two-wave facts recall for Uber search results (あさひ 08-13).
+
+        Wave B (primary): every result store TITLE is string-matched against
+        the fact texts in three levels — full normalized title, adjacent token
+        pairs, single tokens — scored by matched length. One-char store names
+        (the「◯◯丼 玄」pattern) ride the full/pair levels only; single tokens
+        follow the eval-tuned drop rules (21/21 recall, 1 borderline FP on the
+        08-13 test set). Wave A: semantic hits on the search keyword itself
+        (no judge; floor = facts_rag.similarity_threshold) — catches
+        store-independent preference facts (「日式中華は口に合わない」).
+        Merge is B-first by score, but when B alone fills ``cap`` the top A
+        hit keeps one guaranteed slot. Zero API for B; one embedding for A.
+        Never raises; returns ``[]`` on any failure.
+        """
+        try:
+            facts = self._load_facts()
+        except Exception:
+            return []
+        by_id = {self._fact_id(f["fact"]): f for f in facts if f.get("fact")}
+        norm_facts = {
+            fid: _norm_match_text(f["fact"])
+            for fid, f in by_id.items()
+            if fid not in exclude_ids
+        }
+        nq = _norm_match_text(query)
+        cap = max(1, int(cap))
+
+        # ---- Wave B: store-name string matching (pure python) ----
+        scored: Dict[str, int] = {}
+        for title in store_titles or []:
+            nt = _norm_match_text(title)
+            if not nt:
+                continue
+            toks = nt.split(" ")
+            needles: List[tuple] = []  # (needle, score, allow_prefix)
+            if len(nt) >= 4:
+                needles.append((nt, len(nt), False))  # L0: full title
+            for a, b in zip(toks, toks[1:]):  # L1: adjacent pairs
+                pair = f"{a} {b}"
+                if len(pair) >= 4:
+                    needles.append((pair, len(pair), False))
+            for t in toks:  # L2: single tokens, eval-tuned drops
+                if len(t) < 2:
+                    continue  # 1-char names only match via L0/L1
+                if t in _MATCH_CONNECTOR_TOKENS:
+                    continue
+                if t in nq:
+                    # The bare category word (=the query axis) belongs to
+                    # wave A. Only this direction: a NAME containing the
+                    # query (ケンタッキーフライド「チキン」) stays matchable.
+                    continue
+                if t.isascii() and len(t) < 5:
+                    continue  # "Hero" ⊂ "Heroes"
+                if t.endswith("店") and len(toks) > 1:
+                    continue  # branch tokens (「◯◯店」「◯◯駅前店」…)
+                if sum(1 for nf in norm_facts.values() if t in nf) > 5:
+                    continue  # generic word, non-discriminative
+                needles.append((t, len(t), len(t) >= 6))
+            for fid, nf in norm_facts.items():
+                best = scored.get(fid, 0)
+                for needle, score, allow_prefix in needles:
+                    if score <= best:
+                        continue
+                    if needle in nf:
+                        best = score
+                    elif allow_prefix:
+                        # partial recordings: ケンタッキーフライドチキン →
+                        # the fact only says ケンタッキー
+                        for cut in range(len(needle) - 1, 4, -1):
+                            if cut <= best:
+                                break
+                            if needle[:cut] in nf:
+                                best = cut
+                                break
+                if best:
+                    scored[fid] = best
+
+        # ---- Wave A: semantic hits on the search keyword ----
+        a_order: List[str] = []
+        if self._facts_index is not None and query.strip():
+            cfg = self._facts_rag_cfg
+            floor = getattr(cfg, "similarity_threshold", 0.6)
+            keywords = extract_keywords(query)
+            embed_q = " ".join(keywords) if keywords else query
+            try:
+                hits, _ = await self._facts_index.retrieve(
+                    embed_q,
+                    exclude_ids=set(exclude_ids),
+                    similarity_threshold=floor,
+                    topn_threshold=floor,
+                    max_retrievals=cap,
+                    lexical_weight=getattr(cfg, "lexical_weight", 0.5),
+                    keywords=keywords,
+                )
+                a_order = [
+                    h["id"] for h in hits if h["id"] in by_id and h["id"] not in scored
+                ]
+            except Exception as e:
+                logger.warning(f"[uber_facts] semantic wave failed: {e}")
+
+        # ---- Merge: B-first by score; A's best keeps a slot when full ----
+        b_order = sorted(scored, key=lambda i: -scored[i])
+        if len(b_order) >= cap and a_order:
+            final = b_order[: cap - 1] + a_order[:1]
+        else:
+            final = (b_order + a_order)[:cap]
+        return [
+            {
+                "id": fid,
+                "fact": by_id[fid]["fact"],
+                "date": str(by_id[fid].get("updated", ""))[:10],
+                "via": "store" if fid in scored else "topic",
+            }
+            for fid in final
+        ]
+
     # ------------------------------------------------------------------
     # Character self-service memory (memory_* in-process tools)
     # ------------------------------------------------------------------
@@ -1033,21 +1209,62 @@ class PersistentMemoryManager:
             return None
         return {"date": entry.get("date", ""), "content": entry.get("content", "")}
 
+    def resolve_diary_uid(self, fragment: str) -> tuple:
+        """Full diary uid from a fragment — the 8-hex short id shown in RAG
+        excerpt blocks, or any unique substring, or the full uid itself.
+
+        Returns ``(uid, matches)``: ``uid`` only on a unique resolution;
+        ambiguity leaves it None with the candidates in ``matches`` so the
+        caller can name them."""
+        frag = (fragment or "").strip()
+        if not frag:
+            return None, []
+        if self._read_diary(frag):  # full uid — the common fast path
+            return frag, [frag]
+        if not os.path.isdir(self._diaries_dir):
+            return None, []
+        stems = [f[:-5] for f in os.listdir(self._diaries_dir) if f.endswith(".json")]
+        matches = [s for s in stems if frag in s]
+        if len(matches) == 1:
+            return matches[0], matches
+        return None, matches
+
+    def diary_sentences(self, diary_uid: str) -> List[str]:
+        """A diary's sentences in order (same splitter as the chunk index, so
+        1-based sentence numbers = chunk ``#i`` + 1 and stay stable across
+        turns — diaries are immutable). ``[]`` when the diary is missing."""
+        entry = self._read_diary((diary_uid or "").strip())
+        if not entry or not entry.get("content"):
+            return []
+        return _split_sentences(entry["content"])
+
     async def retrieve_diary_context(
-        self, query: str, exclude_uids: Set[str], context: str = ""
-    ) -> List[Dict[str, Any]]:
-        """Return diaries relevant to ``query`` (long-tail recall).
+        self,
+        query: str,
+        exclude_uids: Set[str],
+        context: str = "",
+        injected_sents: Optional[Dict[str, Set[int]]] = None,
+    ) -> tuple:
+        """Return diary excerpts relevant to ``query`` (long-tail recall).
 
         Pipeline: denoise the query to content keywords (drop framing words) →
         hybrid candidate generation (keywords drive embedding + lexical, grouped
-        back to whole diaries) → optional LLM relevance judge over the shortlist
-        → recall the full diaries. Reads content fresh from disk so it's never
-        stale.
+        back to whole diaries — retrieval granularity is unchanged) → LLM judge
+        picks SENTENCES inside each relevant diary (08-13 sentence redesign).
+        Reads content fresh from disk so it's never stale.
 
-        Returns ``(hits, candidates)`` where hits is
-        ``[{"uid", "date", "content", "score", "reason"}, ...]`` and candidates is
-        the scored shortlist ``(uid, date, hybrid, vec, lex)`` for log tuning.
-        Returns ``([], [])`` when RAG is off / query empty / embedding fails.
+        ``injected_sents`` maps uid → 1-based sentence numbers already injected
+        into context this session; shortlisted diaries carry that mask into the
+        judge prompt (the caller still subtracts it when packing).
+
+        Returns ``(hits, candidates, keywords)`` where hits is
+        ``[{"uid", "date", "sents", "sentences", "reason"}, ...]`` in judge
+        relevance order — ``sents`` is the full ordered sentence list, and
+        ``sentences`` the picked 1-based numbers (ascending; original order).
+        The old diary-count cap is retired: the caller packs against the
+        sentence budget. A judge API/parse failure returns no hits (the round
+        skips injection — no whole-diary fallback). candidates stays the scored
+        shortlist ``(uid, date, hybrid, vec, lex)`` for log tuning.
         """
         if self._diary_index is None or not query or not query.strip():
             return [], [], []
@@ -1060,7 +1277,9 @@ class PersistentMemoryManager:
         keywords = extract_keywords(query)
         embed_q = " ".join(keywords) if keywords else query
 
-        # No reranker → original score-based threshold + topN selection.
+        # No reranker → original score-based threshold + topN whole-diary
+        # selection (sentence picking needs the judge). Uniform hit shape:
+        # every sentence counts as picked, so the caller's ledger stays exact.
         if self._diary_reranker is None:
             hits, candidates = await self._diary_index.retrieve(
                 embed_q,
@@ -1072,11 +1291,25 @@ class PersistentMemoryManager:
                 lexical_weight=lex_w,
                 keywords=keywords,
             )
-            out, cands = self._resolve_diaries(hits, candidates)
-            return out, cands, keywords
+            out: List[Dict[str, Any]] = []
+            for h in hits:
+                sents = self.diary_sentences(h["id"])
+                if not sents:
+                    continue
+                entry = self._read_diary(h["id"])
+                out.append(
+                    {
+                        "uid": h["id"],
+                        "date": (entry or {}).get("date", h["meta"].get("date", "")),
+                        "sents": sents,
+                        "sentences": list(range(1, len(sents) + 1)),
+                        "reason": "",
+                    }
+                )
+            return out, candidates, keywords
 
         # Reranker path: pull a generous shortlist (no strict gate — the judge is
-        # the real relevance filter), then let the LLM pick/order the relevant.
+        # the real relevance filter), then let the LLM pick relevant sentences.
         top_k = getattr(cfg, "rerank_candidates", 12)
         _, candidates = await self._diary_index.retrieve(
             embed_q,
@@ -1093,49 +1326,43 @@ class PersistentMemoryManager:
         if not candidates or candidates[0][2] < floor:
             return [], candidates, keywords  # nothing plausibly relevant; skip judge
 
+        injected_sents = injected_sents or {}
         shortlist: List[Dict[str, Any]] = []
         for uid, date, _h, _v, _lx in candidates:
             entry = self._read_diary(uid)
-            if entry and entry.get("content"):
-                shortlist.append(
-                    {
-                        "id": uid,
-                        "date": entry.get("date", date),
-                        "content": entry["content"],
-                    }
-                )
-        judged = await self._diary_reranker.rerank(query, shortlist, context=context)
-        if judged is None:  # judge errored → fall back to top-N by hybrid
-            judged = [dict(s, reason="(rerank-fallback)") for s in shortlist[:max_n]]
+            if not entry or not entry.get("content"):
+                continue
+            shortlist.append(
+                {
+                    "id": uid,
+                    "date": entry.get("date", date),
+                    "sents": _split_sentences(entry["content"]),
+                    "injected": sorted(injected_sents.get(uid, set())),
+                }
+            )
+        judged = await self._diary_reranker.rerank_sentences(
+            query,
+            shortlist,
+            context=context,
+            budget=getattr(cfg, "sentence_budget", 8),
+        )
+        if judged is None:
+            # Judge API/parse failure → skip this round entirely (宁缺勿整篇
+            # 回退 — a whole-diary fallback would break the sentence ledger).
+            logger.info("[diary_rag] judge failed — no injection this round.")
+            return [], candidates, keywords
 
         out = [
             {
                 "uid": j["id"],
                 "date": j["date"],
-                "content": j["content"],
-                "score": 0.0,
+                "sents": j["sents"],
+                "sentences": j["sentences"],
                 "reason": j.get("reason", ""),
             }
-            for j in judged[:max_n]
+            for j in judged
         ]
         return out, candidates, keywords
-
-    def _resolve_diaries(self, hits: List[Dict[str, Any]], candidates) -> tuple:
-        """Map VectorIndex hits to full diaries read fresh from disk."""
-        out: List[Dict[str, Any]] = []
-        for h in hits:
-            entry = self._read_diary(h["id"])
-            if entry and entry.get("content"):
-                out.append(
-                    {
-                        "uid": h["id"],
-                        "date": entry.get("date", h["meta"].get("date", "")),
-                        "content": entry["content"],
-                        "score": h["score"],
-                        "reason": "",
-                    }
-                )
-        return out, candidates
 
     def _read_diary(self, uid: str) -> Optional[Dict[str, Any]]:
         """Load a single diary entry by uid, or None if missing/unreadable."""
