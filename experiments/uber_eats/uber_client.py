@@ -262,6 +262,35 @@ _CROSS_PROMO_RE = re.compile(
     r"もどうぞ|その他の商品|他のお店|別のお店|他店|一緒に(頼|注文)"
 )
 
+# Account-targeted carousels are dead weight on the browsing account (no
+# order history), and 特定商品の割引 is fully redundant: probe 08-13 showed
+# its items duplicated in the regular categories with the same promo badge
+# and strikethrough pricing (same promotionUUID). あさひ ruled: drop them.
+_PERSONAL_CAT_RE = re.compile(r"また注文する|あなたへのおすすめ|特定商品の割引")
+
+# Discounted items carry the ORIGINAL price only inside priceTagline's
+# textFormat as a line-through span (the plain text/price fields are already
+# the discounted price). Dig it out so the discount magnitude is visible.
+_STRIKE_RE = re.compile(r"line-through[^>]*>\s*([¥￥][\d,]+)")
+
+# Menu-size economics (あさひ 08-12: two big menus in one round = 24k fresh
+# tokens). A store over _BIG_MENU_THRESHOLD items returns a per-section
+# digest (top _DIGEST_TOP by popularity, no descriptions) instead of the
+# full flood; the full listing of ONE section comes via store(section=...),
+# capped at _SECTION_CAP. Small stores are untouched — no extra round for
+# them. Every cut is visible in the output (item counts per section).
+_BIG_MENU_THRESHOLD = 35
+_DIGEST_TOP = 4
+_SECTION_CAP = 40
+_COLLECT_CEILING = 500  # pathological-store safety bound
+
+
+def _digest_sort_key(it: Dict[str, Any]):
+    """Popularity order for the digest: ranked top-liked first, then by
+    rating count. Stable, so ties keep the store's own ordering."""
+    rank = it.get("top_liked_rank") or 0
+    return (0 if rank else 1, rank if rank else 99, -(it.get("num_ratings") or 0))
+
 
 def _opt_price(cents: Any) -> str:
     """Customization option prices are in 1/100 yen (27000 → ¥270)."""
@@ -566,13 +595,18 @@ class UberEatsClient:
             )
         return cats
 
-    async def store(self, store_uuid: str, max_items: int = 60) -> Dict[str, Any]:
+    async def store(self, store_uuid: str, section: str = "") -> Dict[str, Any]:
         """Return a store's header (rating + review count, ETA, distance, delivery
         fee, open status/hours) and its menu (sectioned; each item has name, price,
         short description, and a sold-out flag).
 
         Cross-promo sections that splice in OTHER stores' products
         (【ドリンクもどうぞ】 etc.) are filtered out so the menu is the store's own.
+
+        Menus over _BIG_MENU_THRESHOLD items come back as a ``digest``
+        (per-section popularity top-N, descriptions dropped) instead of the
+        full flood; pass ``section`` (fuzzy title match) to get one section
+        in full detail. Small stores always return the complete menu.
 
         For a multi-level category store (conbini/supermarket), the item menu is
         skipped (too many items) and ``categories`` (aisles) is returned instead
@@ -602,36 +636,58 @@ class UberEatsClient:
             if isinstance(s, dict)
         }
         menu: List[Dict[str, Any]] = []
-        total = 0
-        seen: set = set()  # de-dupe: Uber repeats items across sections (popular, etc.)
-        # Category stores: skip the item flood — the header + aisle categories are
-        # returned instead (drill in with catalog()).
+        distinct: set = set()  # distinct item count (size threshold only)
+        collected = 0
+        # Restaurant categories live at the ENTRY level inside a section:
+        # each catalogSectionsMap entry is one app carousel (注目の商品 /
+        # 定食 / 丼…) with its own standardItemsPayload.title. The first
+        # version merged every entry into the section and flattened the
+        # whole menu into 주문 (あさひ caught it against the app, 08-13).
+        # Items repeat across carousels (注目の商品 duplicates the real
+        # categories), so de-dupe is LOCAL to a category — mirroring the
+        # app — while the size threshold uses the distinct count.
+        # Category stores: skip the item flood — the header + aisle
+        # categories are returned instead (drill in with catalog()).
         for sec_uuid, entries in (
             {} if categories else (d.get("catalogSectionsMap") or {})
         ).items():
             sec_title = sec_titles.get(sec_uuid, "")
             if sec_title and _CROSS_PROMO_RE.search(sec_title):
                 continue  # other stores' products spliced in — not this store's menu
-            items: List[Dict[str, Any]] = []
             for entry in entries or []:
                 payload = (entry or {}).get("payload") or {}
-                catalog = (payload.get("standardItemsPayload") or {}).get(
-                    "catalogItems"
-                ) or []
-                for it in catalog:
+                sip = payload.get("standardItemsPayload") or {}
+                cat_title = sip.get("title")
+                if isinstance(cat_title, dict):
+                    cat_title = cat_title.get("text", "")
+                cat_title = (cat_title or sec_title or "").strip()
+                if cat_title and _CROSS_PROMO_RE.search(cat_title):
+                    continue
+                if cat_title and _PERSONAL_CAT_RE.search(cat_title):
+                    continue
+                items: List[Dict[str, Any]] = []
+                local_seen: set = set()
+                for it in sip.get("catalogItems") or []:
                     if not isinstance(it, dict):
                         continue
                     iid = it.get("uuid") or it.get("title", "")
-                    if iid in seen:
+                    if iid in local_seen:
                         continue
-                    seen.add(iid)
-                    price = it.get("priceTagline")
-                    if isinstance(price, dict):
-                        price = price.get("text", "")
+                    local_seen.add(iid)
+                    tagline = it.get("priceTagline")
+                    orig = ""
+                    if isinstance(tagline, dict):
+                        m = _STRIKE_RE.search(tagline.get("textFormat") or "")
+                        if m:
+                            orig = m.group(1)
+                        price = tagline.get("text", "")
+                    else:
+                        price = tagline
                     items.append(
                         {
                             "name": it.get("title", ""),
                             "price": price or "",
+                            "orig_price": orig,
                             "item_uuid": it.get("uuid", ""),
                             "desc": " ".join((it.get("itemDescription") or "").split())[
                                 :80
@@ -642,15 +698,56 @@ class UberEatsClient:
                             **_item_promo(it),
                         }
                     )
-                    total += 1
-                    if total >= max_items:
+                    distinct.add(iid)
+                    collected += 1
+                    if collected >= _COLLECT_CEILING:
                         break
-                if total >= max_items:
+                if items:
+                    menu.append({"section": cat_title, "items": items})
+                if collected >= _COLLECT_CEILING:
                     break
-            if items:
-                menu.append({"section": sec_title, "items": items})
-            if total >= max_items:
+            if collected >= _COLLECT_CEILING:
                 break
+        total = len(distinct)
+
+        # Shape the menu by size (see the module constants above). Every cut
+        # stays visible: digest sections carry their true totals, a capped
+        # section view carries section_total.
+        section = (section or "").strip()
+        digest: List[Dict[str, Any]] = []
+        section_view = ""
+        section_total = 0
+        truncated = total >= _COLLECT_CEILING
+        if section and not categories:
+            want = section.casefold()
+            match = next(
+                (m for m in menu if want in (m["section"] or "").casefold()), None
+            )
+            if match is None:
+                names = "、".join(m["section"] or "(無題)" for m in menu) or "(なし)"
+                raise UberUnavailable(
+                    f"カテゴリ「{section}」が見つかりません。カテゴリ一覧: {names}"
+                )
+            section_view = match["section"]
+            section_total = len(match["items"])
+            menu = [
+                {"section": match["section"], "items": match["items"][:_SECTION_CAP]}
+            ]
+            truncated = section_total > _SECTION_CAP
+        elif not categories and total > _BIG_MENU_THRESHOLD:
+            # Digest items keep FULL detail (desc + item_uuid — あさひ 08-13:
+            # both are load-bearing, don't slim them); the saving comes from
+            # top-N per category, with the cut sizes visible.
+            for m in menu:
+                top = sorted(m["items"], key=_digest_sort_key)[:_DIGEST_TOP]
+                digest.append(
+                    {
+                        "section": m["section"],
+                        "total": len(m["items"]),
+                        "items": top,
+                    }
+                )
+            menu = []
 
         r = d.get("rating") or {}
         rating = (r.get("text") or r.get("ratingValue")) if isinstance(r, dict) else r
@@ -679,7 +776,11 @@ class UberEatsClient:
             "hours": str(meta.get("workingHoursTagline", "") or ""),
             "closed_message": str(d.get("closedMessage") or ""),
             "menu": menu,
-            "truncated": total >= max_items,
+            "digest": digest,
+            "total_items": total,
+            "section_view": section_view,
+            "section_total": section_total,
+            "truncated": truncated,
             "is_convenience": bool(categories),
             "categories": categories,
         }

@@ -42,13 +42,17 @@ logger.add(str(HERE / "uber_mcp.log"), rotation="2 MB", retention=3, level="INFO
 _HEADLESS = os.environ.get("UBER_EATS_HEADLESS", "1") != "0"
 _TOOL_TIMEOUT = 25  # seconds — under the MCP client's 30s read timeout
 
-# Appended to every result. Tool results are NOT persisted to the chat context
-# (they vanish next turn), so the character must relay anything worth keeping in
-# its actual reply to the user.
+# Appended to every result. Since the 08-13 per-round replay work, tool
+# results DO persist into later turns, but trimmed hard (~400 chars from the
+# top; a leading related-facts section survives whole) — so the character
+# must still relay anything worth keeping in its actual reply, and facts
+# entries need the full store name for the title-matching recall to find
+# them later.
 _RESULT_NOTE = (
-    "\n\n（メモ：この結果はあなたの参照用で会話履歴には残らない。"
-    "気になった店・料理・価格などは、ユーザーへの返信の中で必ず自分の言葉で伝えること。"
-    "この内容は次のターンには消えている。）"
+    "\n\n（メモ：この結果は次のターン以降、先頭のわずかな部分を除いて"
+    "切り詰められる。気になった店・料理・価格などは、ユーザーへの返信の中で"
+    "必ず自分の言葉で伝えること。また、店について記憶（facts）に記録する"
+    "ときは、後から検索で照合できるよう店名を省略せず正式名のまま書くこと。）"
 )
 
 mcp = FastMCP("uber-eats")
@@ -75,10 +79,16 @@ async def _run(coro, what: str):
 
 
 @mcp.tool()
-async def uber_search(keyword: str, vertical: str = "RESTAURANTS") -> str:
+async def uber_search(
+    keyword: str, vertical: str = "RESTAURANTS", limit: int = 10
+) -> str:
     """Search Uber Eats (Japan) for stores. Takes a keyword such as a dish name
     or store name and returns a list of deliverable stores (name, rating,
     store_uuid).
+    limit is how many stores to return (default 10, max 30). Decide it UP
+    FRONT from the user's intent: if he wants breadth ("いくつか候補",
+    "比較したい", "他には？"), pass a larger limit on the FIRST call —
+    re-searching with a higher limit later costs a whole extra round.
     vertical picks the search index and must be chosen to match the intent:
       - "RESTAURANTS" (default): restaurants and eateries — any food or dish
         query.
@@ -98,8 +108,13 @@ async def uber_search(keyword: str, vertical: str = "RESTAURANTS") -> str:
     that member price (cheaper than usual, or free) is what the user actually
     pays. "通常¥…" is the reference price for non-members."""
     v = normalize_vertical(vertical)
+    try:
+        limit = max(1, min(int(limit), 30))
+    except (TypeError, ValueError):
+        limit = 10
     ok, data = await _run(
-        _client.search(keyword, vertical=v), f"uber_search({keyword!r},{v})"
+        _client.search(keyword, limit=limit, vertical=v),
+        f"uber_search({keyword!r},{v},limit={limit})",
     )
     if not ok:
         return f"検索できませんでした: {data}"
@@ -109,7 +124,12 @@ async def uber_search(keyword: str, vertical: str = "RESTAURANTS") -> str:
             f"「{keyword}」に一致する配達可能な店舗（{v_label}）は"
             "見つかりませんでした。"
         )
-    lines = [f"「{keyword}」の検索結果（{len(data)}件・{v_label}）:"]
+    trunc = (
+        f"上位{len(data)}件のみ表示・limit引数で最大30件まで増やせる"
+        if len(data) >= limit
+        else f"全{len(data)}件"
+    )
+    lines = [f"「{keyword}」の検索結果（{trunc}・{v_label}）:"]
     for s in data:
         pr = "［PR］" if s.get("sponsored") else ""
         bits = []
@@ -137,16 +157,29 @@ async def uber_search(keyword: str, vertical: str = "RESTAURANTS") -> str:
 
 
 @mcp.tool()
-async def uber_store(store_uuid: str) -> str:
+async def uber_store(store_uuid: str, section: str = "") -> str:
     """Get the menu of the store with the given store_uuid. Pass a store_uuid
     from the uber_search results. Returns the store name, rating, delivery
     estimate, and the menu (categories, dish names, prices, like rate).
+    LARGE menus (over ~35 items) come back as a per-category DIGEST: every
+    category (the same categories the app shows) with its top few items by
+    popularity, full detail included. The digest is usually enough to
+    recommend from. To see ALL items of ONE category, call this tool again
+    with section="カテゴリ名" (fuzzy match on the category names shown).
+    Only drill into a category when you actually need it — each extra call
+    costs a round.
+    Every item line carries its item_uuid — pass it to uber_item for
+    toppings/set options and the full description. A trailing ⚙ on the
+    uuid line means the item has options to choose.
     Each item's "好評率" is the share of "likes" (positive ratings), shown with
     the rating count — it is not a repeat-order rate.
     Browse-only: you cannot order or pay.
     The return value is for your reference and does not stay in the
     conversation, so write anything you want to convey in your reply itself."""
-    ok, data = await _run(_client.store(store_uuid), f"uber_store({store_uuid!r})")
+    ok, data = await _run(
+        _client.store(store_uuid, section=section),
+        f"uber_store({store_uuid!r},section={section!r})",
+    )
     if not ok:
         return f"メニューを取得できませんでした: {data}"
     head = data["name"]
@@ -188,33 +221,79 @@ async def uber_store(store_uuid: str) -> str:
             "サブカテゴリ（細分類）が出たら、その subsection_uuid を渡すと商品が表示される。"
         )
         return "\n".join(lines) + _RESULT_NOTE
+    # Big-menu digest: every category, popularity top-N only, cuts labelled.
+    if data.get("digest"):
+        lines.append(
+            f"\n■ メニューが大きい（全{data.get('total_items', '?')}品）ため、"
+            "各カテゴリの人気上位のみ表示:"
+        )
+        for sec in data["digest"]:
+            more = sec["total"] - len(sec["items"])
+            more_s = f"　…他{more}品" if more > 0 else ""
+            lines.append(f"\n▼ {sec['section'] or '(無題)'}（全{sec['total']}品）")
+            for it in sec["items"]:
+                lines.append(_fmt_menu_item(it))
+            if more_s:
+                lines.append(more_s)
+        lines.append(
+            "\n※ カテゴリの全品を見るには uber_store を store_uuid と "
+            "section=カテゴリ名 で再呼び出し。必要なカテゴリだけ絞って呼ぶこと。"
+        )
+        return "\n".join(lines) + _RESULT_NOTE
     if not data.get("menu"):
         lines.append("（メニュー項目を取得できませんでした）")
+    if data.get("section_view"):
+        cap = (
+            f"（全{data['section_total']}品中、先頭{len(data['menu'][0]['items'])}品"
+            "のみ表示）"
+            if data.get("truncated")
+            else f"（全{data['section_total']}品）"
+        )
+        lines.append(f"\n▼ カテゴリ「{data['section_view']}」{cap}")
+        for it in data["menu"][0]["items"]:
+            lines.append(_fmt_menu_item(it))
+        return "\n".join(lines) + _RESULT_NOTE
     for sec in data["menu"]:
         if sec.get("section"):
             lines.append(f"\n■ {sec['section']}")
         for it in sec["items"]:
-            so = "[品切れ] " if it.get("sold_out") else ""
-            price = f"  {it['price']}" if it.get("price") else ""
-            # Eater endorsement (好評率 = 「ライク」率, NOT リピート率) — labelled
-            # explicitly so it can't be misread as a repeat rate.
-            if it.get("like_rate"):
-                cnt = f"({it['num_ratings']}件)" if it.get("num_ratings") else ""
-                endo = f"  👍好評率{it['like_rate']}{cnt}"
-            elif it.get("top_liked_rank"):
-                endo = f"  👍ライク数#{it['top_liked_rank']}"
-            else:
-                endo = ""
-            line = f"- {so}{it['name']}{price}{endo}"
-            if it.get("desc"):
-                line += f"\n    {it['desc']}"
-            # only customizable items are worth drilling into; expose their id
-            if it.get("customizable") and it.get("item_uuid"):
-                line += f"\n    ⚙ トッピング/セット選択あり → uber_item(item_uuid: {it['item_uuid']})"
-            lines.append(line)
+            lines.append(_fmt_menu_item(it))
     if data.get("truncated"):
         lines.append("\n…（メニューは一部のみ表示）")
     return "\n".join(lines) + _RESULT_NOTE
+
+
+def _fmt_menu_item(it: dict) -> str:
+    """One menu line: name/price/likes, promo, description, bare item_uuid
+    (⚙ suffix = customizable). Same shape in digest and full views — desc
+    and uuid are load-bearing everywhere (あさひ 08-13)."""
+    so = "[品切れ] " if it.get("sold_out") else ""
+    price = f"  {it['price']}" if it.get("price") else ""
+    if price and it.get("orig_price"):
+        # price is already the DISCOUNTED figure; the original was dug out
+        # of the strikethrough span client-side (08-13).
+        price += f"（通常{it['orig_price']}）"
+    # Eater endorsement (好評率 = 「ライク」率, NOT リピート率) — labelled
+    # explicitly so it can't be misread as a repeat rate.
+    if it.get("like_rate"):
+        cnt = f"({it['num_ratings']}件)" if it.get("num_ratings") else ""
+        endo = f"  👍好評率{it['like_rate']}{cnt}"
+    elif it.get("top_liked_rank"):
+        endo = f"  👍ライク数#{it['top_liked_rank']}"
+    else:
+        endo = ""
+    line = f"- {so}{it['name']}{price}{endo}"
+    if it.get("promo"):
+        line += f"\n    🎁 {it['promo']}"
+    if it.get("desc"):
+        line += f"\n    {it['desc']}"
+    # Bare uuid line — the docstring teaches uber_item usage once; the old
+    # per-item "→ uber_item(...)" arrow text was broadcast N times per menu
+    # and burned tokens for nothing (あさひ 08-13). ⚙ = customizable.
+    if it.get("item_uuid"):
+        gear = " ⚙" if it.get("customizable") else ""
+        line += f"\n    item_uuid: {it['item_uuid']}{gear}"
+    return line
 
 
 def _fmt_catalog_item(it: dict) -> str:
@@ -229,6 +308,8 @@ def _fmt_catalog_item(it: dict) -> str:
     else:
         endo = ""
     line = f"- {so}{it['name']}{price}{endo}"
+    if it.get("promo"):
+        line += f"\n    🎁 {it['promo']}"
     if it.get("customizable") and it.get("item_uuid"):
         line += f"\n    ⚙ 選択肢あり → uber_item(item_uuid: {it['item_uuid']})"
     return line
