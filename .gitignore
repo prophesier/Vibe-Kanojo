@@ -7,6 +7,10 @@ handoff.md
 rag_design.md
 PROJECT.md
 
+# local test suite (offline mocks; kept out of the public repo as a second
+# layer of insurance — fixtures imitate personal data shapes)
+tests/
+
 # local backups (chat history, persona snapshots)
 backup/
 
