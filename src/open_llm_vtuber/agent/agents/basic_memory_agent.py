@@ -424,6 +424,7 @@ class BasicMemoryAgent(AgentInterface):
                 return i, acc
             acc += w
         return -1, acc
+
     # Tools whose results are exempt from the replay cap (あさひ 08-13:
     # reading a diary in full = injecting it — the content IS the point, so
     # it must survive replay verbatim). Exempt results are trivially
@@ -3471,18 +3472,57 @@ class BasicMemoryAgent(AgentInterface):
 
     @staticmethod
     def _mcp_tool_marker(tool_name: str) -> str:
-        """Short inline tag flagging that an MCP tool was used. Uber keeps its
-        own glyph; any other MCP tool gets a generic 🔧 tag so EVERY tool call
-        is visible in chat (あさひ audits usage from there when away). Time
-        tools return "" here — their marker is result-bearing and fires after
-        execution (_time_tool_marker)."""
+        """Short inline tag flagging that an MCP tool was used. Any MCP tool
+        gets a generic 🔧 tag so EVERY tool call is visible in chat (あさひ
+        audits usage from there when away). Time and uber tools return ""
+        here — their markers are result-bearing and fire after execution
+        (_deferred_tool_marker); uber's carry the keyword / store name /
+        item name pulled from the result (あさひ 08-14: the bare Uber Eats
+        badge said nothing)."""
         if tool_name.startswith("uber"):
-            return "\n🍔 *Uber Eats*\n"
+            return ""
         if tool_name in _DEFERRED_MARKER_TOOLS:
             return ""
         if tool_name:
             return f"\n🔧 *ツール: {tool_name[:40]}*\n"
         return ""
+
+    # Result-head patterns for the uber markers, keyed by tool. search uses
+    # re.search (defensive: its content may gain a prepended facts section if
+    # the emit order ever changes); store/item anchor on the leading 【…】.
+    _UBER_MARKER_SPECS = {
+        "uber_search": (re.compile(r"「(.+?)」の検索結果"), "Uber検索"),
+        "uber_store": (re.compile(r"^【(.+?)】"), "メニュー閲覧"),
+        "uber_item": (re.compile(r"^【(.+?)】"), "商品詳細"),
+    }
+
+    @classmethod
+    def _uber_tool_marker(cls, tool_name: str, content: Any) -> str:
+        """Result-bearing marker for the uber tools: search shows the
+        keyword, store the store name, item the item name (server formats:
+        「kw」の検索結果 / 【店名】 / 【商品名  価格】). uber_category,
+        errors and parse misses fall back to the old generic badge so every
+        call stays visible. Display-only; TOOL_MARKER_RE strips 🍔 *Uber…*
+        from replay."""
+        if not tool_name.startswith("uber"):
+            return ""
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    break
+        spec = cls._UBER_MARKER_SPECS.get(tool_name)
+        if spec:
+            m = spec[0].search(text.strip())
+            if m:
+                # item heads glue price / [品切れ] after a double space
+                label = m.group(1).split("  ")[0].strip()
+                if label:
+                    return f"\n🍔 *{spec[1]}: {label[:40]}*\n"
+        return "\n🍔 *Uber Eats*\n"
 
     # Tools whose marker can only be written once the result is known, so
     # _mcp_tool_marker stays silent for them and _deferred_tool_marker emits
@@ -3562,8 +3602,10 @@ class BasicMemoryAgent(AgentInterface):
     @classmethod
     def _deferred_tool_marker(cls, tool_name: str, content: Any) -> str:
         """Markers that can only be written once the result is in hand."""
-        return cls._time_tool_marker(tool_name, content) or cls._music_tool_marker(
-            tool_name, content
+        return (
+            cls._time_tool_marker(tool_name, content)
+            or cls._music_tool_marker(tool_name, content)
+            or cls._uber_tool_marker(tool_name, content)
         )
 
     def _handle_api_error_turn(self, error_message: str) -> str:

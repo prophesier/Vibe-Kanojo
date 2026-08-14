@@ -509,13 +509,15 @@ def get_latest_history_uid(conf_uid: str) -> str:
 # '*'. That is deliberately conservative: replies contain real markdown like
 # "**Zero Escape**", so a greedy ".*\*" would swallow reply text — instead, a
 # query/url that itself contains '*' (rare) is left as-is rather than risk
-# eating real content. Keep in sync with the emitters (currently: 🍔 Uber /
-# 🔍 Web検索 / 🔗 Web取得 / ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam / 📝 記憶 /
-# 🕐 時刻確認・時刻変換).
+# eating real content. Keep in sync with the emitters (currently: 🍔 Uber
+# Eats・Uber検索・メニュー閲覧・商品詳細 / 🔍 Web検索 / 🔗 Web取得 /
+# ⏰ Alarm set / 🧠 自己診断 / 🎮 Steam / 📝 記憶 / 🕐 時刻確認・時刻変換).
 # ---------------------------------------------------------------------------
 TOOL_MARKER_RE = re.compile(
     r"[ \t]*(?:"
-    r"🍔[ \t]*\*Uber Eats\*"
+    # any 🍔-glyph marker: the label varies since 08-14 (keyword / store /
+    # item name pulled from the result)
+    r"🍔[ \t]*\*[^*\n]*\*"
     r"|🔍[ \t]*\*Web検索:[^*\n]*\*"
     r"|🔗[ \t]*\*Web取得:[^*\n]*\*"
     r"|⏰[ \t]*\*Alarm[^*\n]*\*"
