@@ -3940,7 +3940,7 @@ class BasicMemoryAgent(AgentInterface):
                         "plus Anthropic's official status page. With no argument, "
                         "checks the model you are currently running on. Returns a "
                         "short assessment report (score, trend, baseline, official "
-                        "incidents, verdict). Read-only; no LLM call."
+                        "incidents, verdict)."
                     ),
                     "parameters": {
                         "type": "object",
