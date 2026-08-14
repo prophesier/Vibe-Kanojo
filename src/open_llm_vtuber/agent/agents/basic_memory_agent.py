@@ -1009,18 +1009,14 @@ class BasicMemoryAgent(AgentInterface):
         "kept in memory, history_search does a keyword search over the full "
         "conversation logs. For both: to narrow by date or period, use the "
         "date_from/date_to arguments — do not mix dates into the query or the "
-        "keywords. Only the beginning of a search result stays in context after "
-        "the turn, so mention anything worth keeping in your reply; a "
-        "memory_read_diary result stays whole. To save or correct facts "
-        "established in conversation, use memory_add / memory_update (only when "
-        "the user asked, or the correction is unambiguous; be careful about "
-        "rewriting). Deletion is memory_delete, which requires the user's "
-        "consent. Additions and corrections are reflected in search immediately, "
-        "and enter the resident list from the next startup. user-tier memories "
-        "are the user's own (you cannot create or delete them; correcting their "
-        "content is allowed). When a session is wrapping up, you may write its "
-        "diary yourself with memory_write_diary (left unwritten, it is "
-        "generated automatically at the next startup)."
+        "keywords. To save or correct facts established in conversation, use "
+        "memory_add / memory_update (be careful about rewriting). Deletion is "
+        "memory_delete, which requires the user's consent. Additions and "
+        "corrections are reflected in search immediately, and enter the "
+        "resident list from the next startup. user-tier memories are the "
+        "user's own (you cannot create or delete them; correcting their "
+        "content is allowed). When a session is wrapping up, write the diary "
+        "of this session with memory_write_diary."
     )
 
     # Lean variant (5-series models): keeps when-to-use routing and the
@@ -1033,15 +1029,11 @@ class BasicMemoryAgent(AgentInterface):
         "look into the past yourself, use memory_search (memory_read_diary for "
         "a full diary entry); for concrete exchanges and proper nouns that "
         "were never kept in memory, history_search does a keyword search over "
-        "the full conversation logs. Only the beginning of a search result "
-        "stays in context after the turn, so mention anything worth keeping "
-        "in your reply; a memory_read_diary result stays whole. To save or "
-        "correct facts established in conversation, use memory_add / "
-        "memory_update (only when the user asked, or the correction is "
-        "unambiguous; be careful about rewriting). Deletion is memory_delete, "
-        "which requires the user's consent. When a session is wrapping up, "
-        "you may write its diary yourself with memory_write_diary (left "
-        "unwritten, it is generated automatically at the next startup)."
+        "the full conversation logs. To save or correct facts established in "
+        "conversation, use memory_add / memory_update (be careful about "
+        "rewriting). Deletion is memory_delete, which requires the user's "
+        "consent. When a session is wrapping up, write the diary of this "
+        "session with memory_write_diary."
     )
 
     # Trailing system block placed right before the message history.
@@ -4175,10 +4167,8 @@ class BasicMemoryAgent(AgentInterface):
                         "initiative. Fact hits carry an id, used by "
                         "memory_update / memory_delete. Diary hits carry a "
                         "diary_uid, which memory_read_diary expands to the full "
-                        "entry. Note: only the beginning of a search result "
-                        "stays in context after the turn — mention anything "
-                        "important in your reply (a memory_read_diary result, "
-                        "by contrast, stays whole). Meaning of importance: "
+                        "entry. Note: the search result may be truncated from "
+                        "the next turn onward. Meaning of importance: "
                         "user = curated by the user himself (resident every "
                         "session) / high = important (resident every session) / "
                         "low = enters context only when searched or recalled. To "
@@ -4392,11 +4382,7 @@ class BasicMemoryAgent(AgentInterface):
                         "Read one diary entry in full. memory_search hits and "
                         "the auto-recalled ［過去の記憶］ blocks are sentence "
                         "excerpts, so use this when you need the surrounding "
-                        "context. The result STAYS in the conversation context "
-                        "afterwards — no need to read the same diary twice. "
-                        "Because each read occupies "
-                        "context permanently, there is a small per-turn limit; "
-                        "read only what the reply genuinely needs."
+                        "context."
                     ),
                     "parameters": {
                         "type": "object",
@@ -4419,26 +4405,23 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_write_diary",
                     "description": (
-                        "Write THIS session's diary yourself and save it, "
-                        "instead of the automatic generation at the next "
-                        "startup. Use it when the session is wrapping up "
-                        "(e.g. the goodnight exchange). Write in your usual "
-                        "diary voice and length (first person, a few hundred "
-                        "characters, the whole session's arc). If the "
-                        "conversation continues afterwards, call it again "
-                        "before the next goodbye — it overwrites your "
-                        "earlier draft. If you never call it, the diary is "
-                        "generated automatically as before."
+                        "At the end of a session (e.g. the goodnight phase, "
+                        "or other cases where a restart is needed), use this "
+                        "tool to write a diary for this session. Write in "
+                        "your usual diary voice and length (first person, a "
+                        "few hundred characters, the whole session's arc). "
+                        "If the conversation continues afterwards, you may "
+                        "call it again before the next goodbye — it "
+                        "overwrites your earlier draft. If you never call "
+                        "this tool during the whole session, the diary is "
+                        "generated automatically before the next restart."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "content": {
                                 "type": "string",
-                                "description": (
-                                    "The diary text (≥100 characters; same "
-                                    "style as your existing diaries)."
-                                ),
+                                "description": "The diary text (≥100 characters).",
                             }
                         },
                         "required": ["content"],
