@@ -1192,7 +1192,7 @@ class PersistentMemoryManager:
                         {
                             "date": meta.get("date", ""),
                             # the containing diary — usable with
-                            # memory_read_diary / memory_inject
+                            # memory_read_diary
                             "diary_uid": meta.get("parent", ""),
                             "text": c.get("text", ""),
                             "score": round(float(h.get("score", 0.0)), 3),
@@ -1208,6 +1208,48 @@ class PersistentMemoryManager:
         if not entry:
             return None
         return {"date": entry.get("date", ""), "content": entry.get("content", "")}
+
+    def write_session_diary(self, history_uid: str, content: str) -> Dict[str, Any]:
+        """Save the CURRENT session's diary written by the character herself
+        (memory_write_diary, あさひ 08-14).
+
+        Same file shape as the boot-time generation, so backfill's
+        exists→skip check makes them perfect complements: written → the
+        gpt pass never runs; unwritten → generated as before. No
+        ``facts_extracted`` flag, so the fact-extraction pass still
+        processes the session either way. Embedding is deliberately left
+        to the next boot's ensure_indexed — a live session never needs to
+        retrieve its own diary, and the text-drift check re-embeds
+        overwritten drafts. Never raises."""
+        uid = (history_uid or "").strip()
+        content = (content or "").strip()
+        if not uid or not content:
+            return {"status": "error", "message": "セッションか内容が空。"}
+        try:
+            os.makedirs(self._diaries_dir, exist_ok=True)
+            path = os.path.join(self._diaries_dir, f"{uid}.json")
+            overwrote = os.path.exists(path)
+            entry = {
+                "date": self._session_date_from_uid(uid),
+                "history_uid": uid,
+                "content": content,
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(entry, f, ensure_ascii=False, indent=2)
+            return {
+                "status": "ok",
+                "date": entry["date"],
+                "overwrote": overwrote,
+                "note": "保存した。"
+                + (
+                    "以前の下書きを上書きした。"
+                    if overwrote
+                    else "次回起動時の自動生成はスキップされる。"
+                ),
+            }
+        except Exception as e:
+            logger.warning(f"[memory] write_session_diary failed: {e}")
+            return {"status": "error", "message": "日記の保存に失敗した。"}
 
     def resolve_diary_uid(self, fragment: str) -> tuple:
         """Full diary uid from a fragment — the 8-hex short id shown in RAG

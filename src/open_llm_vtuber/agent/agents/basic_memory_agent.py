@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 from loguru import logger
 from .agent_interface import AgentInterface
 from ...web_tools import web_search, web_fetch
-from ...memory.reranker import _compact_sent_ranges
 from ...alarms import resolve_fire_at, format_local
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
@@ -170,17 +169,12 @@ class BasicMemoryAgent(AgentInterface):
         # In-process tool calls made during the CURRENT turn — the log-only
         # "claimed but never called" canary (_check_stateful_claims).
         self._turn_inproc_calls: List[str] = []
-        # Memory blocks pinned via memory_inject — folded into the NEXT
-        # outgoing user message exactly like the RAG/steam blocks
-        # (persist-not-ephemeral), so they stay visible across turns.
-        self._memory_pending_blocks: List[str] = []
-
         # Diary RAG (long-tail recall). _pending_rag_block is the block built
         # for the turn currently being assembled (consumed by _to_messages).
         # Sentence ledger (08-13 redesign): uid → {"got": 1-based sentence
         # numbers already in context, "total": sentence count}. RAG injects
-        # only the set difference per diary; a full-text tool read or
-        # memory_inject pin marks every sentence. Fully-covered diaries leave
+        # only the set difference per diary; a full-text tool read marks
+        # every sentence. Fully-covered diaries leave
         # the retrieval candidate pool; partially-covered ones stay, carrying
         # their 既出 mask into the judge prompt. Session-scoped: the injected
         # blocks live in _memory, so the ledger resets with it.
@@ -1005,6 +999,9 @@ class BasicMemoryAgent(AgentInterface):
 
     # When-to-use only; the two-phase delete flow and tier rules live in the
     # schemas and are enforced mechanically by the handlers regardless.
+    # 08-14 (あさひ): the old "results disappear at the end of the turn"
+    # claim went stale when replay persistence landed — results now stay,
+    # trimmed to their beginning; memory_inject was retired with it.
     _MEMORY_CAPABILITY_NOTE = (
         "[Managing memory] Separate from automatic recall, when you want to look "
         "into the past yourself, use memory_search (memory_read_diary for a full "
@@ -1012,35 +1009,39 @@ class BasicMemoryAgent(AgentInterface):
         "kept in memory, history_search does a keyword search over the full "
         "conversation logs. For both: to narrow by date or period, use the "
         "date_from/date_to arguments — do not mix dates into the query or the "
-        "keywords. Search results disappear at the end of the turn; pin facts "
-        "you want to keep referring to with memory_inject (a diary read via "
-        "memory_read_diary stays in context by itself). To save or correct facts "
+        "keywords. Only the beginning of a search result stays in context after "
+        "the turn, so mention anything worth keeping in your reply; a "
+        "memory_read_diary result stays whole. To save or correct facts "
         "established in conversation, use memory_add / memory_update (only when "
         "the user asked, or the correction is unambiguous; be careful about "
         "rewriting). Deletion is memory_delete, which requires the user's "
         "consent. Additions and corrections are reflected in search immediately, "
         "and enter the resident list from the next startup. user-tier memories "
         "are the user's own (you cannot create or delete them; correcting their "
-        "content is allowed)."
+        "content is allowed). When a session is wrapping up, you may write its "
+        "diary yourself with memory_write_diary (left unwritten, it is "
+        "generated automatically at the next startup)."
     )
 
     # Lean variant (5-series models): keeps when-to-use routing and the
-    # behavioral gates (turn-scoped results + memory_inject pinning, the
-    # save/correct caution, delete consent). Cut: argument mechanics
-    # (date_from/date_to), propagation timing, and tier rules — all of those
-    # live in the schemas and are enforced mechanically by the handlers.
+    # behavioral gates (result-persistence semantics, the save/correct
+    # caution, delete consent). Cut: argument mechanics (date_from/date_to),
+    # propagation timing, and tier rules — all of those live in the schemas
+    # and are enforced mechanically by the handlers.
     _MEMORY_CAPABILITY_NOTE_LEAN = (
         "[Managing memory] Separate from automatic recall, when you want to "
         "look into the past yourself, use memory_search (memory_read_diary for "
         "a full diary entry); for concrete exchanges and proper nouns that "
         "were never kept in memory, history_search does a keyword search over "
-        "the full conversation logs. Search results disappear at the end of "
-        "the turn — pin facts you want to keep referring to with memory_inject "
-        "(a diary read via memory_read_diary stays in context by itself). "
-        "To save or correct facts established in conversation, use memory_add "
-        "/ memory_update (only when the user asked, or the correction is "
+        "the full conversation logs. Only the beginning of a search result "
+        "stays in context after the turn, so mention anything worth keeping "
+        "in your reply; a memory_read_diary result stays whole. To save or "
+        "correct facts established in conversation, use memory_add / "
+        "memory_update (only when the user asked, or the correction is "
         "unambiguous; be careful about rewriting). Deletion is memory_delete, "
-        "which requires the user's consent."
+        "which requires the user's consent. When a session is wrapping up, "
+        "you may write its diary yourself with memory_write_diary (left "
+        "unwritten, it is generated automatically at the next startup)."
     )
 
     # Trailing system block placed right before the message history.
@@ -1135,12 +1136,9 @@ class BasicMemoryAgent(AgentInterface):
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
         "日記の囲みは**文単位の抜粋**である："
         "`〔日記 日付 抜粋・全N句（id: …）〕` の見出しの下に、"
-        "`s番号:` 付きで関連文だけが並ぶ（番号はその日記内の文位置）。"
-        "同じ日記の2回目以降は `〔日記 日付 抜粋・続き〕` となり"
-        "（idは初出の囲みに記載）、`（… は注入済み）` の行はその日記の"
-        "他の文が過去のターンで既に注入され、履歴のどこかにあることを示す。"
-        "抜粋だけでは前後関係が分からず返答の質に関わる場合のみ、"
-        "id を指定して memory_read_diary で全文を読める。\n"
+        "`s番号:` 付きで関連文だけが並ぶ（番号はその日記内の文位置。"
+        "以前のターンに出た文は重複して表示されない）。"
+        "id を memory_read_diary に渡せば、いつでも全文が読める。\n"
         "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
         "[Strict rules on executing tools]\n\n"
         "For any act that changes state — saving, correcting, or deleting "
@@ -1252,12 +1250,9 @@ class BasicMemoryAgent(AgentInterface):
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
         "日記の囲みは**文単位の抜粋**である："
         "`〔日記 日付 抜粋・全N句（id: …）〕` の見出しの下に、"
-        "`s番号:` 付きで関連文だけが並ぶ（番号はその日記内の文位置）。"
-        "同じ日記の2回目以降は `〔日記 日付 抜粋・続き〕` となり"
-        "（idは初出の囲みに記載）、`（… は注入済み）` の行はその日記の"
-        "他の文が過去のターンで既に注入され、履歴のどこかにあることを示す。"
-        "抜粋だけでは前後関係が分からず返答の質に関わる場合のみ、"
-        "id を指定して memory_read_diary で全文を読める。\n"
+        "`s番号:` 付きで関連文だけが並ぶ（番号はその日記内の文位置。"
+        "以前のターンに出た文は重複して表示されない）。"
+        "id を memory_read_diary に渡せば、いつでも全文が読める。\n"
         "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
         "[Thinking]\n\n"
         "Engage your thinking mode for every reply, no matter how small or "
@@ -1709,7 +1704,6 @@ class BasicMemoryAgent(AgentInterface):
         self._pending_facts_block = ""
         self._steam_pending_blocks = []
         self._pending_memory_deletes = {}
-        self._memory_pending_blocks = []
         # Reset banner state; will be set True below if the current
         # session already has messages here, or later by _add_message
         # when the first user message of a fresh session comes in.
@@ -1930,13 +1924,10 @@ class BasicMemoryAgent(AgentInterface):
         # outgoing payload — which is then stored verbatim (stored == sent).
         steam_blocks = self._steam_pending_blocks
         self._steam_pending_blocks = []
-        memory_blocks = self._memory_pending_blocks
-        self._memory_pending_blocks = []
         rag_block = "\n\n".join(
             b
             for b in (self._pending_rag_block, self._pending_facts_block)
             + tuple(steam_blocks)
-            + tuple(memory_blocks)
             if b
         )
         self._pending_rag_block = ""
@@ -2069,8 +2060,8 @@ class BasicMemoryAgent(AgentInterface):
         return e
 
     def _ledger_mark_full(self, uid: str) -> None:
-        """Mark every sentence of ``uid`` as in-context (full-text tool read /
-        memory_inject pin). No-op when the diary is missing or unsplittable."""
+        """Mark every sentence of ``uid`` as in-context (full-text tool
+        read). No-op when the diary is missing or unsplittable."""
         mgr = self._memory_manager
         sents = mgr.diary_sentences(uid) if mgr else []
         if sents:
@@ -2154,7 +2145,7 @@ class BasicMemoryAgent(AgentInterface):
                     continue  # already fully in context — free no-op re-pick
                 if packed and count >= budget:
                     break  # budget reached at a diary boundary — stop packing
-                packed.append({**h, "delta": delta, "had": sorted(got)})
+                packed.append({**h, "delta": delta})
                 count += len(delta)
             if packed:
                 self._pending_rag_block = self._format_diary_rag_block(packed)
@@ -2210,28 +2201,22 @@ class BasicMemoryAgent(AgentInterface):
         """Terse excerpt block for the packed diary sentences.
 
         Diaries appear in judge relevance order; sentences inside each diary
-        in original order with their stable sN labels. The 既出 line points at
-        sentences injected on earlier turns, so the union stays readable
-        without repeating a single byte. The short id lets the model pull the
-        full diary via memory_read_diary; repeat injections drop it — the
-        first block already carries it, and date + 既出 numbers anchor the
-        continuation (semantics explained once in _HISTORY_NOTE — blocks
-        themselves stay minimal)."""
+        in original order with their stable sN labels. Only the ledger DIFF
+        is rendered (sentences already in context are never re-sent); the
+        short id is shown on every block — the 08-13 repeat-omission variant
+        cost more in explanation than it saved, and its 注入済み pointer
+        leaked engineering jargon into model-visible text (あさひ 08-14,
+        both retired). Semantics live once in _HISTORY_NOTE."""
         lines = ["［過去の記憶（自動検索）開始］"]
         for p in packed:
             date = (p.get("date") or "")[:10]
             total = len(p.get("sents") or [])
-            if p.get("had"):
-                lines.append(f"〔日記 {date} 抜粋・続き〕")
-            else:
-                lines.append(
-                    f"〔日記 {date} 抜粋・全{total}句"
-                    f"（id: {self._short_diary_id(p['uid'])}）〕"
-                )
+            lines.append(
+                f"〔日記 {date} 抜粋・全{total}句"
+                f"（id: {self._short_diary_id(p['uid'])}）〕"
+            )
             for n in p["delta"]:
                 lines.append(f"s{n}: {p['sents'][n - 1]}")
-            if p.get("had"):
-                lines.append(f"（{_compact_sent_ranges(p['had'])} は注入済み）")
         lines.append("［過去の記憶終了］")
         return "\n".join(lines)
 
@@ -4188,12 +4173,12 @@ class BasicMemoryAgent(AgentInterface):
                         "and past diary entries). Separate from automatic "
                         "recall: this is how you look into the past on your own "
                         "initiative. Fact hits carry an id, used by "
-                        "memory_update / memory_delete / memory_inject. Diary "
-                        "hits carry a diary_uid, which memory_read_diary expands "
-                        "to the full entry. Note: SEARCH results disappear at "
-                        "the end of this turn — pin facts you want to keep with "
-                        "memory_inject (a memory_read_diary result, by contrast, "
-                        "stays in context by itself). Meaning of importance: "
+                        "memory_update / memory_delete. Diary hits carry a "
+                        "diary_uid, which memory_read_diary expands to the full "
+                        "entry. Note: only the beginning of a search result "
+                        "stays in context after the turn — mention anything "
+                        "important in your reply (a memory_read_diary result, "
+                        "by contrast, stays whole). Meaning of importance: "
                         "user = curated by the user himself (resident every "
                         "session) / high = important (resident every session) / "
                         "low = enters context only when searched or recalled. To "
@@ -4408,8 +4393,8 @@ class BasicMemoryAgent(AgentInterface):
                         "the auto-recalled ［過去の記憶］ blocks are sentence "
                         "excerpts, so use this when you need the surrounding "
                         "context. The result STAYS in the conversation context "
-                        "afterwards — no memory_inject needed, and no need to "
-                        "read the same diary twice. Because each read occupies "
+                        "afterwards — no need to read the same diary twice. "
+                        "Because each read occupies "
                         "context permanently, there is a small per-turn limit; "
                         "read only what the reply genuinely needs."
                     ),
@@ -4432,36 +4417,31 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "function",
                 "function": {
-                    "name": "memory_inject",
+                    "name": "memory_write_diary",
                     "description": (
-                        "Pin the given facts / diary entries into the "
-                        "conversation context. They stay visible from the next "
-                        "user message onward, through the same mechanism as "
-                        "automatic recall. memory_search results vanish at the "
-                        "end of the turn, so inject facts you want to keep "
-                        "using (memory_read_diary results already persist — "
-                        "injecting a diary you just read is redundant). "
-                        "Injected content is not surfaced again by automatic "
-                        "recall."
+                        "Write THIS session's diary yourself and save it, "
+                        "instead of the automatic generation at the next "
+                        "startup. Use it when the session is wrapping up "
+                        "(e.g. the goodnight exchange). Write in your usual "
+                        "diary voice and length (first person, a few hundred "
+                        "characters, the whole session's arc). If the "
+                        "conversation continues afterwards, call it again "
+                        "before the next goodbye — it overwrites your "
+                        "earlier draft. If you never call it, the diary is "
+                        "generated automatically as before."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "fact_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "ids of facts to pin (max 10).",
-                            },
-                            "diary_uids": {
-                                "type": "array",
-                                "items": {"type": "string"},
+                            "content": {
+                                "type": "string",
                                 "description": (
-                                    "diary_uids (or short excerpt-block ids) "
-                                    "to pin (max 3; the full entry is "
-                                    "included)."
+                                    "The diary text (≥100 characters; same "
+                                    "style as your existing diaries)."
                                 ),
-                            },
+                            }
                         },
+                        "required": ["content"],
                     },
                 },
             },
@@ -4612,7 +4592,7 @@ class BasicMemoryAgent(AgentInterface):
         "memory_update",
         "memory_delete",
         "memory_read_diary",
-        "memory_inject",
+        "memory_write_diary",
     )
     # Per-operation marker text is built by _memory_marker (📝 *記憶◯◯: …*);
     # display/history only — stripped from the AI replay like all markers.
@@ -5370,8 +5350,8 @@ class BasicMemoryAgent(AgentInterface):
                 result = await self._memory_delete_flow(args)
             elif name == "memory_read_diary":
                 result = self._memory_read_diary_query(args)
-            elif name == "memory_inject":
-                result = self._memory_inject_query(args)
+            elif name == "memory_write_diary":
+                result = self._memory_write_diary_query(args)
             else:
                 return None, {
                     "status": "error",
@@ -5406,11 +5386,10 @@ class BasicMemoryAgent(AgentInterface):
             label = f"記憶更新: {_clip(args.get('new_fact'))}"
         elif name == "memory_read_diary":
             label = f"日記閲覧: {_clip(result.get('date') or args.get('diary_uid'))}"
-        elif name == "memory_inject":
-            n = int(result.get("injected_facts", 0)) + int(
-                result.get("injected_diaries", 0)
+        elif name == "memory_write_diary":
+            label = f"日記記入: {_clip(result.get('date') or '')}" + (
+                "（上書き）" if result.get("overwrote") else ""
             )
-            label = f"記憶注入: {n}件"
         elif status == "pending_approval":
             label = f"記憶削除申請: {_clip(result.get('fact'))}"
         else:
@@ -5493,68 +5472,35 @@ class BasicMemoryAgent(AgentInterface):
             "status": "ok",
             "diary_uid": uid,
             **entry,
-            "note": "この全文はこのまま会話の文脈に残る（再読・memory_inject不要）。",
+            "note": "この全文はこのまま会話の文脈に残る（再読は不要）。",
         }
 
-    def _memory_inject_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Pin facts/diaries into the conversation context, RAG-style.
+    def _memory_write_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Write THIS session's diary (memory_write_diary, あさひ 08-14).
 
-        Builds a block folded into the NEXT outgoing user message (persist-
-        not-ephemeral, same seam as the RAG blocks) and marks the ids as
-        session-injected so auto-RAG never re-surfaces them."""
-        mgr = self._memory_manager
-        fact_ids = [
-            str(x).strip() for x in (args.get("fact_ids") or []) if str(x).strip()
-        ][:10]
-        diary_uids = [
-            str(x).strip() for x in (args.get("diary_uids") or []) if str(x).strip()
-        ][:3]
-        if not fact_ids and not diary_uids:
+        Replaces the boot-time generation for sessions she closes herself:
+        the file lands in diaries/ in the exact backfill shape, so the next
+        startup sees it and skips the LLM pass (exists → skip), while the
+        fact-extraction pass still picks it up (no facts_extracted flag).
+        Restricted to the CURRENT session — past diaries stay immutable
+        (sentence numbering / ledger / embeddings all assume it). Calling
+        again overwrites her own draft (session continued past the first
+        goodnight); the index drift check re-embeds the changed chunks at
+        the next boot."""
+        content = str(args.get("content", "")).strip()
+        if len(content) < 100:
             return {
                 "status": "error",
-                "message": "fact_ids か diary_uids のどちらかが必要。",
+                "message": "内容が短すぎる（100字以上。セッション全体を振り返って書くこと）。",
             }
-        lines: List[str] = []
-        injected_facts: List[str] = []
-        injected_diaries: List[str] = []
-        missing: List[str] = []
-        for fid in fact_ids:
-            f = mgr.find_fact(fid)
-            if not f:
-                missing.append(fid)
-                continue
-            date = str(f.get("updated", ""))[:10]
-            lines.append(f"- [{date}] {f.get('fact', '')}")
-            injected_facts.append(fid)
-        for frag in diary_uids:
-            uid, _matches = mgr.resolve_diary_uid(frag)
-            e = mgr.read_diary_full(uid) if uid else None
-            if not e:
-                missing.append(frag)
-                continue
-            lines.append(f"[日記 {e.get('date') or uid}]\n{e.get('content', '')}")
-            injected_diaries.append(uid)
-        if not lines:
-            return {
-                "status": "error",
-                "message": "指定のidが1件も見つからない。",
-                "missing": missing,
-            }
-        self._memory_pending_blocks.append(
-            "【記憶（自分で呼び出して文脈に固定した分）】\n" + "\n".join(lines)
-        )
-        # Auto-RAG must not re-surface what is now pinned in context.
-        self._session_injected_fact_ids.update(injected_facts)
-        for uid in injected_diaries:
-            self._ledger_mark_full(uid)
-        result: Dict[str, Any] = {
-            "status": "ok",
-            "injected_facts": len(injected_facts),
-            "injected_diaries": len(injected_diaries),
-            "note": "次のユーザーメッセージから文脈に残り続ける。自動想起はこれらを重複表示しない。",
-        }
-        if missing:
-            result["missing"] = missing
+        if not self._history_uid:
+            return {"status": "error", "message": "現在のセッションが特定できない。"}
+        result = self._memory_manager.write_session_diary(self._history_uid, content)
+        if result.get("status") == "ok":
+            logger.info(
+                f"[diary_write] session diary saved by the character "
+                f"({len(content)}字, overwrote={result.get('overwrote', False)})"
+            )
         return result
 
     async def _memory_delete_flow(self, args: Dict[str, Any]) -> Dict[str, Any]:
