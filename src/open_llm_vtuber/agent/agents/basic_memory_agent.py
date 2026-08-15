@@ -407,6 +407,14 @@ class BasicMemoryAgent(AgentInterface):
     _MILLITOK_CJK = 900  # chars above U+2E7F
     _MILLITOK_OTHER = 263  # ≈1/3.8 tok per char
     _PROTOCOL_TRUNCATION_MARKER = "…[truncated for replay]"
+    # Substitute output for a thinking-only turn (billed reasoning, zero
+    # visible text — an Opus 5 failure shape that spiked to 4x in two days,
+    # あさひ 08-15). Overrides the 07-25 "never rewrite model output" rule
+    # for THIS bug: an omitted assistant turn replays as two consecutive
+    # user messages — the exact shape that seeded fabricated-input
+    # imitation (08-05). Stored in history AND appended to the protocol's
+    # final assistant message as a text block.
+    _EMPTY_TURN_PLACEHOLDER = "【…】"
 
     @classmethod
     def _token_cut(cls, text: str, budget_millitok: int) -> tuple:
@@ -2848,13 +2856,12 @@ class BasicMemoryAgent(AgentInterface):
                     # Thinking-only turn: billed reasoning, zero visible text
                     # (max_tokens ate the budget mid-thinking, or the model
                     # ended the turn silently — refusals were handled above).
-                    # Never synthesize an utterance for it (あさひ 07-25:
-                    # rewriting the model's own output teaches it the
-                    # pattern). The verbatim transcript IS the true record:
-                    # commit it with empty text so the session keeps the turn
-                    # (thinking and executed tools included); replay paths
-                    # that lack the transcript omit the message entirely —
-                    # the only API-legal fallback for a text-less turn.
+                    # 08-15 (あさひ, after 4 such turns in two days): store
+                    # the 【…】 placeholder as the utterance — the earlier
+                    # keep-it-empty policy made replays show two consecutive
+                    # user messages, the fabricated-input imitation shape.
+                    # The transcript still carries the true thinking; only
+                    # the missing text block is substituted.
                     if not self._claude_thinking_blocks_replayable(
                         current_assistant_message_content
                     ):
@@ -2864,77 +2871,81 @@ class BasicMemoryAgent(AgentInterface):
                         protocol_is_exact = False
                     logger.warning(
                         "[empty_reply] turn ended with no visible text "
-                        f"(thinking_tokens={turn_thinking_tokens}) — keeping "
-                        "the transcript in-session; no utterance synthesized."
+                        f"(thinking_tokens={turn_thinking_tokens}) — storing "
+                        f"the {self._EMPTY_TURN_PLACEHOLDER} placeholder."
                     )
-                if current_turn_text or (
+                text_for_memory = current_turn_text or self._EMPTY_TURN_PLACEHOLDER
+                protocol_for_memory: Optional[List[Dict[str, Any]]] = None
+                if (
                     protocol_is_exact
                     and current_assistant_message_is_exact
                     and current_assistant_message_content
                 ):
-                    protocol_for_memory: Optional[List[Dict[str, Any]]] = None
-                    if (
-                        protocol_is_exact
-                        and current_assistant_message_is_exact
-                        and current_assistant_message_content
-                    ):
-                        final_assistant = {
-                            "role": "assistant",
-                            "content": deepcopy(current_assistant_message_content),
-                        }
-                        round_thinking.append(request_thinking_tokens)
-                        # Per-round trim (08-09, replaces the 07-25 whole-turn
-                        # gate): tool_result content truncated as before, and
-                        # each round's thinking dropped ONLY if that round
-                        # exceeded the cap — probe-proven safe on completed
-                        # turns. A long-thinking turn keeps its tool calls and
-                        # text instead of losing the whole transcript.
-                        (
-                            protocol_for_memory,
-                            kept_rounds,
-                            dropped_rounds,
-                        ) = self._trim_protocol_per_round(
-                            claude_protocol + [final_assistant],
-                            round_thinking,
-                            replay_cap,
-                        )
-                        if dropped_rounds:
-                            # Next turn's user payload opens with the drop
-                            # notice (see _to_messages) so the missing
-                            # precedent isn't imitated as "think less".
-                            self._pending_thinking_drop_notice = True
-                            logger.info(
-                                f"[thinking_replay] dropped thinking from "
-                                f"{dropped_rounds} round(s) over cap "
-                                f"{replay_cap} (turn total "
-                                f"{turn_thinking_tokens} tok) — notice staged "
-                                "for next turn."
-                            )
-                        # Stage the WHOLE trimmed protocol as the on-disk
-                        # cold-start seed (あさひ 07-24: replaying a tool turn
-                        # without its tool machinery rewrites history into a
-                        # "results without calls" shape — with the precedent
-                        # effect this strong, that teaches fabrication).
-                        # tool_result content is already truncated above with
-                        # an explanatory marker; those are unsigned client
-                        # messages, so truncation cannot trip validation.
-                        # round_thinking (kept-round alignment) lets
-                        # _apply_thinking_seeds re-trim against a cap that
-                        # shrank between store and reload.
-                        if self._claude_protocol_worth_carrying(protocol_for_memory):
-                            self._last_thinking_seed = {
-                                "model": getattr(self._llm, "model", "") or "",
-                                "protocol": deepcopy(protocol_for_memory),
-                                "thinking_tokens": turn_thinking_tokens,
-                                "round_thinking": list(kept_rounds),
+                    final_content = deepcopy(current_assistant_message_content)
+                    if not current_turn_text:
+                        final_content.append(
+                            {
+                                "type": "text",
+                                "text": self._EMPTY_TURN_PLACEHOLDER,
                             }
-                        else:
-                            protocol_for_memory = None
-                    self._add_message(
-                        current_turn_text,
-                        "assistant",
-                        claude_protocol=protocol_for_memory,
+                        )
+                    final_assistant = {
+                        "role": "assistant",
+                        "content": final_content,
+                    }
+                    round_thinking.append(request_thinking_tokens)
+                    # Per-round trim (08-09, replaces the 07-25 whole-turn
+                    # gate): tool_result content truncated as before, and
+                    # each round's thinking dropped ONLY if that round
+                    # exceeded the cap — probe-proven safe on completed
+                    # turns. A long-thinking turn keeps its tool calls and
+                    # text instead of losing the whole transcript.
+                    (
+                        protocol_for_memory,
+                        kept_rounds,
+                        dropped_rounds,
+                    ) = self._trim_protocol_per_round(
+                        claude_protocol + [final_assistant],
+                        round_thinking,
+                        replay_cap,
                     )
+                    if dropped_rounds:
+                        # Next turn's user payload opens with the drop
+                        # notice (see _to_messages) so the missing
+                        # precedent isn't imitated as "think less".
+                        self._pending_thinking_drop_notice = True
+                        logger.info(
+                            f"[thinking_replay] dropped thinking from "
+                            f"{dropped_rounds} round(s) over cap "
+                            f"{replay_cap} (turn total "
+                            f"{turn_thinking_tokens} tok) — notice staged "
+                            "for next turn."
+                        )
+                    # Stage the WHOLE trimmed protocol as the on-disk
+                    # cold-start seed (あさひ 07-24: replaying a tool turn
+                    # without its tool machinery rewrites history into a
+                    # "results without calls" shape — with the precedent
+                    # effect this strong, that teaches fabrication).
+                    # tool_result content is already truncated above with
+                    # an explanatory marker; those are unsigned client
+                    # messages, so truncation cannot trip validation.
+                    # round_thinking (kept-round alignment) lets
+                    # _apply_thinking_seeds re-trim against a cap that
+                    # shrank between store and reload.
+                    if self._claude_protocol_worth_carrying(protocol_for_memory):
+                        self._last_thinking_seed = {
+                            "model": getattr(self._llm, "model", "") or "",
+                            "protocol": deepcopy(protocol_for_memory),
+                            "thinking_tokens": turn_thinking_tokens,
+                            "round_thinking": list(kept_rounds),
+                        }
+                    else:
+                        protocol_for_memory = None
+                self._add_message(
+                    text_for_memory,
+                    "assistant",
+                    claude_protocol=protocol_for_memory,
+                )
                 return
 
     async def _openai_tool_interaction_loop(
@@ -3330,18 +3341,24 @@ class BasicMemoryAgent(AgentInterface):
                     "thinking entirely."
                 )
             if not complete_response and claude_assistant_message is not None:
-                # Thinking-only turn — same treatment as the tool loop: keep
-                # the true transcript with empty text, synthesize nothing.
+                # Thinking-only turn — same treatment as the tool loop
+                # (08-15): substitute the 【…】 placeholder so replays keep
+                # an assistant turn between the user messages.
                 logger.warning(
                     "[empty_reply] turn ended with no visible text "
-                    f"(thinking_tokens={plain_thinking_tokens}) — keeping "
-                    "the transcript in-session; no utterance synthesized."
+                    f"(thinking_tokens={plain_thinking_tokens}) — storing "
+                    f"the {self._EMPTY_TURN_PLACEHOLDER} placeholder."
                 )
                 if not self._claude_thinking_blocks_replayable(
                     claude_assistant_message.get("content") or []
                 ):
                     # Unsigned (max_tokens cut) — unreplayable; drop the turn.
                     claude_assistant_message = None
+                else:
+                    claude_assistant_message = deepcopy(claude_assistant_message)
+                    claude_assistant_message.setdefault("content", []).append(
+                        {"type": "text", "text": self._EMPTY_TURN_PLACEHOLDER}
+                    )
             plain_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
             if plain_cap and plain_thinking_tokens > plain_cap:
                 # Single-request turn = single round, so the per-round rule
@@ -3371,7 +3388,7 @@ class BasicMemoryAgent(AgentInterface):
                         "protocol": [deepcopy(claude_assistant_message)],
                     }
                 self._add_message(
-                    complete_response,
+                    complete_response or self._EMPTY_TURN_PLACEHOLDER,
                     "assistant",
                     claude_protocol=(
                         [claude_assistant_message]
