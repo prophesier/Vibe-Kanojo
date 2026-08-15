@@ -4349,6 +4349,16 @@ class BasicMemoryAgent(AgentInterface):
                                     "Omit to keep the current tier."
                                 ),
                             },
+                            "store_id": {
+                                "type": "string",
+                                "description": (
+                                    "Uber store linkage. Omit to leave it "
+                                    "unchanged. Pass a store_uuid to set or "
+                                    "replace it. CAUTION: an empty string "
+                                    "DELETES the existing linkage — never "
+                                    "pass empty unless you mean to clear it."
+                                ),
+                            },
                         },
                         "required": ["fact_id"],
                     },
@@ -5343,10 +5353,14 @@ class BasicMemoryAgent(AgentInterface):
                     store_id=str(args.get("store_id", "") or ""),
                 )
             elif name == "memory_update":
+                # store_id: absent → None (untouched); present-but-empty is a
+                # deliberate CLEAR, so no str-or-None coercion here.
+                raw_sid = args.get("store_id")
                 result = await mgr.update_fact_manual(
                     str(args.get("fact_id", "")).strip(),
                     str(args.get("new_fact", "")),
                     importance=(str(args.get("importance", "")).strip() or None),
+                    store_id=None if raw_sid is None else str(raw_sid),
                 )
             elif name == "memory_delete":
                 result = await self._memory_delete_flow(args)

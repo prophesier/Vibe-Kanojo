@@ -948,6 +948,7 @@ class PersistentMemoryManager:
         fact_id: str,
         new_text: str = "",
         importance: Optional[str] = None,
+        store_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Rewrite a fact's text and/or change its importance (memory_update).
 
@@ -956,7 +957,9 @@ class PersistentMemoryManager:
         user-tier facts and DELETING them). The TIER of a user-tier fact is
         equally the user's own — the character may not promote or demote it
         (あさひ 2026-08-09: importance change added for high/low; ``user``
-        stays manual-only in both directions)."""
+        stays manual-only in both directions). ``store_id`` (08-15): None =
+        untouched, empty string = clear the linkage, else set (stored as
+        the 8-char short)."""
         new_text = " ".join((new_text or "").split())
         importance = (importance or "").strip().lower() or None
         if importance == "llm":  # legacy spelling of "high"
@@ -966,10 +969,12 @@ class PersistentMemoryManager:
                 "status": "error",
                 "message": "importance は high / low のみ（user は本人管理で指定不可）。",
             }
-        if not new_text and importance is None:
+        if store_id is not None:
+            store_id = store_id.strip()
+        if not new_text and importance is None and store_id is None:
             return {
                 "status": "error",
-                "message": "新しい本文か importance のどちらかが必要。",
+                "message": "新しい本文か importance か store_id のどれかが必要。",
             }
         facts = self._load_facts()
         for f in facts:
@@ -988,6 +993,11 @@ class PersistentMemoryManager:
                     f["fact"] = new_text
                 if importance is not None:
                     f["importance"] = importance
+                if store_id is not None:
+                    if store_id:
+                        f["store_id"] = store_id[:8]
+                    else:
+                        f.pop("store_id", None)
                 f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self._save_facts(facts)
                 await self._sync_facts_index()
@@ -1006,6 +1016,12 @@ class PersistentMemoryManager:
                     notes.append("本文は変更なし（idも不変）。")
                 if importance is not None and importance != old_tier:
                     notes.append(f"importance を {old_tier}→{importance} に変更。")
+                if store_id is not None:
+                    notes.append(
+                        f"store_id を {store_id[:8]} に設定。"
+                        if store_id
+                        else "store_id を削除。"
+                    )
                 notes.append("常駐リストへの反映は次回起動から。")
                 return {"status": "ok", "id": new_id, "note": " ".join(notes)}
         return {
