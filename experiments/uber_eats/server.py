@@ -113,6 +113,62 @@ def _resolve_store_uuid(s: str) -> str | None:
     return entry.get("uuid") if entry else None
 
 
+# Same short-id treatment for ITEM uuids (08-15, あさひ: menus repeat the
+# 36-char uuid per item — the biggest remaining bulk). Flat short→full map;
+# no names needed, items resolve only for uber_item calls.
+_ITEM_IDS_PATH = HERE / "_item_ids.json"
+
+
+def _load_item_ids() -> dict:
+    try:
+        with open(_ITEM_IDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+_item_ids: dict = _load_item_ids()
+
+
+def _save_item_ids() -> None:
+    try:
+        tmp = _ITEM_IDS_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_item_ids, f)
+        tmp.replace(_ITEM_IDS_PATH)
+    except Exception as e:
+        logger.warning(f"item-id registry save failed: {e}")
+
+
+def _register_item(uuid: str) -> str:
+    uuid = (uuid or "").strip()
+    if len(uuid) < _SHORT_LEN:
+        return uuid
+    short = uuid[:_SHORT_LEN]
+    known = _item_ids.get(short)
+    if known and known != uuid:
+        return uuid  # collision — this item keeps its full uuid visible
+    _item_ids[short] = uuid
+    return short
+
+
+def _resolve_item_uuid(s: str) -> str | None:
+    s = (s or "").strip()
+    if len(s) >= 32:
+        return s
+    return _item_ids.get(s[:_SHORT_LEN])
+
+
+# Appended once under menu/item listings — explains the row-tail id and the
+# ⚙ mark in ONE place instead of per row (the old per-item arrow text and
+# the orphaned bare ⚙ both died here, 08-15).
+_MENU_FOOT = (
+    "\n※ 商品行末の英数字がその商品の item_uuid（uber_item で選択肢・詳細）。"
+    "⚙ はトッピング等の選択肢あり。"
+)
+
+
 async def _run(coro, what: str):
     """Run a client coroutine with a hard timeout; never raise. Returns
     ``(ok, value_or_message)``."""
@@ -303,7 +359,8 @@ async def uber_store(store_uuid: str, section: str = "") -> str:
             "\n※ カテゴリの全品を見るには uber_store を store_uuid と "
             "section=カテゴリ名 で再呼び出し。必要なカテゴリだけ絞って呼ぶこと。"
         )
-        return "\n".join(lines) + _RESULT_NOTE
+        _save_item_ids()
+        return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
     if not data.get("menu"):
         lines.append("（メニュー項目を取得できませんでした）")
     if data.get("section_view"):
@@ -316,7 +373,8 @@ async def uber_store(store_uuid: str, section: str = "") -> str:
         lines.append(f"\n▼ カテゴリ「{data['section_view']}」{cap}")
         for it in data["menu"][0]["items"]:
             lines.append(_fmt_menu_item(it))
-        return "\n".join(lines) + _RESULT_NOTE
+        _save_item_ids()
+        return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
     for sec in data["menu"]:
         if sec.get("section"):
             lines.append(f"\n■ {sec['section']}")
@@ -324,13 +382,15 @@ async def uber_store(store_uuid: str, section: str = "") -> str:
             lines.append(_fmt_menu_item(it))
     if data.get("truncated"):
         lines.append("\n…（メニューは一部のみ表示）")
-    return "\n".join(lines) + _RESULT_NOTE
+    _save_item_ids()
+    return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
 
 
 def _fmt_menu_item(it: dict) -> str:
-    """One menu line: name/price/likes, promo, description, bare item_uuid
-    (⚙ suffix = customizable). Same shape in digest and full views — desc
-    and uuid are load-bearing everywhere (あさひ 08-13)."""
+    """One menu line: name/price/likes with the short item id as the last
+    field (⚙ suffix = customizable), then promo and description. Same shape
+    in digest and full views — desc and id are load-bearing everywhere
+    (あさひ 08-13)."""
     so = "[品切れ] " if it.get("sold_out") else ""
     price = f"  {it['price']}" if it.get("price") else ""
     if price and it.get("orig_price"):
@@ -347,16 +407,15 @@ def _fmt_menu_item(it: dict) -> str:
     else:
         endo = ""
     line = f"- {so}{it['name']}{price}{endo}"
+    # The item id rides the info line as the LAST field, like store rows
+    # (08-15); _MENU_FOOT explains it and the ⚙ mark once per listing.
+    if it.get("item_uuid"):
+        gear = " ⚙" if it.get("customizable") else ""
+        line += f" · {_register_item(it['item_uuid'])}{gear}"
     if it.get("promo"):
         line += f"\n    🎁 {it['promo']}"
     if it.get("desc"):
         line += f"\n    {it['desc']}"
-    # Bare uuid line — the docstring teaches uber_item usage once; the old
-    # per-item "→ uber_item(...)" arrow text was broadcast N times per menu
-    # and burned tokens for nothing (あさひ 08-13). ⚙ = customizable.
-    if it.get("item_uuid"):
-        gear = " ⚙" if it.get("customizable") else ""
-        line += f"\n    item_uuid: {it['item_uuid']}{gear}"
     return line
 
 
@@ -372,10 +431,11 @@ def _fmt_catalog_item(it: dict) -> str:
     else:
         endo = ""
     line = f"- {so}{it['name']}{price}{endo}"
+    if it.get("item_uuid"):
+        gear = " ⚙" if it.get("customizable") else ""
+        line += f" · {_register_item(it['item_uuid'])}{gear}"
     if it.get("promo"):
         line += f"\n    🎁 {it['promo']}"
-    if it.get("customizable") and it.get("item_uuid"):
-        line += f"\n    ⚙ 選択肢あり → uber_item(item_uuid: {it['item_uuid']})"
     return line
 
 
@@ -435,14 +495,15 @@ async def uber_category(
         lines.append(
             f"\n…（続きあり。offset={data['next_offset']} を uber_category に渡すと続き）"
         )
-    return "\n".join(lines) + _RESULT_NOTE
+    _save_item_ids()
+    return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
 
 
 @mcp.tool()
 async def uber_item(store_uuid: str, item_uuid: str) -> str:
-    """Get an item's details. Pass store_uuid and item_uuid (shown for items
-    marked "⚙" in the uber_store results). Returns the available options and
-    their surcharges: toppings, set contents, sizes, and so on.
+    """Get an item's details. Pass store_uuid and item_uuid (the trailing id
+    of an item row in the uber_store results). Returns the available options
+    and their surcharges: toppings, set contents, sizes, and so on.
     Browse-only: you cannot order or pay."""
     full_uuid = _resolve_store_uuid(store_uuid)
     if not full_uuid:
@@ -450,8 +511,14 @@ async def uber_item(store_uuid: str, item_uuid: str) -> str:
             f"store_uuid {store_uuid!r} が見つかりません。"
             "先に uber_search で店を検索してください。"
         )
+    full_item = _resolve_item_uuid(item_uuid)
+    if not full_item:
+        return (
+            f"item_uuid {item_uuid!r} が見つかりません。"
+            "先に uber_store でメニューを表示してください。"
+        )
     ok, data = await _run(
-        _client.item(full_uuid, item_uuid), f"uber_item({item_uuid!r})"
+        _client.item(full_uuid, full_item), f"uber_item({item_uuid!r})"
     )
     if not ok:
         return f"商品詳細を取得できませんでした: {data}"

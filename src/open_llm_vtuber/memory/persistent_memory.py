@@ -856,12 +856,14 @@ class PersistentMemoryManager:
             except Exception as e:
                 logger.warning(f"[uber_facts] semantic wave failed: {e}")
 
-        # ---- Merge: B-first (result order); A's best keeps a slot when full ----
+        # ---- Merge: B-first (result order); A's best keeps a slot when full.
+        # A contributes at most 2 either way (あさひ 08-15: unlimited topical
+        # backfill just stuffed every free slot with noise). ----
         b_order = sorted(scored, key=lambda i: scored[i])
         if len(b_order) >= cap and a_order:
             final = b_order[: cap - 1] + a_order[:1]
         else:
-            final = (b_order + a_order)[:cap]
+            final = (b_order + a_order[:2])[:cap]
         return [
             {
                 "id": fid,
