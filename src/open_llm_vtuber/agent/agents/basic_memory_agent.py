@@ -1,4 +1,4 @@
-﻿from typing import (
+from typing import (
     AsyncIterator,
     List,
     Dict,
@@ -199,7 +199,6 @@ class BasicMemoryAgent(AgentInterface):
         # Fingerprint of the last system prompt, for diagnosing prompt-cache
         # drops: a change between turns is exactly what busts the prefix cache.
         self._last_system_fp: str = ""
-
         # Tracks whether the current session's banner has already been
         # prepended in _memory. Set by set_memory_from_recent_histories
         # when the current session had pre-existing messages, OR by
@@ -1494,6 +1493,29 @@ class BasicMemoryAgent(AgentInterface):
         blocks.append({"type": "text", "text": self._history_note()})
         return blocks
 
+    # Anthropic's cache lookup only checks ~20 content-block boundaries
+    # BEFORE each breakpoint (08-16 incident: a 4-round tool turn expanded
+    # to ~27 blocks, every message-level entry fell out of the window and
+    # the whole messages region — 31k — rewrote). Keep a 2-block margin.
+    _BP_LOOKBACK_BUDGET = 18
+    # Wire-block index (content blocks, protocol-expanded) of the last
+    # message-level cache entry; the next bp must land within
+    # _BP_LOOKBACK_BUDGET blocks of it. Class-level default, instance
+    # attribute once a marker is placed.
+    _bp_wire_anchor: Optional[int] = None
+
+    @staticmethod
+    def _wire_blocks(message: Dict[str, Any]) -> int:
+        """Content blocks this message expands to on the wire."""
+        proto = message.get("claude_protocol")
+        if isinstance(proto, list) and proto:
+            return sum(
+                len(m.get("content")) if isinstance(m.get("content"), list) else 1
+                for m in proto
+            )
+        c = message.get("content")
+        return len(c) if isinstance(c, list) else 1
+
     def _attach_cache_breakpoint(
         self, messages: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
@@ -1504,6 +1526,15 @@ class BasicMemoryAgent(AgentInterface):
         The preceding user message still provides an incremental cache
         breakpoint without modifying the latest assistant response.
 
+        08-16 lookback budget: if the natural position sits more than
+        _BP_LOOKBACK_BUDGET wire blocks past the previous entry
+        (``_bp_wire_anchor``), the marker moves back inside the window —
+        onto an earlier eligible message, or (a monster tool turn) INTO the
+        trimmed protocol expansion via the ``_bp_inner_block`` tag that
+        claude_llm consumes. The tail past the marker rides fresh once and
+        the next turn's write covers it; positions converge back to natural
+        over subsequent turns.
+
         Returns a new list with one message replaced; the original message
         objects (which live in self._memory) are not mutated. Only applies for
         Claude LLM — otherwise returns messages unchanged.
@@ -1512,19 +1543,83 @@ class BasicMemoryAgent(AgentInterface):
             return messages
 
         new_messages = list(messages)
-        for index in range(len(new_messages) - 1, -1, -1):
-            candidate = new_messages[index]
-            if candidate.get("claude_protocol") or candidate.get("thinking_blocks"):
-                continue
-            # Silent-turn placeholders (empty content, 08-07) can't take the
-            # marker: wrapping "" into a text block would send an empty text
-            # block, which the API rejects.
-            if not candidate.get("content"):
-                continue
+        ends: List[int] = []
+        total = 0
+        for m in new_messages:
+            total += self._wire_blocks(m)
+            ends.append(total)
 
-            content = candidate.get("content")
-            if isinstance(content, str):
-                replacement = {
+        natural = self._bp_natural_index(new_messages)
+        if natural is None:
+            return new_messages
+        index = natural
+        anchor = self._bp_wire_anchor
+        limit = None if anchor is None else anchor + self._BP_LOOKBACK_BUDGET
+        if limit is not None and ends[natural] > limit:
+            fallback = None
+            for j in range(natural - 1, -1, -1):
+                if ends[j] <= (anchor or 0):
+                    break
+                if ends[j] <= limit and self._bp_mark(new_messages[j]) is not None:
+                    fallback = j
+                    break
+            if fallback is not None:
+                index = fallback
+                logger.info(
+                    f"[cache] bp walked back to msg[{index}] "
+                    f"(natural end {ends[natural]} > anchor {anchor}+"
+                    f"{self._BP_LOOKBACK_BUDGET} lookback budget)."
+                )
+            else:
+                for j, m in enumerate(new_messages):
+                    start = ends[j] - self._wire_blocks(m)
+                    if start < limit <= ends[j] and m.get("claude_protocol"):
+                        new_messages[j] = {**m, "_bp_inner_block": limit - start}
+                        self._bp_wire_anchor = limit
+                        logger.info(
+                            f"[cache] bp placed INSIDE msg[{j}]'s protocol at "
+                            f"block {limit - start} (turn too large for the "
+                            "lookback window; tail rides fresh once)."
+                        )
+                        return new_messages
+                logger.warning(
+                    f"[cache] no bp position within lookback budget "
+                    f"(anchor {anchor}, natural end {ends[natural]}) — "
+                    "keeping natural placement; one-shot rewrite expected."
+                )
+
+        marked = self._bp_mark(new_messages[index])
+        if marked is not None:
+            replacement, covered = marked
+            new_messages[index] = replacement
+            self._bp_wire_anchor = (
+                ends[index] - self._wire_blocks(new_messages[index]) + covered
+            )
+        return new_messages
+
+    def _bp_natural_index(self, messages: List[Dict[str, Any]]) -> Optional[int]:
+        """Index of the newest message eligible to carry the marker."""
+        for index in range(len(messages) - 1, -1, -1):
+            if self._bp_mark(messages[index]) is not None:
+                return index
+        return None
+
+    def _bp_mark(self, candidate: Dict[str, Any]) -> Optional[tuple]:
+        """(marked copy, wire blocks covered by the entry) — or None when the
+        message cannot carry the marker (protocol/thinking entries, empty
+        placeholders, bare-image messages)."""
+        if candidate.get("claude_protocol") or candidate.get("thinking_blocks"):
+            return None
+        # Silent-turn placeholders (empty content, 08-07) can't take the
+        # marker: wrapping "" into a text block would send an empty text
+        # block, which the API rejects.
+        if not candidate.get("content"):
+            return None
+
+        content = candidate.get("content")
+        if isinstance(content, str):
+            return (
+                {
                     **candidate,
                     "content": [
                         {
@@ -1533,42 +1628,39 @@ class BasicMemoryAgent(AgentInterface):
                             "cache_control": self._CACHE_CONTROL_1H,
                         }
                     ],
-                }
-            elif isinstance(content, list) and content:
-                # Image blocks are never cached: _add_message keeps only the
-                # text, so an image exists for exactly one request — a prefix
-                # containing it can never re-occur. But the LEADING text
-                # blocks (payload rides first by construction) are stored
-                # verbatim, so the marker goes on the last text block BEFORE
-                # the first non-text block (あさひ 08-09): the whole prior
-                # prefix — a tool turn's protocol replay included — direct-
-                # writes on this request, and only the image itself rides
-                # fresh. Next turn the message replays text-only and the
-                # cached span still matches (string ↔ wrapped-block
-                # equivalence is production-proven). The old whole-message
-                # skip parked the marker on an already-cached boundary and
-                # re-paid the protocol replay as fresh — compounding across
-                # consecutive image turns. A message with no leading text
-                # (bare image) still cannot be marked at all.
-                cut = len(content)
-                for i, block in enumerate(content):
-                    if not (isinstance(block, dict) and block.get("type") == "text"):
-                        cut = i
-                        break
-                if cut == 0:
-                    continue
-                new_content = [dict(block) for block in content]
-                new_content[cut - 1] = {
-                    **new_content[cut - 1],
-                    "cache_control": self._CACHE_CONTROL_1H,
-                }
-                replacement = {**candidate, "content": new_content}
-            else:
-                continue
-
-            new_messages[index] = replacement
-            break
-        return new_messages
+                },
+                1,
+            )
+        if isinstance(content, list) and content:
+            # Image blocks are never cached: _add_message keeps only the
+            # text, so an image exists for exactly one request — a prefix
+            # containing it can never re-occur. But the LEADING text
+            # blocks (payload rides first by construction) are stored
+            # verbatim, so the marker goes on the last text block BEFORE
+            # the first non-text block (あさひ 08-09): the whole prior
+            # prefix — a tool turn's protocol replay included — direct-
+            # writes on this request, and only the image itself rides
+            # fresh. Next turn the message replays text-only and the
+            # cached span still matches (string ↔ wrapped-block
+            # equivalence is production-proven). The old whole-message
+            # skip parked the marker on an already-cached boundary and
+            # re-paid the protocol replay as fresh — compounding across
+            # consecutive image turns. A message with no leading text
+            # (bare image) still cannot be marked at all.
+            cut = len(content)
+            for i, block in enumerate(content):
+                if not (isinstance(block, dict) and block.get("type") == "text"):
+                    cut = i
+                    break
+            if cut == 0:
+                return None
+            new_content = [dict(block) for block in content]
+            new_content[cut - 1] = {
+                **new_content[cut - 1],
+                "cache_control": self._CACHE_CONTROL_1H,
+            }
+            return ({**candidate, "content": new_content}, cut)
+        return None
 
     @staticmethod
     def _strip_cache_marker(message: Dict[str, Any]) -> Dict[str, Any]:
@@ -1700,6 +1792,7 @@ class BasicMemoryAgent(AgentInterface):
         # blocks live in _memory, which is being rebuilt here anyway).
         self._diary_sent_ledger = {}
         self._pending_rag_block = ""
+        self._bp_wire_anchor = None
         self._session_injected_fact_ids = set()
         self._pending_facts_block = ""
         self._steam_pending_blocks = []
@@ -2498,11 +2591,22 @@ class BasicMemoryAgent(AgentInterface):
             )
             for m in messages
         )
-        marking_active = not prefix_has_image
+        # An inner-protocol bp (_bp_inner_block, 08-16 lookback fix) already
+        # holds the single message-level slot and cannot be stripped from
+        # here (it materializes during conversion) — moving another marker
+        # would exceed the 4-breakpoint limit, so migration sits this turn
+        # out.
+        inner_bp_tagged = any("_bp_inner_block" in m for m in messages)
+        marking_active = not prefix_has_image and not inner_bp_tagged
         if prefix_has_image:
             logger.debug(
                 "[cache] non-text block in prefix — in-loop breakpoint "
                 "migration disabled this turn."
+            )
+        elif inner_bp_tagged:
+            logger.debug(
+                "[cache] inner-protocol bp active — in-loop migration "
+                "disabled this turn."
             )
         # Set when the safety classifier declines a request (stop_reason
         # "refusal"); handled after the stream ends.
@@ -2829,6 +2933,12 @@ class BasicMemoryAgent(AgentInterface):
                                     "cache_control": self._CACHE_CONTROL_1H,
                                 }
                                 bp_index = len(messages) - 1
+                                # The entry now sits at the end of the whole
+                                # wire prefix — track it for the lookback
+                                # budget (08-16).
+                                self._bp_wire_anchor = sum(
+                                    self._wire_blocks(m) for m in messages
+                                )
                                 logger.debug(
                                     "[cache] tool round stable "
                                     f"(thinking={request_thinking_tokens} tok) "

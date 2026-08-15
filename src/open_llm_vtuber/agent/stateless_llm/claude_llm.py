@@ -365,7 +365,7 @@ class AsyncLLM(StatelessLLMInterface):
         message = {
             key: value
             for key, value in message.items()
-            if key not in {"claude_protocol", "thinking_blocks"}
+            if key not in {"claude_protocol", "thinking_blocks", "_bp_inner_block"}
         }
 
         # Handle potential tool_result content blocks
@@ -440,7 +440,16 @@ class AsyncLLM(StatelessLLMInterface):
                 and protocol
                 and all(isinstance(item, dict) for item in protocol)
             ):
-                converted.extend(deepcopy(protocol))
+                expanded = deepcopy(protocol)
+                inner = message.get("_bp_inner_block")
+                if isinstance(inner, int) and inner > 0:
+                    # Lookback-budget breakpoint (agent 08-16): the previous
+                    # turn expanded to more content blocks than Anthropic's
+                    # ~20-block lookback window, so the message-level marker
+                    # lands INSIDE this trimmed (byte-stable) replay instead
+                    # of on the outgoing message.
+                    self._attach_inner_bp(expanded, inner)
+                converted.extend(expanded)
                 continue
 
             if message.get("role") == "assistant":
@@ -454,6 +463,36 @@ class AsyncLLM(StatelessLLMInterface):
 
             converted.append(self._convert_message_format(message))
         return converted
+
+    @staticmethod
+    def _attach_inner_bp(expanded: List[Dict[str, Any]], inner: int) -> None:
+        """Attach cache_control to the ``inner``-th content block (1-based,
+        counted across the expanded protocol). If that position is not a
+        block list (string-content message), fall back to the last block
+        boundary before it. Mutates ``expanded`` (already a deepcopy)."""
+        cc = {"type": "ephemeral", "ttl": "1h"}
+        count = 0
+        last_list = None  # (message, block_index) of the latest usable block
+        for m in expanded:
+            c = m.get("content")
+            if isinstance(c, list):
+                for k, b in enumerate(c):
+                    count += 1
+                    if isinstance(b, dict):
+                        last_list = (m, k)
+                    if count >= inner and last_list is not None:
+                        tm, tk = last_list
+                        tm["content"][tk] = {**tm["content"][tk], "cache_control": cc}
+                        return
+            else:
+                count += 1
+                if count >= inner and last_list is not None:
+                    tm, tk = last_list
+                    tm["content"][tk] = {**tm["content"][tk], "cache_control": cc}
+                    return
+        if last_list is not None:
+            tm, tk = last_list
+            tm["content"][tk] = {**tm["content"][tk], "cache_control": cc}
 
     @staticmethod
     def _assistant_message_for_replay(message: Any) -> Dict[str, Any]:
