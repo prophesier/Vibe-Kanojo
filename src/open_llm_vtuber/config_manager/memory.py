@@ -110,6 +110,7 @@ class FactsRagConfig(I18nMixin):
     rerank_candidates: int = Field(12, alias="rerank_candidates")
     prefilter_floor: float = Field(0.3, alias="prefilter_floor")
     rerank_context_turns: int = Field(6, alias="rerank_context_turns")
+    uber_topic_floor: float = Field(0.0, alias="uber_topic_floor")
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "enabled": Description(
@@ -155,6 +156,10 @@ class FactsRagConfig(I18nMixin):
         "rerank_context_turns": Description(
             en="How many recent conversation turns to give the LLM judge as context",
             zh="给 LLM 判官作为上下文的最近对话轮数",
+        ),
+        "uber_topic_floor": Description(
+            en="Similarity floor for the judge-free semantic wave of the Uber facts link (0 = reuse similarity_threshold). The search keyword is broad, so this usually wants to sit higher",
+            zh="uber 联动里免判官语义波的相似度下限（0=复用 similarity_threshold）。检索词是宽类目词，这里通常要设得更高",
         ),
     }
 

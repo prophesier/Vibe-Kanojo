@@ -18,6 +18,7 @@ Env: UBER_EATS_HEADLESS=0 to watch the browser (default headless).
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import pathlib
 import sys
@@ -43,20 +44,73 @@ _HEADLESS = os.environ.get("UBER_EATS_HEADLESS", "1") != "0"
 _TOOL_TIMEOUT = 25  # seconds — under the MCP client's 30s read timeout
 
 # Appended to every result. Since the 08-13 per-round replay work, tool
-# results DO persist into later turns, but trimmed hard (~400 chars from the
-# top; a leading related-facts section survives whole) — so the character
-# must still relay anything worth keeping in its actual reply, and facts
-# entries need the full store name for the title-matching recall to find
-# them later.
+# results DO persist into later turns, but trimmed hard (~500 tok-equiv from
+# the top; a leading related-facts section survives whole) — so the character
+# must still relay anything worth keeping in its actual reply. Since 08-15
+# facts link to stores by store_uuid (memory_add's store_id), not by name.
 _RESULT_NOTE = (
     "\n\n（メモ：この結果は次のターン以降、先頭のわずかな部分を除いて"
     "切り詰められる。気になった店・料理・価格などは、ユーザーへの返信の中で"
-    "必ず自分の言葉で伝えること。また、店について記憶（facts）に記録する"
-    "ときは、後から検索で照合できるよう店名を省略せず正式名のまま書くこと。）"
+    "必ず自分の言葉で伝えること。また、店の感想を記憶（facts）に記録する"
+    "ときは、その店の store_uuid を memory_add の store_id 引数に渡すこと。）"
 )
 
 mcp = FastMCP("uber-eats")
 _client = UberEatsClient(headless=_HEADLESS)
+
+# Short store-id registry (あさひ 08-15): the LLM sees only the first 8 hex
+# chars of a store_uuid (a full uuid tokenizes to ~18-20 tok and repeats per
+# result row); the map resolves shorts back to full uuids for the store /
+# item / category calls and keeps the official title for the facts linkage.
+# Persisted next to this file so replayed short ids survive a restart.
+_STORE_IDS_PATH = HERE / "_store_ids.json"
+_SHORT_LEN = 8
+
+
+def _load_store_ids() -> dict:
+    try:
+        with open(_STORE_IDS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+_store_ids: dict = _load_store_ids()
+
+
+def _save_store_ids() -> None:
+    try:
+        tmp = _STORE_IDS_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_store_ids, f, ensure_ascii=False, indent=1)
+        tmp.replace(_STORE_IDS_PATH)
+    except Exception as e:
+        logger.warning(f"store-id registry save failed: {e}")
+
+
+def _register_store(uuid: str, name: str) -> str:
+    """Book a store in the registry; returns the id to DISPLAY (the 8-char
+    short, or the full uuid on the astronomically rare short collision)."""
+    uuid = (uuid or "").strip()
+    if len(uuid) < _SHORT_LEN:
+        return uuid
+    short = uuid[:_SHORT_LEN]
+    known = _store_ids.get(short)
+    if known and known.get("uuid") != uuid:
+        return uuid  # collision — this store keeps its full uuid visible
+    if not known or (name and known.get("name") != name):
+        _store_ids[short] = {"uuid": uuid, "name": name or ""}
+    return short
+
+
+def _resolve_store_uuid(s: str) -> str | None:
+    """Full uuid from a short display id (or a full uuid passed through)."""
+    s = (s or "").strip()
+    if len(s) >= 32:
+        return s
+    entry = _store_ids.get(s[:_SHORT_LEN])
+    return entry.get("uuid") if entry else None
 
 
 async def _run(coro, what: str):
@@ -100,8 +154,6 @@ async def uber_search(
     both, call this tool once per vertical.
     Browse-only: you cannot order or pay. If a store looks
     interesting, pass its store_uuid to uber_store to see the menu.
-    The return value is for your reference and does not stay in the
-    conversation, so write anything you want to convey in your reply itself.
     Stores marked ［PR］ are sponsored (ad slots).
     A store whose delivery fee is marked "Uber One" is showing the member price.
     The browsing account is not an Uber One member, but the user himself is, so
@@ -150,8 +202,9 @@ async def uber_search(
         line = f"- {pr}{s['name']}{meta}"
         if s.get("promos"):
             line += "\n    🎁 " + " / ".join(s["promos"][:2])
-        line += f"\n    store_uuid: {s['store_uuid']}"
+        line += f"\n    store_uuid: {_register_store(s['store_uuid'], s['name'])}"
         lines.append(line)
+    _save_store_ids()
     lines.append("\n※ メニューを見るには uber_store に store_uuid を渡してください。")
     return "\n".join(lines) + _RESULT_NOTE
 
@@ -173,15 +226,21 @@ async def uber_store(store_uuid: str, section: str = "") -> str:
     uuid line means the item has options to choose.
     Each item's "好評率" is the share of "likes" (positive ratings), shown with
     the rating count — it is not a repeat-order rate.
-    Browse-only: you cannot order or pay.
-    The return value is for your reference and does not stay in the
-    conversation, so write anything you want to convey in your reply itself."""
+    Browse-only: you cannot order or pay."""
+    full_uuid = _resolve_store_uuid(store_uuid)
+    if not full_uuid:
+        return (
+            f"store_uuid {store_uuid!r} が見つかりません。"
+            "先に uber_search で店を検索してください。"
+        )
     ok, data = await _run(
-        _client.store(store_uuid, section=section),
+        _client.store(full_uuid, section=section),
         f"uber_store({store_uuid!r},section={section!r})",
     )
     if not ok:
         return f"メニューを取得できませんでした: {data}"
+    _register_store(full_uuid, data.get("name", ""))
+    _save_store_ids()
     head = data["name"]
     bits = []
     if data.get("rating"):
@@ -325,11 +384,15 @@ async def uber_category(
     subsection_uuid values to see that subcategory's items (name and price).
     Categories without subcategories show their items directly. Use offset to
     page further.
-    Browse-only: you cannot order or pay.
-    The return value is for your reference and does not stay in the
-    conversation, so write anything you want to convey in your reply itself."""
+    Browse-only: you cannot order or pay."""
+    full_uuid = _resolve_store_uuid(store_uuid)
+    if not full_uuid:
+        return (
+            f"store_uuid {store_uuid!r} が見つかりません。"
+            "先に uber_search で店を検索してください。"
+        )
     ok, data = await _run(
-        _client.catalog(store_uuid, section_uuid, subsection_uuid, offset),
+        _client.catalog(full_uuid, section_uuid, subsection_uuid, offset),
         f"uber_category({section_uuid!r},{subsection_uuid!r})",
     )
     if not ok:
@@ -375,11 +438,15 @@ async def uber_item(store_uuid: str, item_uuid: str) -> str:
     """Get an item's details. Pass store_uuid and item_uuid (shown for items
     marked "⚙" in the uber_store results). Returns the available options and
     their surcharges: toppings, set contents, sizes, and so on.
-    Browse-only: you cannot order or pay.
-    The return value is for your reference and does not stay in the
-    conversation, so write anything you want to convey in your reply itself."""
+    Browse-only: you cannot order or pay."""
+    full_uuid = _resolve_store_uuid(store_uuid)
+    if not full_uuid:
+        return (
+            f"store_uuid {store_uuid!r} が見つかりません。"
+            "先に uber_search で店を検索してください。"
+        )
     ok, data = await _run(
-        _client.item(store_uuid, item_uuid), f"uber_item({item_uuid!r})"
+        _client.item(full_uuid, item_uuid), f"uber_item({item_uuid!r})"
     )
     if not ok:
         return f"商品詳細を取得できませんでした: {data}"

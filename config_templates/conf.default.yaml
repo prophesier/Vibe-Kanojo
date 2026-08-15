@@ -112,6 +112,10 @@ system_config:
       rerank_candidates: 12
       prefilter_floor: 0.3
       rerank_context_turns: 6
+      # Similarity floor for the judge-free semantic wave of the Uber facts
+      # link (0 = reuse similarity_threshold). The search keyword is a broad
+      # category word, so this usually wants to sit higher.
+      uber_topic_floor: 0.7
 
 # configuration for the default character
 character_config:

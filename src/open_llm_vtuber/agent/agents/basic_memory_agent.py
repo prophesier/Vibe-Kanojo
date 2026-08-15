@@ -2245,24 +2245,25 @@ class BasicMemoryAgent(AgentInterface):
             lines.append(f"{'ユーザー' if role == 'user' else 'AI'}: {text}")
         return "\n".join(lines)
 
-    # Store lines in a formatted uber_search result: "- ［PR］{title}  ★…" /
-    # "- {title}  配送…" — the title runs to the first double-space.
-    _UBER_TITLE_RE = re.compile(r"^-\s*(?:［PR］)?(.+?)(?:\s{2,}|$)", re.MULTILINE)
+    # store_uuid lines in a formatted uber_search result (8-char short ids
+    # since 08-15; tolerate full uuids for robustness).
+    _UBER_STORE_ID_RE = re.compile(
+        r"^\s*store_uuid:\s*([0-9a-f][0-9a-f-]{7,39})", re.MULTILINE
+    )
 
     @classmethod
-    def _uber_store_titles(cls, text: str) -> List[str]:
-        return [m.group(1).strip() for m in cls._UBER_TITLE_RE.finditer(text or "")][
-            :40
-        ]
+    def _uber_store_ids(cls, text: str) -> List[str]:
+        return [m.group(1)[:8] for m in cls._UBER_STORE_ID_RE.finditer(text or "")][:40]
 
     async def _augment_uber_search_results(
         self, results: List[Any], calls: List[Dict[str, Any]]
     ) -> None:
-        """Prepend related facts to uber_search results (あさひ 08-13).
+        """Prepend related facts to uber_search results (あさひ 08-13;
+        store-id keyed since 08-15).
 
         ``calls`` entries are normalized ``{"id", "name", "input"}``. Wave
         A/B retrieval and merge live in the manager (uber_related_facts);
-        this seam parses the store titles out of the formatted result,
+        this seam parses the store ids out of the formatted result,
         dedups against everything already in context, prepends the section
         with the replay-exempt end marker, and books the injected ids so
         neither facts RAG nor a later search re-surfaces them. Cap =
@@ -2289,8 +2290,8 @@ class BasicMemoryAgent(AgentInterface):
             except (TypeError, ValueError):
                 limit = 10
             cap = max(1, (limit + 1) // 2)
-            titles = self._uber_store_titles(content)
-            if not titles and not query:
+            store_ids = self._uber_store_ids(content)
+            if not store_ids and not query:
                 continue
             try:
                 exclude = set(mgr.injected_fact_ids())
@@ -2298,7 +2299,7 @@ class BasicMemoryAgent(AgentInterface):
                 exclude = set()
             exclude |= self._session_injected_fact_ids
             try:
-                hits = await mgr.uber_related_facts(query, titles, exclude, cap)
+                hits = await mgr.uber_related_facts(query, store_ids, exclude, cap)
             except Exception as e:
                 logger.warning(f"[uber_facts] lookup failed: {e}")
                 continue
@@ -4290,6 +4291,17 @@ class BasicMemoryAgent(AgentInterface):
                                     "Default: low."
                                 ),
                             },
+                            "store_id": {
+                                "type": "string",
+                                "description": (
+                                    "Only when the fact records an Uber Eats "
+                                    "store/order impression: the store_uuid "
+                                    "from the uber results. Links the fact to "
+                                    "that store so it resurfaces when the "
+                                    "store appears in a search. Leave empty "
+                                    "for everything else."
+                                ),
+                            },
                         },
                         "required": ["fact"],
                     },
@@ -5322,6 +5334,7 @@ class BasicMemoryAgent(AgentInterface):
                 result = await mgr.add_fact_manual(
                     str(args.get("fact", "")),
                     importance=str(args.get("importance", "low") or "low"),
+                    store_id=str(args.get("store_id", "") or ""),
                 )
             elif name == "memory_update":
                 result = await mgr.update_fact_manual(

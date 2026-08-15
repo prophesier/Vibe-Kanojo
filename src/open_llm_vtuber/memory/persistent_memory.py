@@ -13,7 +13,6 @@ import json
 import os
 import re
 import shutil
-import unicodedata
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Set
 from loguru import logger
@@ -79,25 +78,6 @@ def _split_sentences(text: str) -> List[str]:
 _TIMESTAMP_RE = re.compile(
     r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE
 )
-
-# Decoration characters stripped before store-title ↔ fact text matching
-# (uber_related_facts). Real Uber titles carry 「」quotes, ‼! flourishes and
-# full-width spaces; facts record names bare — NFKC + strip → both align.
-_MATCH_STRIP = "「」『』【】“”\"'‼！!？?・、。,．.　"
-
-
-def _norm_match_text(s: str) -> str:
-    """Normalize a store title or fact text for string matching."""
-    s = unicodedata.normalize("NFKC", s or "")
-    for ch in _MATCH_STRIP:
-        s = s.replace(ch, " ")
-    return " ".join(s.split())
-
-
-# Connector words that appear as standalone title tokens ("A アンド B") but
-# also inside unrelated compound names (クリスピーチキン「アンド」トマト) —
-# the one FP generator left on the 08-13 eval. Never discriminative.
-_MATCH_CONNECTOR_TOKENS = frozenset({"アンド", "and", "And", "AND", "the", "The"})
 
 
 _FACT_EXTRACT_SYSTEM = (
@@ -812,92 +792,52 @@ class PersistentMemoryManager:
     async def uber_related_facts(
         self,
         query: str,
-        store_titles: List[str],
+        store_ids: List[str],
         exclude_ids: Set[str],
         cap: int,
     ) -> List[Dict[str, Any]]:
-        """Two-wave facts recall for Uber search results (あさひ 08-13).
+        """Two-wave facts recall for Uber search results.
 
-        Wave B (primary): every result store TITLE is string-matched against
-        the fact texts in three levels — full normalized title, adjacent token
-        pairs, single tokens — scored by matched length. One-char store names
-        (the「◯◯丼 玄」pattern) ride the full/pair levels only; single tokens
-        follow the eval-tuned drop rules (21/21 recall, 1 borderline FP on the
-        08-13 test set). Wave A: semantic hits on the search keyword itself
-        (no judge; floor = facts_rag.similarity_threshold) — catches
-        store-independent preference facts (「日式中華は口に合わない」).
-        Merge is B-first by score, but when B alone fills ``cap`` the top A
-        hit keeps one guaranteed slot. Zero API for B; one embedding for A.
-        Never raises; returns ``[]`` on any failure.
+        Wave B (primary, 08-15 redesign): facts carry an optional
+        ``store_id`` — the store_uuid's 8-char short form — and match by
+        EQUALITY against the ids of the stores in the search results.
+        This replaced the 08-13 title-string matcher: name fuzz (prefix
+        overreach, same-name different-store, comparison mentions) is gone
+        by construction, and a rotated uuid fails silently to a miss, never
+        to a wrong injection. Keyless facts are invisible to this wave.
+        Ordering follows the stores' positions in the search results.
+        Wave A: semantic hits on the search keyword itself (no judge;
+        floor = facts_rag.uber_topic_floor, falling back to
+        similarity_threshold) — catches store-independent preference facts
+        (「日式中華は口に合わない」). Merge is B-first, but when B alone
+        fills ``cap`` the top A hit keeps one guaranteed slot. Zero API for
+        B; one embedding for A. Never raises; returns ``[]`` on failure.
         """
         try:
             facts = self._load_facts()
         except Exception:
             return []
         by_id = {self._fact_id(f["fact"]): f for f in facts if f.get("fact")}
-        norm_facts = {
-            fid: _norm_match_text(f["fact"])
-            for fid, f in by_id.items()
-            if fid not in exclude_ids
-        }
-        nq = _norm_match_text(query)
         cap = max(1, int(cap))
 
-        # ---- Wave B: store-name string matching (pure python) ----
+        # ---- Wave B: store-id equality ----
+        shorts = [s[:8] for s in (store_ids or []) if s]
+        rank = {s: i for i, s in enumerate(shorts)}
         scored: Dict[str, int] = {}
-        for title in store_titles or []:
-            nt = _norm_match_text(title)
-            if not nt:
+        for fid, f in by_id.items():
+            if fid in exclude_ids:
                 continue
-            toks = nt.split(" ")
-            needles: List[tuple] = []  # (needle, score, allow_prefix)
-            if len(nt) >= 4:
-                needles.append((nt, len(nt), False))  # L0: full title
-            for a, b in zip(toks, toks[1:]):  # L1: adjacent pairs
-                pair = f"{a} {b}"
-                if len(pair) >= 4:
-                    needles.append((pair, len(pair), False))
-            for t in toks:  # L2: single tokens, eval-tuned drops
-                if len(t) < 2:
-                    continue  # 1-char names only match via L0/L1
-                if t in _MATCH_CONNECTOR_TOKENS:
-                    continue
-                if t in nq:
-                    # The bare category word (=the query axis) belongs to
-                    # wave A. Only this direction: a NAME containing the
-                    # query (ケンタッキーフライド「チキン」) stays matchable.
-                    continue
-                if t.isascii() and len(t) < 5:
-                    continue  # "Hero" ⊂ "Heroes"
-                if t.endswith("店") and len(toks) > 1:
-                    continue  # branch tokens (「◯◯店」「◯◯駅前店」…)
-                if sum(1 for nf in norm_facts.values() if t in nf) > 5:
-                    continue  # generic word, non-discriminative
-                needles.append((t, len(t), len(t) >= 6))
-            for fid, nf in norm_facts.items():
-                best = scored.get(fid, 0)
-                for needle, score, allow_prefix in needles:
-                    if score <= best:
-                        continue
-                    if needle in nf:
-                        best = score
-                    elif allow_prefix:
-                        # partial recordings: ケンタッキーフライドチキン →
-                        # the fact only says ケンタッキー
-                        for cut in range(len(needle) - 1, 4, -1):
-                            if cut <= best:
-                                break
-                            if needle[:cut] in nf:
-                                best = cut
-                                break
-                if best:
-                    scored[fid] = best
+            key = str(f.get("store_id", "") or "")[:8]
+            if key and key in rank:
+                scored[fid] = rank[key]
 
         # ---- Wave A: semantic hits on the search keyword ----
         a_order: List[str] = []
         if self._facts_index is not None and query.strip():
             cfg = self._facts_rag_cfg
-            floor = getattr(cfg, "similarity_threshold", 0.6)
+            floor = getattr(cfg, "uber_topic_floor", 0.0) or getattr(
+                cfg, "similarity_threshold", 0.6
+            )
             keywords = extract_keywords(query)
             embed_q = " ".join(keywords) if keywords else query
             try:
@@ -916,8 +856,8 @@ class PersistentMemoryManager:
             except Exception as e:
                 logger.warning(f"[uber_facts] semantic wave failed: {e}")
 
-        # ---- Merge: B-first by score; A's best keeps a slot when full ----
-        b_order = sorted(scored, key=lambda i: -scored[i])
+        # ---- Merge: B-first (result order); A's best keeps a slot when full ----
+        b_order = sorted(scored, key=lambda i: scored[i])
         if len(b_order) >= cap and a_order:
             final = b_order[: cap - 1] + a_order[:1]
         else:
@@ -959,13 +899,16 @@ class PersistentMemoryManager:
             logger.warning(f"[memory_tool] facts index sync failed: {e}")
 
     async def add_fact_manual(
-        self, text: str, importance: str = "low"
+        self, text: str, importance: str = "low", store_id: str = ""
     ) -> Dict[str, Any]:
         """Append a fact on the character's behalf (memory_add).
 
         ``importance`` is clamped to high/low — ``user`` is manual-only and an
         LLM must never assign it. Duplicate content (same fingerprint) is
-        rejected instead of silently re-added.
+        rejected instead of silently re-added. ``store_id`` (optional, Uber
+        facts only) links the fact to a store for the search-time recall;
+        stored as the 8-char short form. It is NOT part of the fingerprint,
+        so adding/fixing it later never churns the embedding index.
         """
         text = " ".join((text or "").split())
         if not text:
@@ -977,13 +920,15 @@ class PersistentMemoryManager:
         fid = self._fact_id(text)
         if any(self._fact_id(f["fact"]) == fid for f in facts if f.get("fact")):
             return {"status": "error", "message": "同内容の記憶が既にある。", "id": fid}
-        facts.append(
-            {
-                "fact": text,
-                "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "importance": importance,
-            }
-        )
+        entry = {
+            "fact": text,
+            "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "importance": importance,
+        }
+        store_id = (store_id or "").strip()
+        if store_id:
+            entry["store_id"] = store_id[:8]
+        facts.append(entry)
         self._save_facts(facts)
         await self._sync_facts_index()
         # Full text on purpose — the log is the recovery trail for accidental

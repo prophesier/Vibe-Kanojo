@@ -82,6 +82,7 @@ system_config:
       rerank_candidates: 12
       prefilter_floor: 0.3
       rerank_context_turns: 6
+      uber_topic_floor: 0.7        # uber 联动免判官语义波的相似度下限（0=复用 similarity_threshold；类目词宽，宜偏高）
 
 # 默认角色的配置
 character_config:
