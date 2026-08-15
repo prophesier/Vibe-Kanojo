@@ -2245,15 +2245,21 @@ class BasicMemoryAgent(AgentInterface):
             lines.append(f"{'ユーザー' if role == 'user' else 'AI'}: {text}")
         return "\n".join(lines)
 
-    # store_uuid lines in a formatted uber_search result (8-char short ids
-    # since 08-15; tolerate full uuids for robustness).
-    _UBER_STORE_ID_RE = re.compile(
-        r"^\s*store_uuid:\s*([0-9a-f][0-9a-f-]{7,39})", re.MULTILINE
-    )
+    # A store row's trailing id token: the 8-char short, or the full uuid on
+    # the rare display-collision fallback (08-15: the id is the LAST info bit
+    # of each "- " store line — the labelled store_uuid line is gone).
+    _UBER_STORE_ID_TOKEN = re.compile(r"[0-9a-f]{8}(?:[0-9a-f-]{28})?")
 
     @classmethod
     def _uber_store_ids(cls, text: str) -> List[str]:
-        return [m.group(1)[:8] for m in cls._UBER_STORE_ID_RE.finditer(text or "")][:40]
+        ids: List[str] = []
+        for line in (text or "").splitlines():
+            if not line.startswith("- "):
+                continue
+            tail = line.rsplit(None, 1)[-1]
+            if cls._UBER_STORE_ID_TOKEN.fullmatch(tail):
+                ids.append(tail[:8])
+        return ids[:40]
 
     async def _augment_uber_search_results(
         self, results: List[Any], calls: List[Dict[str, Any]]

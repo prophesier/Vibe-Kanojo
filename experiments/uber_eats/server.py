@@ -198,14 +198,19 @@ async def uber_search(
                 bits.append(f"配送{s['fee']}")
         if s.get("eta"):
             bits.append(s["eta"])
-        meta = "  " + " · ".join(bits) if bits else ""
-        line = f"- {pr}{s['name']}{meta}"
+        # The store_uuid (8-char short) rides the info bits as the LAST field
+        # (08-15 あさひ: the labelled "store_uuid:" line was pure overhead);
+        # the footer explains it once, outside the repeated rows.
+        bits.append(_register_store(s["store_uuid"], s["name"]))
+        line = f"- {pr}{s['name']}  " + " · ".join(bits)
         if s.get("promos"):
             line += "\n    🎁 " + " / ".join(s["promos"][:2])
-        line += f"\n    store_uuid: {_register_store(s['store_uuid'], s['name'])}"
         lines.append(line)
     _save_store_ids()
-    lines.append("\n※ メニューを見るには uber_store に store_uuid を渡してください。")
+    lines.append(
+        "\n※ 各行末尾の英数字がその店の store_uuid。"
+        "メニューを見るには uber_store に渡してください。"
+    )
     return "\n".join(lines) + _RESULT_NOTE
 
 
