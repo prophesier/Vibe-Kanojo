@@ -1,4 +1,4 @@
-"""Read-only Uber Eats browse MCP server (Stage 1).
+﻿"""Read-only Uber Eats browse MCP server (Stage 1).
 
 Tools (browse only — there is deliberately NO cart / checkout / payment tool, so
 the model cannot order even if it wanted to):
@@ -113,32 +113,11 @@ def _resolve_store_uuid(s: str) -> str | None:
     return entry.get("uuid") if entry else None
 
 
-# Same short-id treatment for ITEM uuids (08-15, あさひ: menus repeat the
-# 36-char uuid per item — the biggest remaining bulk). Flat short→full map;
-# no names needed, items resolve only for uber_item calls.
-_ITEM_IDS_PATH = HERE / "_item_ids.json"
-
-
-def _load_item_ids() -> dict:
-    try:
-        with open(_ITEM_IDS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
-_item_ids: dict = _load_item_ids()
-
-
-def _save_item_ids() -> None:
-    try:
-        tmp = _ITEM_IDS_PATH.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_item_ids, f)
-        tmp.replace(_ITEM_IDS_PATH)
-    except Exception as e:
-        logger.warning(f"item-id registry save failed: {e}")
+# Same short-id treatment for ITEM uuids (08-15). In-memory ONLY, unlike the
+# store registry (あさひ: items are numerous, churn often, and there is no
+# pre-fetch path — a stale short after a restart just means re-opening the
+# menu, which is the natural flow anyway).
+_item_ids: dict = {}
 
 
 def _register_item(uuid: str) -> str:
@@ -165,7 +144,7 @@ def _resolve_item_uuid(s: str) -> str | None:
 # the orphaned bare ⚙ both died here, 08-15).
 _MENU_FOOT = (
     "\n※ 商品行末の英数字がその商品の item_uuid（uber_item で選択肢・詳細）。"
-    "⚙ はトッピング等の選択肢あり。"
+    "⚙ はトッピング等の選択肢あり。名前だけの行は前のカテゴリに出た商品の再掲。"
 )
 
 
@@ -342,7 +321,10 @@ async def uber_store(store_uuid: str, section: str = "") -> str:
         )
         return "\n".join(lines) + _RESULT_NOTE
     # Big-menu digest: every category, popularity top-N only, cuts labelled.
+    # Items repeat across Uber's category carousels — a repeat keeps only its
+    # name (あさひ 08-15: everything else is a byte-for-byte rerun).
     if data.get("digest"):
+        seen_items: set = set()
         lines.append(
             f"\n■ メニューが大きい（全{data.get('total_items', '?')}品）ため、"
             "各カテゴリの人気上位のみ表示:"
@@ -352,14 +334,18 @@ async def uber_store(store_uuid: str, section: str = "") -> str:
             more_s = f"　…他{more}品" if more > 0 else ""
             lines.append(f"\n▼ {sec['section'] or '(無題)'}（全{sec['total']}品）")
             for it in sec["items"]:
-                lines.append(_fmt_menu_item(it))
+                key = it.get("item_uuid") or it.get("name")
+                if key in seen_items:
+                    lines.append(f"- {it['name']}")
+                else:
+                    seen_items.add(key)
+                    lines.append(_fmt_menu_item(it))
             if more_s:
                 lines.append(more_s)
         lines.append(
             "\n※ カテゴリの全品を見るには uber_store を store_uuid と "
             "section=カテゴリ名 で再呼び出し。必要なカテゴリだけ絞って呼ぶこと。"
         )
-        _save_item_ids()
         return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
     if not data.get("menu"):
         lines.append("（メニュー項目を取得できませんでした）")
@@ -373,16 +359,20 @@ async def uber_store(store_uuid: str, section: str = "") -> str:
         lines.append(f"\n▼ カテゴリ「{data['section_view']}」{cap}")
         for it in data["menu"][0]["items"]:
             lines.append(_fmt_menu_item(it))
-        _save_item_ids()
         return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
+    seen_items = set()
     for sec in data["menu"]:
         if sec.get("section"):
             lines.append(f"\n■ {sec['section']}")
         for it in sec["items"]:
-            lines.append(_fmt_menu_item(it))
+            key = it.get("item_uuid") or it.get("name")
+            if key in seen_items:
+                lines.append(f"- {it['name']}")
+            else:
+                seen_items.add(key)
+                lines.append(_fmt_menu_item(it))
     if data.get("truncated"):
         lines.append("\n…（メニューは一部のみ表示）")
-    _save_item_ids()
     return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
 
 
@@ -495,7 +485,6 @@ async def uber_category(
         lines.append(
             f"\n…（続きあり。offset={data['next_offset']} を uber_category に渡すと続き）"
         )
-    _save_item_ids()
     return "\n".join(lines) + _MENU_FOOT + _RESULT_NOTE
 
 
