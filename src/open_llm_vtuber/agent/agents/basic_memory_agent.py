@@ -1,4 +1,4 @@
-from typing import (
+﻿from typing import (
     AsyncIterator,
     List,
     Dict,
@@ -414,7 +414,7 @@ class BasicMemoryAgent(AgentInterface):
     # user messages — the exact shape that seeded fabricated-input
     # imitation (08-05). Stored in history AND appended to the protocol's
     # final assistant message as a text block.
-    _EMPTY_TURN_PLACEHOLDER = "【…】"
+    _EMPTY_TURN_PLACEHOLDER = "…"
 
     @classmethod
     def _token_cut(cls, text: str, budget_millitok: int) -> tuple:
@@ -2857,7 +2857,7 @@ class BasicMemoryAgent(AgentInterface):
                     # (max_tokens ate the budget mid-thinking, or the model
                     # ended the turn silently — refusals were handled above).
                     # 08-15 (あさひ, after 4 such turns in two days): store
-                    # the 【…】 placeholder as the utterance — the earlier
+                    # the ellipsis placeholder as the utterance — the earlier
                     # keep-it-empty policy made replays show two consecutive
                     # user messages, the fabricated-input imitation shape.
                     # The transcript still carries the true thinking; only
@@ -3342,7 +3342,7 @@ class BasicMemoryAgent(AgentInterface):
                 )
             if not complete_response and claude_assistant_message is not None:
                 # Thinking-only turn — same treatment as the tool loop
-                # (08-15): substitute the 【…】 placeholder so replays keep
+                # (08-15): substitute the ellipsis placeholder so replays keep
                 # an assistant turn between the user messages.
                 logger.warning(
                     "[empty_reply] turn ended with no visible text "
