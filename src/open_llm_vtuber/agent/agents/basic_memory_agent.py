@@ -2414,7 +2414,7 @@ class BasicMemoryAgent(AgentInterface):
                 continue
             section = "\n".join(
                 [self._UBER_FACTS_HEADER]
-                + [f"- [{h['date']}] {h['fact']}" for h in hits]
+                + [f"- [{self._fact_row_tag(h)}] {h['fact']}" for h in hits]
                 + [self._UBER_FACTS_END]
             )
             r["content"] = f"{section}\n{content}"
@@ -2504,11 +2504,20 @@ class BasicMemoryAgent(AgentInterface):
         """
         lines = ["［関連する事実（自動検索）開始］"]
         for e in entries:
-            date = (e.get("date") or "")[:10]
-            prefix = f"[{date}] " if date else ""
+            tag = self._fact_row_tag(e)
+            prefix = f"[{tag}] " if tag else ""
             lines.append(f"・{prefix}{(e.get('fact') or '').strip()}")
         lines.append("［関連する事実終了］")
         return "\n".join(lines)
+
+    @staticmethod
+    def _fact_row_tag(e: Dict[str, Any]) -> str:
+        """`記録日 id` or `記録日 id store_id` — the bracket tag every fact
+        row carries (08-20 format; the facts header explains it once)."""
+        date = (e.get("date") or "")[:10]
+        fid = str(e.get("id") or "")[:8]
+        sid = str(e.get("store_id") or "")[:8]
+        return " ".join(t for t in (date, fid, sid) if t)
 
     @staticmethod
     def _inproc_result_is_error(result: Any) -> bool:

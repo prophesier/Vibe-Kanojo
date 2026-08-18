@@ -503,14 +503,23 @@ class PersistentMemoryManager:
         for f in facts:
             updated = str(f.get("updated", ""))
             date = updated[:10] if len(updated) >= 10 else "不明"
-            lines.append(f"- [{date}] {f['fact']}")
+            tag = f"{date} {self._fact_id(f['fact'])[:8]}"
+            sid = str(f.get("store_id", "") or "")[:8]
+            if sid:
+                tag += f" {sid}"
+            lines.append(f"- [{tag}] {f['fact']}")
         body = "\n".join(lines)
         header = (
             "## ユーザーに関する長期記憶（事実）\n"
-            "各事実の冒頭の `[YYYY-MM-DD]` は、その事実が**このリストに記録された日**で"
-            "あり、出来事が実際に起きた日ではない。"
-            "事実抽出は次のセッション開始時にまとめて行われるため、"
-            "実際の出来事はその数時間〜数日前に起きている可能性がある点に注意。"
+            "各事実の冒頭は `[記録日 id]` または `[記録日 id store_id]`。"
+            "記録日はその事実が**このリストに記録された日**であり、"
+            "出来事が実際に起きた日ではない"
+            "（事実抽出は次のセッション開始時にまとめて行われるため、"
+            "実際の出来事はその数時間〜数日前の可能性がある）。"
+            "id は事実そのものの短縮IDで、memory_update / memory_delete に"
+            "そのまま渡せる。store_id は Uber の店舗ID——uber_store に渡せば"
+            "その店のメニューが開き、memory_add / memory_update の store_id "
+            "引数と同じもの。"
         )
         return f"{header}\n\n{body}"
 
@@ -600,6 +609,45 @@ class PersistentMemoryManager:
         """
         norm = " ".join((fact_text or "").split())
         return hashlib.sha1(norm.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _id_matches(full_id: str, given: str) -> bool:
+        """Exact 16-hex id, or a >=8-hex prefix — the displayed short id
+        (08-20: every injection path shows `[date id8]`, so the tools must
+        accept what the model actually sees)."""
+        return full_id == given or (len(given) >= 8 and full_id.startswith(given))
+
+    @staticmethod
+    def _row_store_id(f: Dict[str, Any]) -> Dict[str, str]:
+        """``{"store_id": ...}`` when the fact carries the uber linkage,
+        else empty — splatted into recall/search rows so every path can
+        render `[記録日 id store_id]` without special-casing."""
+        sid = str(f.get("store_id", "") or "")[:8]
+        return {"store_id": sid} if sid else {}
+
+    def _facts_by_given_id(self, facts, fact_id: str):
+        """All (index, fact) whose content id matches ``fact_id`` (prefix
+        aware). More than one hit = ambiguous prefix; callers must refuse."""
+        out = []
+        for i, f in enumerate(facts):
+            if f.get("fact") and self._id_matches(self._fact_id(f["fact"]), fact_id):
+                out.append((i, f))
+        return out
+
+    def _ambiguous_id_error(self, fact_id: str, matches) -> Dict[str, Any]:
+        """Refusal for an ambiguous short id. Every display path shows only
+        the 8-hex form, so the model has nowhere else to get a longer id —
+        the error itself must carry the full ids (08-20 あさひ)."""
+        listing = " / ".join(
+            f"{self._fact_id(f['fact'])}＝{f['fact'][:30]}" for _, f in matches
+        )
+        return {
+            "status": "error",
+            "message": (
+                f"id {fact_id} が複数の記憶に一致して曖昧: {listing}。"
+                "完全なidで再指定を。"
+            ),
+        }
 
     def _header_facts(self) -> List[Dict[str, Any]]:
         """Facts that belong in the system-prompt header.
@@ -748,6 +796,7 @@ class PersistentMemoryManager:
                     "date": str(by_id[h["id"]].get("updated", ""))[:10],
                     "score": h["score"],
                     "reason": "",
+                    **self._row_store_id(by_id[h["id"]]),
                 }
                 for h in hits
                 if h["id"] in by_id
@@ -784,6 +833,7 @@ class PersistentMemoryManager:
                 or str(by_id.get(j["id"], {}).get("updated", ""))[:10],
                 "score": 0.0,
                 "reason": j.get("reason", ""),
+                **self._row_store_id(by_id.get(j["id"], {})),
             }
             for j in judged[:max_n]
         ]
@@ -870,6 +920,7 @@ class PersistentMemoryManager:
                 "fact": by_id[fid]["fact"],
                 "date": str(by_id[fid].get("updated", ""))[:10],
                 "via": "store" if fid in scored else "topic",
+                **self._row_store_id(by_id[fid]),
             }
             for fid in final
         ]
@@ -884,11 +935,11 @@ class PersistentMemoryManager:
     # character may neither create (clamped) nor modify nor delete it.
 
     def find_fact(self, fact_id: str) -> Optional[Dict[str, Any]]:
-        """Fact dict by content-fingerprint id, or None."""
-        for f in self._load_facts():
-            if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
-                return f
-        return None
+        """Fact dict by content-fingerprint id (short-prefix aware), or None.
+        An ambiguous prefix also returns None — the mutation paths surface
+        the distinction; this read path stays conservative."""
+        matches = self._facts_by_given_id(self._load_facts(), fact_id)
+        return matches[0][1] if len(matches) == 1 else None
 
     async def _sync_facts_index(self) -> None:
         """Re-sync the fact vector index after a manual mutation (no-op when
@@ -921,7 +972,11 @@ class PersistentMemoryManager:
         facts = self._load_facts()
         fid = self._fact_id(text)
         if any(self._fact_id(f["fact"]) == fid for f in facts if f.get("fact")):
-            return {"status": "error", "message": "同内容の記憶が既にある。", "id": fid}
+            return {
+                "status": "error",
+                "message": "同内容の記憶が既にある。",
+                "id": fid[:8],
+            }
         entry = {
             "fact": text,
             "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -938,7 +993,7 @@ class PersistentMemoryManager:
         logger.info(f"[memory_tool] fact ADDED ({importance}, {fid}): {text}")
         return {
             "status": "ok",
-            "id": fid,
+            "id": fid[:8],
             "importance": importance,
             "note": "保存した。検索には即時反映、常駐の事実リストへは次回起動から。",
         }
@@ -977,53 +1032,55 @@ class PersistentMemoryManager:
                 "message": "新しい本文か importance か store_id のどれかが必要。",
             }
         facts = self._load_facts()
-        for f in facts:
-            if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
-                old = f["fact"]
-                old_tier = f.get("importance") or "low"
-                if importance is not None and old_tier == "user":
-                    return {
-                        "status": "error",
-                        "message": (
-                            "userレベルの記憶の優先度は本人管理のため変更"
-                            "できない（本文の修正は可）。"
-                        ),
-                    }
-                if new_text:
-                    f["fact"] = new_text
-                if importance is not None:
-                    f["importance"] = importance
-                if store_id is not None:
-                    if store_id:
-                        f["store_id"] = store_id[:8]
-                    else:
-                        f.pop("store_id", None)
-                f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                self._save_facts(facts)
-                await self._sync_facts_index()
-                new_id = self._fact_id(f["fact"])
-                # Full old/new text on purpose — recovery trail for accidental
-                # edits (restore by hand from the log if needed).
-                logger.info(
-                    f"[memory_tool] fact UPDATED {fact_id}→{new_id} "
-                    f"(tier {old_tier}→{f.get('importance') or 'low'}):\n"
-                    f"  OLD: {old}\n  NEW: {f['fact']}"
-                )
-                notes = []
-                if new_text:
-                    notes.append("本文を更新した（idは内容ハッシュのため変わった）。")
+        matches = self._facts_by_given_id(facts, fact_id)
+        if len(matches) > 1:
+            return self._ambiguous_id_error(fact_id, matches)
+        for _, f in matches:
+            old = f["fact"]
+            old_tier = f.get("importance") or "low"
+            if importance is not None and old_tier == "user":
+                return {
+                    "status": "error",
+                    "message": (
+                        "userレベルの記憶の優先度は本人管理のため変更"
+                        "できない（本文の修正は可）。"
+                    ),
+                }
+            if new_text:
+                f["fact"] = new_text
+            if importance is not None:
+                f["importance"] = importance
+            if store_id is not None:
+                if store_id:
+                    f["store_id"] = store_id[:8]
                 else:
-                    notes.append("本文は変更なし（idも不変）。")
-                if importance is not None and importance != old_tier:
-                    notes.append(f"importance を {old_tier}→{importance} に変更。")
-                if store_id is not None:
-                    notes.append(
-                        f"store_id を {store_id[:8]} に設定。"
-                        if store_id
-                        else "store_id を削除。"
-                    )
-                notes.append("常駐リストへの反映は次回起動から。")
-                return {"status": "ok", "id": new_id, "note": " ".join(notes)}
+                    f.pop("store_id", None)
+            f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._save_facts(facts)
+            await self._sync_facts_index()
+            new_id = self._fact_id(f["fact"])
+            # Full old/new text on purpose — recovery trail for accidental
+            # edits (restore by hand from the log if needed).
+            logger.info(
+                f"[memory_tool] fact UPDATED {fact_id}→{new_id} "
+                f"(tier {old_tier}→{f.get('importance') or 'low'}):\n"
+                f"  OLD: {old}\n  NEW: {f['fact']}"
+            )
+            notes = []
+            if new_text:
+                notes.append("本文を更新した（idは内容ハッシュのため変わった）。")
+            else:
+                notes.append("本文は変更なし（idも不変）。")
+            if importance is not None and importance != old_tier:
+                notes.append(f"importance を {old_tier}→{importance} に変更。")
+            if store_id is not None:
+                notes.append(
+                    f"store_id を {store_id[:8]} に設定。"
+                    if store_id
+                    else "store_id を削除。"
+                )
+            notes.append("常駐リストへの反映は次回起動から。")
+            return {"status": "ok", "id": new_id[:8], "note": " ".join(notes)}
         return {
             "status": "error",
             "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
@@ -1034,24 +1091,26 @@ class PersistentMemoryManager:
         for having completed the user-approval flow BEFORE calling this.
         ``user``-tier facts cannot be deleted by the character at all."""
         facts = self._load_facts()
-        for i, f in enumerate(facts):
-            if f.get("fact") and self._fact_id(f["fact"]) == fact_id:
-                if (f.get("importance") or "low") == "user":
-                    return {
-                        "status": "error",
-                        "message": "userレベルの記憶は本人管理のため削除不可。",
-                    }
-                removed = facts.pop(i)
-                self._save_facts(facts)
-                await self._sync_facts_index()
-                # Full text on purpose — this line is what lets あさひ restore
-                # an accidentally deleted fact by hand from the log.
-                logger.info(
-                    f"[memory_tool] fact DELETED ({fact_id}, "
-                    f"importance={removed.get('importance', 'low')}): "
-                    f"{removed.get('fact', '')}"
-                )
-                return {"status": "ok", "deleted": removed.get("fact", "")}
+        matches = self._facts_by_given_id(facts, fact_id)
+        if len(matches) > 1:
+            return self._ambiguous_id_error(fact_id, matches)
+        for i, f in matches:
+            if (f.get("importance") or "low") == "user":
+                return {
+                    "status": "error",
+                    "message": "userレベルの記憶は本人管理のため削除不可。",
+                }
+            removed = facts.pop(i)
+            self._save_facts(facts)
+            await self._sync_facts_index()
+            # Full text on purpose — this line is what lets あさひ restore
+            # an accidentally deleted fact by hand from the log.
+            logger.info(
+                f"[memory_tool] fact DELETED ({fact_id}, "
+                f"importance={removed.get('importance', 'low')}): "
+                f"{removed.get('fact', '')}"
+            )
+            return {"status": "ok", "deleted": removed.get("fact", "")}
         return {"status": "error", "message": f"id {fact_id} の記憶が見つからない。"}
 
     async def search_memory_tool(
@@ -1118,11 +1177,12 @@ class PersistentMemoryManager:
                 )
                 out["facts"] = [
                     {
-                        "id": h["id"],
+                        "id": h["id"][:8],
                         "fact": by_id[h["id"]].get("fact", ""),
                         "date": str(by_id[h["id"]].get("updated", ""))[:10],
                         "importance": by_id[h["id"]].get("importance", "low"),
                         "score": round(float(h.get("score", 0.0)), 3),
+                        **self._row_store_id(by_id[h["id"]]),
                     }
                     for h in hits
                     if h["id"] in by_id
