@@ -189,14 +189,19 @@ async def process_single_conversation(
             # real turn and MUST be persisted (あさひ 08-07): dropping it
             # collapses the reload into two adjacent user turns — the exact
             # shape that seeded the 08-05 hallucinated-input incident. The
-            # empty-content record carries the seed so a same-model restart
-            # replays the turn verbatim.
+            # record stores the agent's ellipsis placeholder as content —
+            # matching what the protocol replays — and carries the seed so a
+            # same-model restart replays the turn verbatim. (08-18: this site
+            # used to write "" while the protocol carried "…".)
             if full_response or thinking_seed:
+                placeholder = getattr(
+                    context.agent_engine, "_EMPTY_TURN_PLACEHOLDER", "…"
+                )
                 store_message(
                     conf_uid=context.character_config.conf_uid,
                     history_uid=context.history_uid,
                     role="ai",
-                    content=full_response,
+                    content=full_response or placeholder,
                     name=context.character_config.character_name,
                     avatar=context.character_config.avatar,
                     thinking_seed=thinking_seed,
