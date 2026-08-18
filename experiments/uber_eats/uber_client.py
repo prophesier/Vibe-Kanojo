@@ -188,9 +188,21 @@ def _item_promo(it: Dict[str, Any]) -> Dict[str, Any]:
     the full human-readable text. Only promoted items carry promoInfo, so
     plain items add nothing to the tool output. Reverse gap documented in
     PROJECT.md: app-targeted offers (店舗限定オファー) never appear in this
-    web-session payload at all — this parses only what the surface sends."""
+    web-session payload at all — this parses only what the surface sends.
+
+    08-18 (肉垣 BOGO 误判): the featured-section copy of an item carries NO
+    badge (badges ride the offer/category copies, which dedup reduces to
+    name-only lines), so the badge never rendered and BOGO items were
+    indistinguishable from %-off items. A BOGO item DOES carry structured
+    ``itemPromotion`` on every copy — synthesize the label from it when the
+    badge is absent. Badge text wins when present (localized verbatim)."""
     badge = (it.get("promoInfo") or {}).get("promoBadge") or {}
     text = str(badge.get("accessibilityText") or "").strip()
+    if not text:
+        bxgy = (it.get("itemPromotion") or {}).get("buyXGetYItemPromotion") or {}
+        buy, get = bxgy.get("buyQuantity"), bxgy.get("getQuantity")
+        if buy and get:
+            text = f"{buy} つ頼むと {get} つ無料"
     return {"promo": text} if text else {}
 
 
