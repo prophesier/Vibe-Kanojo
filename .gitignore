@@ -6,6 +6,7 @@ model_dict.json
 handoff.md
 rag_design.md
 PROJECT.md
+PROJECT-archive.md
 
 # local test suite (offline mocks; kept out of the public repo as a second
 # layer of insurance — fixtures imitate personal data shapes)
