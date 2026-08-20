@@ -429,7 +429,7 @@ class BasicMemoryAgent(AgentInterface):
     # it must survive replay verbatim). Exempt results are trivially
     # truncation-stable, so an in-loop breakpoint can ride their round.
     # Matched by tool NAME via the protocol's tool_use blocks (id → name).
-    _PROTOCOL_EXEMPT_RESULT_TOOLS = frozenset({"memory_read_diary"})
+    _PROTOCOL_EXEMPT_RESULT_TOOLS = frozenset({"memory_read_diary", "model_history"})
     # uber_search results open with a related-facts section (あさひ 08-13:
     # ヒロ couldn't see his restaurant history while browsing). Everything up
     # to and including this end marker survives replay verbatim; the 400-char
@@ -1250,6 +1250,11 @@ class BasicMemoryAgent(AgentInterface):
         "`s番号:` 付きで関連文だけが並ぶ（番号はその日記内の文位置。"
         "以前のターンに出た文は重複して表示されない）。"
         "id を memory_read_diary に渡せば、いつでも全文が読める。\n"
+        "日記の日付や id の横にモデル名（opus4.6 / opus5 など）が付くことが"
+        "ある——その記録を実際に体験した当時の会話モデルを示す。"
+        "「本人執筆」付きの日記は当時の自分が書いたもので、"
+        "無印の日記は記録係（gpt5.1）の代筆。"
+        "ある日にどのモデルが動いていたかは model_history で引ける。\n"
         "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
         "[Thinking]\n\n"
         "Engage your thinking mode for every reply, no matter how small or "
@@ -1931,6 +1936,12 @@ class BasicMemoryAgent(AgentInterface):
             # Diaries for all loaded sessions are suppressed — their content
             # is already present verbatim in self._memory.
             self._memory_manager.set_active_sessions(loaded_uids)
+            # Session→model attribution (あさひ 08-20): tell the manager who
+            # the experiencer is, then refresh the map (attributes finished
+            # sessions the map missed, snapshots for annotations + the
+            # model_history tool). Cheap: only unmapped session files scan.
+            self._memory_manager.set_chat_model(getattr(self._llm, "model", "") or "")
+            self._memory_manager.refresh_model_map(current_uid=current_uid)
         logger.info(
             f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)"
             + (" + current session" if current_uid else "")
@@ -2307,13 +2318,15 @@ class BasicMemoryAgent(AgentInterface):
         leaked engineering jargon into model-visible text (あさひ 08-14,
         both retired). Semantics live once in _HISTORY_NOTE."""
         lines = ["［過去の記憶（自動検索）開始］"]
+        mgr = self._memory_manager
         for p in packed:
             date = (p.get("date") or "")[:10]
             total = len(p.get("sents") or [])
-            lines.append(
-                f"〔日記 {date} 抜粋・全{total}句"
-                f"（id: {self._short_diary_id(p['uid'])}）〕"
-            )
+            # Experiencer-model tag next to the id (あさひ 08-20); empty for
+            # unmapped sessions — the header simply stays id-only.
+            tag = mgr.diary_display_tag(p["uid"]) if mgr else ""
+            id_part = self._short_diary_id(p["uid"]) + (f" {tag}" if tag else "")
+            lines.append(f"〔日記 {date} 抜粋・全{total}句（id: {id_part}）〕")
             for n in p["delta"]:
                 lines.append(f"s{n}: {p['sents'][n - 1]}")
         lines.append("［過去の記憶終了］")
@@ -4639,6 +4652,29 @@ class BasicMemoryAgent(AgentInterface):
                     },
                 },
             },
+            {
+                "type": "function",
+                "function": {
+                    "name": "model_history",
+                    "description": (
+                        "Look up which conversation model(s) were active on a "
+                        "given date (Japan time): every session touching that "
+                        "day, with its start/end times and the model that "
+                        "experienced it. Use when you want to know 'who was I "
+                        "then' — e.g. after reading an old diary or memory."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "date": {
+                                "type": "string",
+                                "description": "The day to look up, YYYY-MM-DD.",
+                            }
+                        },
+                        "required": ["date"],
+                    },
+                },
+            },
         ]
 
     def _build_memory_tools_claude(self) -> List[Dict[str, Any]]:
@@ -4787,6 +4823,7 @@ class BasicMemoryAgent(AgentInterface):
         "memory_delete",
         "memory_read_diary",
         "memory_write_diary",
+        "model_history",
     )
     # Per-operation marker text is built by _memory_marker (📝 *記憶◯◯: …*);
     # display/history only — stripped from the AI replay like all markers.
@@ -5549,6 +5586,8 @@ class BasicMemoryAgent(AgentInterface):
                 result = await self._memory_delete_flow(args)
             elif name == "memory_read_diary":
                 result = self._memory_read_diary_query(args)
+            elif name == "model_history":
+                result = self._model_history_query(args)
             elif name == "memory_write_diary":
                 result = self._memory_write_diary_query(args)
             else:
@@ -5597,6 +5636,8 @@ class BasicMemoryAgent(AgentInterface):
                 label = f"記憶更新({kind}): {_clip(body)}"
         elif name == "memory_read_diary":
             label = f"日記閲覧: {_clip(result.get('date') or args.get('diary_uid'))}"
+        elif name == "model_history":
+            label = f"モデル履歴: {_clip(args.get('date'))}"
         elif name == "memory_write_diary":
             label = f"日記記入: {_clip(result.get('date') or '')}" + (
                 "（上書き）" if result.get("overwrote") else ""
@@ -5628,6 +5669,24 @@ class BasicMemoryAgent(AgentInterface):
             date_from=str(args.get("date_from", "") or "").strip(),
             date_to=str(args.get("date_to", "") or "").strip(),
         )
+
+    def _model_history_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """model_history — sessions touching one JST date, with the model
+        that experienced each. Reads the boot-frozen map snapshot; the
+        result is replay-EXEMPT (small, and truncating a date table would
+        just invite re-queries)."""
+        date = str(args.get("date", "")).strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+            return {
+                "status": "error",
+                "message": f"date は YYYY-MM-DD 形式で指定すること: {date!r}",
+            }
+        mgr = self._memory_manager
+        rows = mgr.sessions_for_date(date) if mgr else []
+        out: Dict[str, Any] = {"status": "ok", "date": date, "sessions": rows}
+        if not rows:
+            out["note"] = "この日のセッション記録はない。"
+        return out
 
     def _memory_read_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Full diary view. 08-13: the result is replay-EXEMPT (see

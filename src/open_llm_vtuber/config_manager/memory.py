@@ -195,7 +195,7 @@ class PersistentMemoryConfig(I18nMixin):
             zh="facts.json 中保留的最大事实条数",
         ),
         "memory_llm_model": Description(
-            en="Model for memory tasks (diary/fact/consolidate); blank = reuse the chat model. Uses the provider set by memory_llm_provider",
+            en="Model for memory tasks (diary/fact); blank = reuse the chat model. Uses the provider set by memory_llm_provider",
             zh="记忆任务（日记/事实/合并）用的模型；留空则复用主对话模型。使用 memory_llm_provider 指定的 provider",
         ),
         "memory_llm_provider": Description(

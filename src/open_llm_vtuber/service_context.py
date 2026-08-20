@@ -641,7 +641,7 @@ class ServiceContext:
                 )
                 logger.info("[memory] Persistent memory manager initialised.")
 
-                # Optional: route memory tasks (diary/fact/consolidate) through a
+                # Optional: route memory tasks (diary/fact) through a
                 # separate model — they're big, uncached one-shot calls that don't
                 # need the (pricier) chat model. Memory uses its own provider
                 # (memory_llm_provider, default openai_llm) so it stays decoupled

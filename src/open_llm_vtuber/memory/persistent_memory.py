@@ -101,7 +101,7 @@ _FACT_EXTRACT_SYSTEM = (
     "今回抽出する新しい事実の中に、互いに密接に関連するものが2つ以上あれば、"
     "別々の項目として出力せず、1つに統合した事実として書く。\n"
     "※ このバッチ内での統合のみを指す。既存の事実リストとの整合・統合は"
-    "ここでは行わない。それは後から /facts-consolidate が担当する。\n"
+    "ここでは行わない。\n"
     "例：\n"
     "× 「ユーザーはAアニメを視聴」「ユーザーはBアニメを視聴」「ユーザーはCアニメを視聴」\n"
     "○ 「ユーザーはA、B、Cのアニメを視聴している」\n"
@@ -142,66 +142,6 @@ _FACT_EXTRACT_SYSTEM = (
     '繰り返す：JSON配列のみ。各要素は必ず "fact" と "importance" を持つ。'
     '"importance" は "high" か "low"。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。'
 )
-
-_CONSOLIDATE_SYSTEM = (
-    "あなたはメモリ整理ツールです。これは会話ではありません。"
-    "ロールプレイ、キャラクターとしての応答、感情表現タグ（[neutral]等）、"
-    "前置き、コメント、Markdown装飾、コードフェンス（```）は一切禁止です。\n"
-    "出力は**生のJSON配列のみ**。それ以外のテキストを1文字でも含めると失敗とみなされます。\n\n"
-    "タスク：ユーザーに関する事実リストを整理し、関連性の高い項目を1つに統合する。"
-    "総数を減らしつつ情報量は保つことが目的。\n\n"
-    "【統合の対象例】\n"
-    "- 同じカテゴリの列挙系：\n"
-    "  例：複数の「視聴したアニメ」→「ユーザーは A, B, C を視聴した」\n"
-    "  例：複数の「使用ツール」→「ユーザーは X, Y, Z を使用している」\n"
-    "- 同じテーマの周辺事実を要約：\n"
-    "  例：「物理学部出身」+「物理学を専攻」→「ユーザーは物理学部出身で物理学を専攻していた」\n"
-    "- 微妙な重複・言い換え（古い方を新しい表現に統合）\n"
-    "- **矛盾・状態更新**：新しい事実が古い事実を無効化している場合、"
-    "新しい状態を反映するように統合する。どう統合するかは内容で判断：\n"
-    "  ・**単純な進捗・状態の上書き** → 新しい状態のみ残し、古いものは捨てる\n"
-    "    例：「ゼロエスケープの2章をプレイ中」+「3章をプレイ中」→「3章をプレイ中」\n"
-    "    例：「Aタスクに取り組み中」+「Aタスクを完了した」→「Aタスクを完了した」\n"
-    "  ・**経過自体に意味がある変化** → 「以前X、現在Y」の形で経過を残す\n"
-    "    例：「就職活動中」+「会社Aに内定」→「就職活動を経て会社Aに内定した」\n"
-    "    例：「雨が好き」+「雨が嫌いになった」→「以前は雨が好きだったが、今は嫌い」\n"
-    "    例：「東京在住」+「大阪に引っ越した」→「以前は東京、現在は大阪在住」\n"
-    "  ・判断基準：古い状態自体が**今後も参照する価値がある履歴か**。"
-    "達成、価値観の変化、人生の節目、好みの変化、住所・職業の変遷などは履歴として残す。"
-    "単なる進捗や状況の更新は上書きで構わない。\n"
-    "- **複合事実の部分更新（外科的修正）**：1つの事実に複数の独立した情報が含まれていて、"
-    "その**一部だけ**が新しい事実で無効化されている場合、その部分だけを更新する。"
-    "事実全体を捨てない。\n"
-    "  例：古い「ユーザーはAプロジェクト中で、Bツールを使用している」+ 新しい「Bプロジェクトに移行」\n"
-    "  → 「ユーザーはBプロジェクト中で、Bツールを使用している」（Bツール部分は保持、A部分のみ更新）\n\n"
-    "【統合の厳格なルール】\n"
-    "- 統合元のうち**まだ有効な情報**は全て保持すること。"
-    "新しい事実で明示的に無効化された古い情報は捨ててよいが、"
-    "それ以外の意図的な省略・歪曲・過度な要約は禁止。\n"
-    "- 推測で情報を追加してはならない。元の事実に明記されていない内容は書かない。\n"
-    "- 単独で意味を持つ重要な事実は無理に統合しない（矛盾・更新がある場合は別）：\n"
-    "  - 個人情報（出身、学歴、資格、職業、年齢、家族）\n"
-    "  - 約束・合意事項\n"
-    "  - 人生の節目・重要な出来事・トラウマ\n"
-    "  - 価値観・信念\n"
-    "- 統合すると元の情報の特異性が失われる場合は統合しない。\n"
-    "- 各統合グループには**少なくとも2個**のインデックスを含めること（1個だけは統合ではない）。\n"
-    "- 同じインデックスを複数のグループに含めてはならない。\n"
-    "- 統合候補が無ければ空の配列 `[]` を出力する。\n\n"
-    "**出力形式（厳守）**：\n"
-    "[\n"
-    '  {"merge": [元のインデックス1, インデックス2, ...], "into": "統合後の事実文"},\n'
-    '  {"merge": [...], "into": "..."},\n'
-    "  ...\n"
-    "]\n\n"
-    "例：\n"
-    "[\n"
-    '  {"merge": [3, 7, 12], "into": "ユーザーは『ひぐらしのなく頃に』『サマータイムレンダ』『xxx』を視聴した"},\n'
-    '  {"merge": [5, 9], "into": "ユーザーは物理学部出身で物理学を専攻していた"}\n'
-    "]\n\n"
-    "繰り返す：JSON配列のみ。前置き・コメント・Markdownは禁止。"
-)
-
 
 _DIARY_SYSTEM = (
     "あなたは記憶アシスタントです。AIキャラクターの一人称視点から、"
@@ -309,13 +249,35 @@ _FACT_PRUNE_SYSTEM = (
     "全体を削除すると、まだ有効な情報まで失うため。\n"
     "例：「ユーザーはAプロジェクトに取り組み中で、Bツールを使用している」のうち、"
     "Aだけが古い情報になっていても、Bツールの情報は現在も有効。"
-    "このような複合事実は削除候補から除外し、後から /facts-consolidate で"
-    "外科的に部分更新するのが正しい処理。\n"
+    "このような複合事実は削除候補から除外する。\n"
     "削除してよいのは**事実全体が陳腐化・無効化されている**ケースのみ。\n\n"
     "**出力形式（厳守）**：\n"
     "削除するインデックス（数字）のみをJSON配列で出力する: [3, 7, 12]\n"
     "繰り返す：JSON配列のみ。他のテキスト・記号は一切含めない。"
 )
+
+
+def model_short_name(model_id: str) -> str:
+    """Compact display form of a model id — the annotation style あさひ chose
+    (統一モデル番号): claude-opus-4-6 → opus4.6, claude-opus-5 → opus5,
+    gpt-5.1 → gpt5.1, gpt-5.6-sol → gpt5.6-sol. Number segments join with
+    dots (the first attaches bare), non-number tails keep a hyphen. Unknown
+    ids fall through recognizably instead of erroring."""
+    m = (model_id or "").strip().lower()
+    if not m:
+        return "?"
+    if m.startswith("claude-"):
+        m = m[len("claude-") :]
+    parts = m.split("-")
+    out = parts[0]
+    seen_num = False
+    for p in parts[1:]:
+        if re.fullmatch(r"\d+(\.\d+)*", p):
+            out += p if not seen_num else "." + p
+            seen_num = True
+        else:
+            out += "-" + p
+    return out
 
 
 class PersistentMemoryManager:
@@ -325,6 +287,12 @@ class PersistentMemoryManager:
     # running. Prevents concurrent connections from kicking off duplicate
     # backfills against the same character.
     _backfill_in_progress: ClassVar[Set[str]] = set()
+
+    # Class-level defaults so partially-constructed instances (tests build
+    # via __new__) degrade gracefully: no chat model recorded, no map
+    # snapshot loaded. Real instances overwrite both in __init__/boot.
+    _chat_model: str = ""
+    _model_map_snapshot: Optional[Dict[str, Any]] = None
 
     def __init__(
         self,
@@ -345,7 +313,7 @@ class PersistentMemoryManager:
         self._base_dir = os.path.join("chat_history", conf_uid)
         self._facts_path = os.path.join(self._base_dir, "facts.json")
         self._diaries_dir = os.path.join(self._base_dir, "diaries")
-        # Optional dedicated LLM for memory tasks (diary/fact/consolidate). When
+        # Optional dedicated LLM for memory tasks (diary/fact). When
         # set, _call_llm uses it instead of the chat model — keeps big uncached
         # one-shot memory calls off the (pricier) chat model. set via setter.
         self._memory_llm: Any = None
@@ -354,6 +322,14 @@ class PersistentMemoryManager:
         # for extraction), so it needs an explicit "low"; gpt-5.5 defaults to
         # "medium" so empty is fine there. Set from config via the setter.
         self._memory_reasoning_effort: str = ""
+        # The CHAT model's id (set by the agent at wiring) — the "experiencer"
+        # recorded on fact history events and used for the in-progress session
+        # in the model map snapshot. Distinct from _memory_llm (the writer of
+        # diaries/extractions).
+        self._chat_model: str = ""
+        # Session→model attribution snapshot (chat_history/_model_map.json,
+        # refreshed at boot by refresh_model_map). Keys are session uids.
+        self._model_map_snapshot = {}
 
         # Diary RAG (long-tail recall). Built only when enabled and an embedding
         # key resolves; otherwise stays None and every RAG call is a no-op so a
@@ -466,7 +442,7 @@ class PersistentMemoryManager:
     # ------------------------------------------------------------------
 
     def set_memory_llm(self, llm: Any) -> None:
-        """Route memory tasks (diary/fact/consolidate) through this LLM instead
+        """Route memory tasks (diary/fact) through this LLM instead
         of the chat model. Pass None to fall back to the caller-supplied LLM."""
         self._memory_llm = llm
 
@@ -474,6 +450,11 @@ class PersistentMemoryManager:
         """Set reasoning_effort for memory-task LLM calls (none/low/medium/high).
         Empty string = don't send it, i.e. use the model's own default."""
         self._memory_reasoning_effort = (effort or "").strip()
+
+    def set_chat_model(self, model: str) -> None:
+        """Record the CHAT model's id (the experiencer) — stamped onto fact
+        history events and the in-progress session's model-map entry."""
+        self._chat_model = (model or "").strip()
 
     def set_active_sessions(self, uids) -> None:
         """Mark these session UIDs as already loaded in the sliding window."""
@@ -545,11 +526,19 @@ class PersistentMemoryManager:
         diaries = self._load_recent_diaries()
         if not diaries:
             return ""
-        entries = "\n\n".join(f"[{d['date']}]\n{d['content']}" for d in diaries)
+
+        def _head(d: Dict[str, Any]) -> str:
+            tag = self.diary_display_tag(d.get("history_uid", ""), entry=d)
+            return f"[{d['date']} {tag}]" if tag else f"[{d['date']}]"
+
+        entries = "\n\n".join(f"{_head(d)}\n{d['content']}" for d in diaries)
         return (
             "## 過去セッションの日記\n"
             "後続の会話履歴より前に行われたセッションの要約。"
-            "各エントリ冒頭の日付がそのセッションの実時間。\n"
+            "各エントリ冒頭の日付がそのセッションの実時間。"
+            "日付の横のモデル名は、その記録を実際に体験した当時の会話モデル。"
+            "「本人執筆」付きは当時の自分が書いた日記で、"
+            "無印の日記は記録係（gpt5.1）が代筆したもの。\n"
             "※ 日記中の「未解決」「これから」「明日」など、当時の予定や保留事項を"
             "表す記述は、その日記が書かれた時点の状態を反映している。"
             "その後すでに解決・完了している可能性があるため、現状を断定せず、"
@@ -951,6 +940,17 @@ class PersistentMemoryManager:
         except Exception as e:
             logger.warning(f"[memory_tool] facts index sync failed: {e}")
 
+    @staticmethod
+    def _history_event(op: str, model: str, now: str = "") -> Dict[str, str]:
+        """One provenance event for a fact's ``history`` list (あさひ 08-20:
+        pure record — original creator, later editors — no consumer yet).
+        ``m`` is the full model id; unknown stays '' rather than a guess."""
+        return {
+            "t": now or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "m": (model or "").strip(),
+            "op": op,
+        }
+
     async def add_fact_manual(
         self, text: str, importance: str = "low", store_id: str = ""
     ) -> Dict[str, Any]:
@@ -977,10 +977,13 @@ class PersistentMemoryManager:
                 "message": "同内容の記憶が既にある。",
                 "id": fid[:8],
             }
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = {
             "fact": text,
-            "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated": now,
             "importance": importance,
+            # Provenance trail (あさひ 08-20): pure record, no consumer yet.
+            "history": [self._history_event("create", self._chat_model, now)],
         }
         store_id = (store_id or "").strip()
         if store_id:
@@ -1056,6 +1059,12 @@ class PersistentMemoryManager:
                 else:
                     f.pop("store_id", None)
             f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Provenance: append the edit; a legacy fact without a history
+            # list starts one here (its creator stays unrecorded — never
+            # fabricated).
+            f.setdefault("history", []).append(
+                self._history_event("edit", self._chat_model, f["updated"])
+            )
             self._save_facts(facts)
             await self._sync_facts_index()
             new_id = self._fact_id(f["fact"])
@@ -1219,26 +1228,41 @@ class PersistentMemoryManager:
                     if not c:
                         continue
                     meta = c.get("meta") or {}
-                    diaries.append(
-                        {
-                            "date": meta.get("date", ""),
-                            # the containing diary — usable with
-                            # memory_read_diary
-                            "diary_uid": meta.get("parent", ""),
-                            "text": c.get("text", ""),
-                            "score": round(float(h.get("score", 0.0)), 3),
-                        }
-                    )
+                    parent = meta.get("parent", "")
+                    row = {
+                        "date": meta.get("date", ""),
+                        # the containing diary — usable with
+                        # memory_read_diary
+                        "diary_uid": parent,
+                        "text": c.get("text", ""),
+                        "score": round(float(h.get("score", 0.0)), 3),
+                    }
+                    tag = self.diary_display_tag(parent)
+                    if tag.endswith(" 本人執筆"):
+                        row["model"] = tag[: -len(" 本人執筆")]
+                        row["written_by"] = "本人"
+                    elif tag:
+                        row["model"] = tag
+                    diaries.append(row)
                 out["diaries"] = diaries
         return out
 
     def read_diary_full(self, diary_uid: str) -> Optional[Dict[str, Any]]:
-        """Full diary entry ``{date, content}`` by uid (memory_read_diary),
-        or None when missing."""
-        entry = self._read_diary((diary_uid or "").strip())
+        """Full diary entry ``{date, content, model?, written_by?}`` by uid
+        (memory_read_diary), or None when missing. ``model`` is the session's
+        experiencer (short form); ``written_by: 本人`` marks a self-written
+        diary — absent = penned by the memory model (gpt5.1)."""
+        uid = (diary_uid or "").strip()
+        entry = self._read_diary(uid)
         if not entry:
             return None
-        return {"date": entry.get("date", ""), "content": entry.get("content", "")}
+        out = {"date": entry.get("date", ""), "content": entry.get("content", "")}
+        label = self.model_label_for_session(uid)
+        if label:
+            out["model"] = label
+        if entry.get("writer") == "self":
+            out["written_by"] = "本人"
+        return out
 
     def write_session_diary(self, history_uid: str, content: str) -> Dict[str, Any]:
         """Save the CURRENT session's diary written by the character herself
@@ -1264,6 +1288,9 @@ class PersistentMemoryManager:
                 "date": self._session_date_from_uid(uid),
                 "history_uid": uid,
                 "content": content,
+                # Self-written via memory_write_diary — drives the 本人執筆
+                # annotation; auto-generated diaries record their pen model.
+                "writer": "self",
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(entry, f, ensure_ascii=False, indent=2)
@@ -1594,7 +1621,23 @@ class PersistentMemoryManager:
                     imp = "high"
                 elif imp not in ("high", "low"):
                     imp = "low"
-                tagged.append({"fact": f["fact"], "updated": now, "importance": imp})
+                tagged.append(
+                    {
+                        "fact": f["fact"],
+                        "updated": now,
+                        "importance": imp,
+                        # Creator = the pen model of this extraction run.
+                        "history": [
+                            self._history_event(
+                                "create",
+                                str(
+                                    getattr(self._memory_llm or llm, "model", "") or ""
+                                ),
+                                now,
+                            )
+                        ],
+                    }
+                )
             merged = existing + tagged
             # Smart trim: ask the LLM to drop least-important entries when
             # over the cap. The whole merged pool (old + new) is the
@@ -1686,10 +1729,14 @@ class PersistentMemoryManager:
             # Use the session's start time (encoded in history_uid) as the date,
             # so backfilled diaries sort correctly with newly-created ones.
             session_date = self._session_date_from_uid(history_uid)
+            pen = self._memory_llm or llm
             diary_entry = {
                 "date": session_date,
                 "history_uid": history_uid,
                 "content": content,
+                # Pen model for the record (display treats non-self diaries
+                # as gpt5.1-written per the prompt-side convention).
+                "writer": str(getattr(pen, "model", "") or ""),
             }
             filename = f"{history_uid}.json"
             path = os.path.join(self._diaries_dir, filename)
@@ -1750,11 +1797,6 @@ class PersistentMemoryManager:
         PersistentMemoryManager._backfill_in_progress.add(conf_uid)
         try:
             from ..chat_history_manager import get_history_list, get_history
-
-            # Promote any pending consolidation result BEFORE the rest of
-            # backfill, so subsequent extraction/pruning operates on the
-            # consolidated baseline rather than the pre-consolidation one.
-            self._promote_staged_facts_if_present()
 
             history_list = get_history_list(conf_uid)
 
@@ -1988,6 +2030,159 @@ class PersistentMemoryManager:
             return f"{parts[0]} {time_part}"
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    # ------------------------------------------------------------------
+    # Session→model attribution (chat_history/_model_map.json)
+    # ------------------------------------------------------------------
+    # The pre-08-18 era was hand-adjudicated (console logs + cost CSV +
+    # あさひ rulings — see the map's own comment field); finished sessions
+    # the map does not cover yet are attributed here at boot from their
+    # thinking_seed.model fields (served truth). The in-progress session
+    # rides only the in-memory snapshot — once it ends, the next boot
+    # attributes it from seeds like any other.
+
+    @property
+    def _model_map_path(self) -> str:
+        return os.path.join("chat_history", "_model_map.json")
+
+    def refresh_model_map(self, current_uid: str = "") -> None:
+        """Attribute unmapped finished sessions from their seeds, persist the
+        map, and freeze an in-memory snapshot (the model_history tool and the
+        diary annotations read only the snapshot). Never raises."""
+        try:
+            data: Dict[str, Any] = {}
+            if os.path.exists(self._model_map_path):
+                with open(self._model_map_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            sessions = data.setdefault("sessions", {})
+            added = 0
+            if os.path.isdir(self._base_dir):
+                for fname in os.listdir(self._base_dir):
+                    if not fname.endswith(".json") or not re.match(
+                        r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[0-9a-f]+\.json$", fname
+                    ):
+                        continue
+                    uid = fname[:-5]
+                    if uid in sessions or uid == current_uid:
+                        continue
+                    entry = self._attribute_session_from_seeds(
+                        os.path.join(self._base_dir, fname)
+                    )
+                    if entry is not None:
+                        sessions[uid] = entry
+                        added += 1
+            if added:
+                data["generated_at"] = datetime.now().isoformat(timespec="seconds")
+                tmp = self._model_map_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=1)
+                os.replace(tmp, self._model_map_path)
+                logger.info(
+                    f"[model_map] attributed {added} new session(s) from seeds."
+                )
+            snapshot = dict(sessions)
+            if current_uid and self._chat_model:
+                snapshot[current_uid] = {
+                    "start": self._session_date_from_uid(current_uid).replace(" ", "T"),
+                    "end": None,
+                    "verdict": "single",
+                    "ongoing": True,
+                    "models": {
+                        self._chat_model: {"messages": 0, "sources": {"current": 1}}
+                    },
+                }
+            self._model_map_snapshot = snapshot
+        except Exception as e:
+            logger.warning(f"[model_map] refresh failed: {e}")
+
+    @staticmethod
+    def _attribute_session_from_seeds(path: str) -> Optional[Dict[str, Any]]:
+        """Map entry for one finished session file, from its thinking seeds.
+        Sessions with no seed at all get verdict 'uncertain' and no models —
+        the display side degrades to no annotation, never a guess."""
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                msgs = json.load(f)
+            if not isinstance(msgs, list) or not msgs:
+                return None
+            models: Dict[str, int] = {}
+            first_ts = last_ts = ""
+            for m in msgs:
+                ts = str(m.get("timestamp") or "")
+                if ts:
+                    first_ts = first_ts or ts
+                    last_ts = ts
+                seed = m.get("thinking_seed")
+                if m.get("role") == "ai" and isinstance(seed, dict):
+                    mid = str(seed.get("model") or "")
+                    if mid:
+                        models[mid] = models.get(mid, 0) + 1
+            verdict = (
+                "single" if len(models) == 1 else ("mixed" if models else "uncertain")
+            )
+            return {
+                "start": first_ts,
+                "end": last_ts,
+                "verdict": verdict,
+                "models": {
+                    k: {"messages": v, "sources": {"seed": v}}
+                    for k, v in models.items()
+                },
+            }
+        except Exception:
+            return None
+
+    def model_label_for_session(self, uid: str) -> str:
+        """Short experiencer label for a session uid ('opus5'; a mixed
+        session joins its models with '/'; unknown/unmapped → '')."""
+        s = (self._model_map_snapshot or {}).get(uid)
+        if not isinstance(s, dict):
+            return ""
+        models = list((s.get("models") or {}).keys())
+        return "/".join(model_short_name(m) for m in models)
+
+    def diary_display_tag(
+        self, uid: str, entry: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Model annotation for one diary: 'opus5', 'opus5 本人執筆', or ''.
+
+        The experiencer comes from the session map; 本人執筆 marks diaries
+        the character wrote herself via memory_write_diary (writer='self' on
+        the diary file). Unmarked diaries were written by the memory model
+        (gpt-5.1) — stated once in the prompt-side note, not per entry."""
+        label = self.model_label_for_session(uid)
+        if not label:
+            return ""
+        if entry is None:
+            entry = self._read_diary(uid) or {}
+        if entry.get("writer") == "self":
+            label += " 本人執筆"
+        return label
+
+    def sessions_for_date(self, date_str: str) -> List[Dict[str, Any]]:
+        """Sessions whose [start, end] day-interval touches the given JST
+        date (YYYY-MM-DD) — the model_history tool. Sorted by start."""
+        rows: List[Dict[str, Any]] = []
+        for uid, s in (self._model_map_snapshot or {}).items():
+            if not isinstance(s, dict):
+                continue
+            start = str(s.get("start") or "")[:10]
+            end = str(s.get("end") or "")[:10] or start
+            if not start or not (start <= date_str <= end):
+                continue
+            rows.append(
+                {
+                    "start": str(s.get("start") or "").replace("T", " "),
+                    "end": (
+                        "進行中"
+                        if s.get("ongoing")
+                        else str(s.get("end") or "").replace("T", " ")
+                    ),
+                    "model": self.model_label_for_session(uid) or "不明",
+                }
+            )
+        rows.sort(key=lambda r: r["start"])
+        return rows
+
     @staticmethod
     def _session_end_hm_from_messages(messages: List[Dict[str, Any]]) -> str:
         """Return HH:MM of the last message's timestamp, or empty string."""
@@ -2037,7 +2232,7 @@ class PersistentMemoryManager:
     async def _call_llm(
         self, llm: Any, system: str, prompt: str, max_tokens: int = 4096
     ) -> str:
-        # Route every memory task (fact extraction, diary, prune, consolidate)
+        # Route every memory task (fact extraction, diary, prune)
         # through the dedicated memory model when one is configured — these are
         # big, uncached one-shot calls that don't need the chat model.
         llm = self._memory_llm or llm
@@ -2138,195 +2333,6 @@ class PersistentMemoryManager:
         if not (added or discarded_new or dropped_existing):
             lines.append("  (no changes)")
         logger.info("\n".join(lines))
-
-    @property
-    def _staged_facts_path(self) -> str:
-        """Path to the pending consolidated facts file."""
-        return os.path.join(self._base_dir, "facts.consolidated.json")
-
-    async def consolidate_facts_to_staged(self, llm: Any) -> Dict[str, Any]:
-        """Run LLM-based fact consolidation and write the result to a staged
-        file alongside facts.json.
-
-        The current facts.json is **not modified** — the active session
-        keeps using it. On the next OLV startup, backfill_async detects the
-        staged file and promotes it to facts.json before running the
-        normal extraction/pruning passes.
-
-        Returns a dict with stats and per-merge breakdown for the caller
-        (Discord bot) to surface to the user.
-        """
-        facts = self._load_facts()
-        result: Dict[str, Any] = {
-            "ok": False,
-            "before": len(facts),
-            "after": len(facts),
-            "merges": [],
-            "message": "",
-        }
-        if len(facts) < 2:
-            result["message"] = "Need at least 2 facts to consolidate."
-            return result
-
-        numbered = "\n".join(
-            f"{i} [{str(f.get('updated', ''))[:10] or '不明'}]: {f['fact']}"
-            for i, f in enumerate(facts)
-        )
-        prompt = (
-            f"現在 {len(facts)} 個の事実がある。\n\n"
-            f"事実リスト（形式: インデックス [記録日]: 内容）:\n{numbered}\n\n"
-            "統合できる項目があれば指定形式で出力。なければ `[]`。"
-        )
-
-        try:
-            raw = await self._call_llm(llm, _CONSOLIDATE_SYSTEM, prompt)
-            logger.info(f"[memory] Fact-consolidation LLM raw output:\n{raw}")
-            if not raw.strip():
-                result["message"] = "Consolidation LLM returned empty output."
-                logger.warning(f"[memory] {result['message']}")
-                return result
-            proposals = self._parse_json_list(raw)
-        except Exception as e:
-            logger.warning(
-                f"[memory] Consolidation LLM call failed: {e}", exc_info=True
-            )
-            result["message"] = f"LLM call failed: {e}"
-            return result
-
-        # Validate proposals: each merge needs ≥2 valid indices, into must
-        # be a non-empty string, no index reused across groups.
-        used_indices: set = set()
-        valid: List[Dict[str, Any]] = []
-        for m in proposals:
-            into = m.get("into", "")
-            if not isinstance(into, str) or not into.strip():
-                continue
-            raw_indices = m.get("merge", [])
-            if not isinstance(raw_indices, list):
-                continue
-            indices = [
-                i
-                for i in raw_indices
-                if isinstance(i, int) and 0 <= i < len(facts) and i not in used_indices
-            ]
-            if len(indices) < 2:
-                continue
-            used_indices.update(indices)
-            valid.append({"merge": indices, "into": into.strip()})
-
-        if not valid:
-            logger.info("[memory] No valid consolidations proposed.")
-            result["ok"] = True
-            result["message"] = "No consolidation opportunities found."
-            return result
-
-        # Build the new fact list: keep unmerged entries; append one entry
-        # per valid merge with `updated` set to the newest date among the
-        # source facts (no new fact was created, just reorganised).
-        merged_text_set = used_indices
-        survivors = [f for i, f in enumerate(facts) if i not in merged_text_set]
-        _tier_rank = {"user": 2, "high": 1, "llm": 1, "low": 0}
-        new_merged: List[Dict[str, Any]] = []
-        for m in valid:
-            source_dates = [str(facts[i].get("updated", "")) for i in m["merge"]]
-            source_dates = [d for d in source_dates if d]
-            newest = (
-                max(source_dates)
-                if source_dates
-                else (datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-            )
-            # Keep the highest tier among the merged sources so consolidation
-            # never silently demotes a hand-set `user` (or `llm`) fact.
-            best_tier = max(
-                (facts[i].get("importance", "low") for i in m["merge"]),
-                key=lambda t: _tier_rank.get(t, 0),
-            )
-            new_merged.append(
-                {"fact": m["into"], "updated": newest, "importance": best_tier}
-            )
-
-        new_facts = survivors + new_merged
-
-        # Write to staged file (NOT facts.json). Backfill will promote it
-        # atomically at the next OLV startup. Same chronological sort as
-        # the main _save_facts path so the staged + promoted file is
-        # immediately ordered.
-        try:
-            os.makedirs(self._base_dir, exist_ok=True)
-            ordered = self._sort_facts(new_facts)
-            with open(self._staged_facts_path, "w", encoding="utf-8") as f:
-                json.dump(ordered, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"[memory] Failed to write staged facts file: {e}")
-            result["message"] = f"Failed to write staged file: {e}"
-            return result
-
-        # Build per-merge log + return payload.
-        log_lines = [
-            f"[memory] Consolidation staged → {self._staged_facts_path} "
-            f"({len(facts)} → {len(new_facts)}, {len(valid)} merge group(s))"
-        ]
-        merges_summary: List[Dict[str, Any]] = []
-        for m in valid:
-            sources = [
-                {
-                    "date": str(facts[i].get("updated", ""))[:10] or "不明",
-                    "fact": facts[i]["fact"],
-                }
-                for i in m["merge"]
-            ]
-            merges_summary.append({"into": m["into"], "sources": sources})
-            log_lines.append(f"  Merged {len(m['merge'])} fact(s) into:")
-            log_lines.append(f"    + {m['into']}")
-            for s in sources:
-                log_lines.append(f"    ← [{s['date']}] {s['fact']}")
-        logger.info("\n".join(log_lines))
-
-        result["ok"] = True
-        result["after"] = len(new_facts)
-        result["merges"] = merges_summary
-        result["message"] = (
-            f"Consolidated {len(facts)} → {len(new_facts)} fact(s) in "
-            f"{len(valid)} merge group(s). Will take effect on next OLV restart."
-        )
-        return result
-
-    def _promote_staged_facts_if_present(self) -> bool:
-        """If a staged consolidated facts file exists, atomically replace
-        facts.json with it (after backing up the current file).
-
-        Called at the very start of backfill_async so the consolidated file
-        becomes the base for any subsequent extraction/pruning in the same
-        backfill run. Returns True if a promotion happened.
-
-        The pre-consolidation snapshot is saved with a timestamped name so
-        each manual consolidation's "before" state is preserved permanently
-        (consolidations are manual + rare, so the backup files won't
-        accumulate excessively — and the user explicitly wants the ability
-        to review or roll back later).
-        """
-        staged = self._staged_facts_path
-        if not os.path.exists(staged):
-            return False
-        try:
-            if os.path.exists(self._facts_path):
-                ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                bak = f"{self._facts_path}.bak.pre-consolidation-{ts}"
-                try:
-                    shutil.copy2(self._facts_path, bak)
-                    logger.info(f"[memory] Pre-consolidation backup → {bak}")
-                except Exception as e:
-                    logger.warning(
-                        f"[memory] Could not back up before consolidation: {e}"
-                    )
-            os.replace(staged, self._facts_path)
-            logger.info(
-                f"[memory] Promoted staged consolidated facts → {self._facts_path}"
-            )
-            return True
-        except Exception as e:
-            logger.warning(f"[memory] Failed to promote staged consolidated facts: {e}")
-            return False
 
     async def _enforce_fact_limit_async(self, llm: Any, persona: str = "") -> None:
         """Trim facts.json down to max_facts if it currently exceeds the cap.
