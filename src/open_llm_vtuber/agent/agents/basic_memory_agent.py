@@ -406,13 +406,11 @@ class BasicMemoryAgent(AgentInterface):
     _MILLITOK_CJK = 900  # chars above U+2E7F
     _MILLITOK_OTHER = 263  # ≈1/3.8 tok per char
     _PROTOCOL_TRUNCATION_MARKER = "…[truncated for replay]"
-    # Substitute output for a thinking-only turn (billed reasoning, zero
-    # visible text — an Opus 5 failure shape that spiked to 4x in two days,
-    # あさひ 08-15). Overrides the 07-25 "never rewrite model output" rule
-    # for THIS bug: an omitted assistant turn replays as two consecutive
-    # user messages — the exact shape that seeded fabricated-input
-    # imitation (08-05). Stored in history AND appended to the protocol's
-    # final assistant message as a text block.
+    # Legacy silent-turn placeholder (08-15..08-20). New silent turns take
+    # the API-error exit instead (_handle_thinking_only_turn, あさひ 08-20);
+    # this constant remains because pre-08-20 records on disk carry it as
+    # content, and single_conversation still uses it as a defensive
+    # fallback for a seed-only store (e.g. an interrupted turn).
     _EMPTY_TURN_PLACEHOLDER = "…"
 
     @classmethod
@@ -1262,15 +1260,12 @@ class BasicMemoryAgent(AgentInterface):
         "turns where such errors go unnoticed. Think first, every time."
     )
 
-    # Model families whose default thinking/tool eagerness no longer needs the
-    # 4.6-era nudges. Substring match (same style as
-    # claude_llm._budget_tokens_removed); a miss falls back to the full note,
-    # so an unlisted new model just keeps today's behavior.
-    _LEAN_NOTE_MODELS = ("opus-5",)
-
     def _lean_prompt_active(self) -> bool:
-        model = (getattr(self._llm, "model", "") or "").lower()
-        return any(x in model for x in self._LEAN_NOTE_MODELS)
+        # あさひ 08-20: lean for ALL models. Was gated by model family
+        # (opus-5 → lean, others → full); unified so switching models never
+        # swaps the prompt bytes. The full variants stay defined above for
+        # reference and are archived verbatim in backup/prompt_full_20260820/.
+        return True
 
     def _history_note(self) -> str:
         if self._lean_prompt_active():
@@ -1503,6 +1498,15 @@ class BasicMemoryAgent(AgentInterface):
     # _BP_LOOKBACK_BUDGET blocks of it. Class-level default, instance
     # attribute once a marker is placed.
     _bp_wire_anchor: Optional[int] = None
+    # Anchor as of the START of the current turn (snapshot in _to_messages,
+    # before this turn's placement/in-loop migration advances it). The
+    # failure exits (_handle_api_error_turn / _handle_thinking_only_turn)
+    # restore it: a discarded turn leaves _memory as if it never happened,
+    # so the anchor must roll back too — a stale post-turn anchor points at
+    # wire blocks that no longer exist and loosens the lookback constraint
+    # for one placement (worst case: one avoidable full messages-region
+    # rewrite, the 08-16 failure shape).
+    _bp_anchor_turn_start: Optional[int] = None
 
     @staticmethod
     def _wire_blocks(message: Dict[str, Any]) -> int:
@@ -1793,6 +1797,7 @@ class BasicMemoryAgent(AgentInterface):
         self._diary_sent_ledger = {}
         self._pending_rag_block = ""
         self._bp_wire_anchor = None
+        self._bp_anchor_turn_start = None
         self._session_injected_fact_ids = set()
         self._pending_facts_block = ""
         self._steam_pending_blocks = []
@@ -2122,6 +2127,7 @@ class BasicMemoryAgent(AgentInterface):
         # non-Claude. The fresh-session first message is safe to mark too:
         # its banner is injected into the outgoing payload above, so
         # stored == sent holds from the very first turn.
+        self._bp_anchor_turn_start = self._bp_wire_anchor
         messages = self._attach_cache_breakpoint(messages)
         return messages
 
@@ -2972,45 +2978,35 @@ class BasicMemoryAgent(AgentInterface):
                 continue
             else:
                 if not current_turn_text:
-                    # Thinking-only turn: billed reasoning, zero visible text
-                    # (max_tokens ate the budget mid-thinking, or the model
-                    # ended the turn silently — refusals were handled above).
-                    # 08-15 (あさひ, after 4 such turns in two days): store
-                    # the ellipsis placeholder as the utterance — the earlier
-                    # keep-it-empty policy made replays show two consecutive
-                    # user messages, the fabricated-input imitation shape.
-                    # The transcript still carries the true thinking; only
-                    # the missing text block is substituted.
-                    if not self._claude_thinking_blocks_replayable(
-                        current_assistant_message_content
-                    ):
-                        # e.g. an unsigned thinking block from a max_tokens
-                        # cut — replaying it would 400; drop the turn rather
-                        # than store a poisoned transcript.
-                        protocol_is_exact = False
-                    logger.warning(
-                        "[empty_reply] turn ended with no visible text "
-                        f"(thinking_tokens={turn_thinking_tokens}) — storing "
-                        f"the {self._EMPTY_TURN_PLACEHOLDER} placeholder."
+                    # Silent turn (billed reasoning and/or tool rounds, zero
+                    # visible text) — あさひ 08-20: API-error treatment
+                    # replaces the 08-15 ellipsis-placeholder policy; see
+                    # _handle_thinking_only_turn. Prior tool rounds ride the
+                    # forensic seed alongside the final silent response.
+                    forensic = claude_protocol + (
+                        [
+                            {
+                                "role": "assistant",
+                                "content": deepcopy(current_assistant_message_content),
+                            }
+                        ]
+                        if current_assistant_message_content
+                        else []
                     )
-                text_for_memory = current_turn_text or self._EMPTY_TURN_PLACEHOLDER
+                    yield self._handle_thinking_only_turn(
+                        turn_thinking_tokens, forensic or None
+                    )
+                    return
+                text_for_memory = current_turn_text
                 protocol_for_memory: Optional[List[Dict[str, Any]]] = None
                 if (
                     protocol_is_exact
                     and current_assistant_message_is_exact
                     and current_assistant_message_content
                 ):
-                    final_content = deepcopy(current_assistant_message_content)
-                    if not current_turn_text:
-                        final_content.append(
-                            {
-                                "type": "text",
-                                "text": self._EMPTY_TURN_PLACEHOLDER,
-                            }
-                        )
                     final_assistant = {
                         "role": "assistant",
-                        "content": final_content,
+                        "content": deepcopy(current_assistant_message_content),
                     }
                     round_thinking.append(request_thinking_tokens)
                     # Per-round trim (08-09, replaces the 07-25 whole-turn
@@ -3459,25 +3455,21 @@ class BasicMemoryAgent(AgentInterface):
                     "but no thinking block in the response — the API hid the "
                     "thinking entirely."
                 )
-            if not complete_response and claude_assistant_message is not None:
-                # Thinking-only turn — same treatment as the tool loop
-                # (08-15): substitute the ellipsis placeholder so replays keep
-                # an assistant turn between the user messages.
-                logger.warning(
-                    "[empty_reply] turn ended with no visible text "
-                    f"(thinking_tokens={plain_thinking_tokens}) — storing "
-                    f"the {self._EMPTY_TURN_PLACEHOLDER} placeholder."
+            if not complete_response:
+                # Silent turn — あさひ 08-20: API-error treatment replaces
+                # the 08-15 ellipsis-placeholder policy; see
+                # _handle_thinking_only_turn. (An empty turn with no
+                # protocol at all — the non-Claude path — is the same
+                # failure and takes the same exit, minus the seed.)
+                yield self._handle_thinking_only_turn(
+                    plain_thinking_tokens,
+                    (
+                        [claude_assistant_message]
+                        if claude_assistant_message is not None
+                        else None
+                    ),
                 )
-                if not self._claude_thinking_blocks_replayable(
-                    claude_assistant_message.get("content") or []
-                ):
-                    # Unsigned (max_tokens cut) — unreplayable; drop the turn.
-                    claude_assistant_message = None
-                else:
-                    claude_assistant_message = deepcopy(claude_assistant_message)
-                    claude_assistant_message.setdefault("content", []).append(
-                        {"type": "text", "text": self._EMPTY_TURN_PLACEHOLDER}
-                    )
+                return
             plain_cap = getattr(self._llm, "thinking_replay_max_tokens", 0) or 0
             if plain_cap and plain_thinking_tokens > plain_cap:
                 # Single-request turn = single round, so the per-round rule
@@ -3507,7 +3499,7 @@ class BasicMemoryAgent(AgentInterface):
                         "protocol": [deepcopy(claude_assistant_message)],
                     }
                 self._add_message(
-                    complete_response or self._EMPTY_TURN_PLACEHOLDER,
+                    complete_response,
                     "assistant",
                     claude_protocol=(
                         [claude_assistant_message]
@@ -3751,6 +3743,10 @@ class BasicMemoryAgent(AgentInterface):
             short = short[:160] + "…"
         if self._memory and self._memory[-1].get("role") == "user":
             self._memory.pop()
+        # Discarded turn → the cache anchor advanced for wire blocks that no
+        # longer exist; roll it back to the turn-start snapshot (see
+        # _bp_anchor_turn_start).
+        self._bp_wire_anchor = self._bp_anchor_turn_start
         marked_disk = False
         try:
             if self._conf_uid and self._history_uid:
@@ -3767,6 +3763,57 @@ class BasicMemoryAgent(AgentInterface):
         return (
             f"\n⚠️ APIエラーで応答できなかった（{short}）。"
             "この往復は文脈に残らない——直前のメッセージは届いていないので、"
+            "もう一度送ってほしい。\n"
+        )
+
+    def _handle_thinking_only_turn(
+        self,
+        thinking_tokens: int,
+        protocol: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """Clean up after a silent turn (no visible text) and build the notice.
+
+        あさひ 08-20 ruling: a turn that thought (or ran tools) but never
+        spoke is a failure symptom — the 08-18 end-incident was preceded by
+        exactly these — so it gets the API-error treatment
+        (_handle_api_error_turn), replacing the 08-15 ellipsis-placeholder
+        policy: the user input is popped from memory, both sides stay on
+        DISK tagged ``context_excluded`` for human review, and the notice
+        asks the user to resend. Assembly skips tagged records on BOTH
+        restart paths — the frozen system transcript and the resume splice
+        share _msg_from_history_record, whose tag check runs before the
+        thinking-seed passthrough — so the turn never re-enters context.
+
+        ``protocol`` (the turn's raw thinking/tool rounds) still rides the
+        excluded AI record as a FORENSIC seed: the 08-18 investigation
+        lived on exactly this material. No replay trim, no replayability
+        gate — an excluded record is for human eyes only."""
+        if self._memory and self._memory[-1].get("role") == "user":
+            self._memory.pop()
+        # Same anchor rollback as the API-error exit (see there).
+        self._bp_wire_anchor = self._bp_anchor_turn_start
+        marked_disk = False
+        try:
+            if self._conf_uid and self._history_uid:
+                marked_disk = mark_last_message_excluded(
+                    self._conf_uid, self._history_uid, "human", "thinking_only"
+                )
+        except Exception as e:
+            logger.warning(f"[thinking_only] disk tagging failed: {e}")
+        self._pending_context_excluded = "thinking_only"
+        if protocol:
+            self._last_thinking_seed = {
+                "model": getattr(self._llm, "model", "") or "",
+                "protocol": deepcopy(protocol),
+                "thinking_tokens": thinking_tokens,
+            }
+        logger.warning(
+            "[thinking_only] silent turn excluded from context "
+            f"(thinking_tokens={thinking_tokens}, disk_tagged={marked_disk})."
+        )
+        return (
+            f"\n⚠️ 思考だけで発話がないまま終わった（thinking {thinking_tokens} tok）。"
+            "この往復は文脈に残らない——返事は届かなかったので、"
             "もう一度送ってほしい。\n"
         )
 
@@ -5535,7 +5582,19 @@ class BasicMemoryAgent(AgentInterface):
         elif name == "memory_add":
             label = f"記憶追加: {_clip(args.get('fact'))}"
         elif name == "memory_update":
-            label = f"記憶更新: {_clip(args.get('new_fact'))}"
+            if args.get("new_fact"):
+                label = f"記憶更新: {_clip(args.get('new_fact'))}"
+            else:
+                # importance/store_id-only call: no new_fact to show, so say
+                # WHAT changed and fall back to the target's text (in the ok
+                # result) or the given id, keeping the audit line legible.
+                imp = str(args.get("importance") or "").strip()
+                if imp:
+                    kind = f"重要度→{imp}"
+                else:
+                    kind = "店舗ID" + ("設定" if args.get("store_id") else "解除")
+                body = result.get("fact") or args.get("fact_id")
+                label = f"記憶更新({kind}): {_clip(body)}"
         elif name == "memory_read_diary":
             label = f"日記閲覧: {_clip(result.get('date') or args.get('diary_uid'))}"
         elif name == "memory_write_diary":

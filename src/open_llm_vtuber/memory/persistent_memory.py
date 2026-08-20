@@ -1080,7 +1080,15 @@ class PersistentMemoryManager:
                     else "store_id を削除。"
                 )
             notes.append("常駐リストへの反映は次回起動から。")
-            return {"status": "ok", "id": new_id[:8], "note": " ".join(notes)}
+            # "fact" rides along for the chat audit marker: importance/store_id
+            # -only calls carry no new_fact, so the marker needs the target's
+            # text from here to stay legible.
+            return {
+                "status": "ok",
+                "id": new_id[:8],
+                "fact": f["fact"],
+                "note": " ".join(notes),
+            }
         return {
             "status": "error",
             "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
