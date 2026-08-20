@@ -38,7 +38,7 @@ from uber_client import (  # noqa: E402
 HERE = pathlib.Path(__file__).resolve().parent
 logger.remove()  # don't write to stdout — stdout is the MCP stdio channel!
 logger.add(sys.stderr, level="INFO")
-logger.add(str(HERE / "uber_mcp.log"), rotation="2 MB", retention=3, level="INFO")
+logger.add(str(HERE / "uber_mcp.log"), rotation="2 MB", level="INFO")
 
 _HEADLESS = os.environ.get("UBER_EATS_HEADLESS", "1") != "0"
 _TOOL_TIMEOUT = 25  # seconds — under the MCP client's 30s read timeout

@@ -55,7 +55,7 @@ def _setup_logging() -> None:
     reconfigure someone else's logging or drop a log file in the repo."""
     logger.remove()  # don't write to stdout — stdout is the MCP stdio channel!
     logger.add(sys.stderr, level="INFO")
-    logger.add(str(HERE / "ncm_mcp.log"), rotation="2 MB", retention=3, level="INFO")
+    logger.add(str(HERE / "ncm_mcp.log"), rotation="2 MB", level="INFO")
 
 
 # One budget for the WHOLE call, not per step. The MCP client gives a tool

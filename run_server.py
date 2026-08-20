@@ -72,11 +72,14 @@ def init_logger(console_log_level: str = "INFO") -> None:
         colorize=True,
     )
 
-    # File output
+    # File output. No retention: logs are permanent (あさひ 08-20 — the
+    # debug payloads double as the forensic/recovery source; xz compression
+    # and year/month foldering are planned separately). Note loguru's
+    # retention only ever fired on rotation or graceful stop, so the
+    # console sink's survival past 30 days was luck, not design.
     logger.add(
         "logs/debug_{time:YYYY-MM-DD}.log",
         rotation="10 MB",
-        retention="30 days",
         level="DEBUG",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message} | {extra}",
         backtrace=True,
@@ -90,7 +93,6 @@ def init_logger(console_log_level: str = "INFO") -> None:
     logger.add(
         "logs/console_{time:YYYY-MM-DD}.log",
         rotation="10 MB",
-        retention="30 days",
         level=console_log_level,
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} | {message}",
     )

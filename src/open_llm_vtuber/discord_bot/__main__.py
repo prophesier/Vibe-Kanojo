@@ -53,12 +53,12 @@ async def _main() -> int:
     from ..pidfile import write_pid
 
     # File logging so remote /logs slash command has something to tail.
+    # No retention: logs are permanent (あさひ 08-20).
     log_dir = project_root / "logs"
     log_dir.mkdir(exist_ok=True)
     logger.add(
         str(log_dir / "discord_{time:YYYY-MM-DD}.log"),
         rotation="10 MB",
-        retention="30 days",
         level="DEBUG",
         format=(
             "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | "
@@ -73,7 +73,6 @@ async def _main() -> int:
     logger.add(
         str(log_dir / "discord_console_{time:YYYY-MM-DD}.log"),
         rotation="10 MB",
-        retention="30 days",
         level="INFO",
         format=(
             "{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | "
