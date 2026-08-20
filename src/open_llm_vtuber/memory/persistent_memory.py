@@ -79,6 +79,12 @@ _TIMESTAMP_RE = re.compile(
     r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE
 )
 
+# A session uid: "YYYY-MM-DD_HH-MM-SS_<hex>". Diary files and session files
+# are named by it; directory scans filter on this so a stray file dropped
+# into diaries/ or chat_history/ never gets injected or embedded
+# (あさひ 08-20).
+_SESSION_UID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[0-9a-f]+$")
+
 
 _FACT_EXTRACT_SYSTEM = (
     "あなたはメモリ抽出ツールです。これは会話ではありません。"
@@ -1495,7 +1501,7 @@ class PersistentMemoryManager:
         if not os.path.isdir(self._diaries_dir):
             return items
         for fname in os.listdir(self._diaries_dir):
-            if not fname.endswith(".json"):
+            if not fname.endswith(".json") or not _SESSION_UID_RE.match(fname[:-5]):
                 continue
             uid = fname[:-5]
             entry = self._read_diary(uid)
@@ -1997,7 +2003,7 @@ class PersistentMemoryManager:
         try:
             entries = []
             for fname in os.listdir(self._diaries_dir):
-                if not fname.endswith(".json"):
+                if not fname.endswith(".json") or not _SESSION_UID_RE.match(fname[:-5]):
                     continue
                 history_uid = fname[:-5]
                 # Skip diaries for sessions already in the agent's sliding
@@ -2057,8 +2063,8 @@ class PersistentMemoryManager:
             added = 0
             if os.path.isdir(self._base_dir):
                 for fname in os.listdir(self._base_dir):
-                    if not fname.endswith(".json") or not re.match(
-                        r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[0-9a-f]+\.json$", fname
+                    if not fname.endswith(".json") or not _SESSION_UID_RE.match(
+                        fname[:-5]
                     ):
                         continue
                     uid = fname[:-5]

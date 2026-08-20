@@ -5676,7 +5676,15 @@ class BasicMemoryAgent(AgentInterface):
         result is replay-EXEMPT (small, and truncating a date table would
         just invite re-queries)."""
         date = str(args.get("date", "")).strip()
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date):
+        # Shape AND calendar validity: the regex keeps zero-padded form
+        # (string comparisons downstream), strptime rejects 2026-13-40.
+        valid = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", date))
+        if valid:
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                valid = False
+        if not valid:
             return {
                 "status": "error",
                 "message": f"date は YYYY-MM-DD 形式で指定すること: {date!r}",
@@ -5685,7 +5693,11 @@ class BasicMemoryAgent(AgentInterface):
         rows = mgr.sessions_for_date(date) if mgr else []
         out: Dict[str, Any] = {"status": "ok", "date": date, "sessions": rows}
         if not rows:
-            out["note"] = "この日のセッション記録はない。"
+            out["note"] = (
+                "それは未来の日付——記録はまだ存在しない。"
+                if date > datetime.now().strftime("%Y-%m-%d")
+                else "この日のセッション記録はない。"
+            )
         return out
 
     def _memory_read_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
