@@ -1541,12 +1541,48 @@ class PersistentMemoryManager:
             key = ""
         return key, base
 
+    @staticmethod
+    def _earliest_timestamp(messages: List[Dict[str, Any]]) -> str:
+        """Earliest ``timestamp`` among history records ('' when none carry
+        one). ISO `YYYY-MM-DD HH:MM:SS` strings, so min() = chronological."""
+        stamps = [
+            str(m.get("timestamp", "") or "").strip()
+            for m in messages
+            if isinstance(m, dict)
+        ]
+        stamps = [s for s in stamps if s]
+        return min(stamps) if stamps else ""
+
+    @staticmethod
+    def _facts_for_extraction_list(
+        facts: List[Dict[str, Any]], window_start: str
+    ) -> List[Dict[str, Any]]:
+        """Existing-facts listing for the extraction prompt (あさひ 08-21).
+
+        user/high always; ``low`` only when its ``updated`` falls inside the
+        extraction input's own time window — a low fact older than every
+        message/diary being analysed can't be re-derived from them, so
+        listing it buys no dedup and only bloats the prompt (low was 73% of
+        the listing's characters when this shipped). Empty ``window_start``
+        keeps the historical pass-everything behaviour. The saved pool is
+        NOT affected — this trims the prompt listing only.
+        """
+        if not window_start:
+            return list(facts)
+        return [
+            f
+            for f in facts
+            if (f.get("importance") or "low") != "low"
+            or str(f.get("updated", "")) >= window_start
+        ]
+
     async def extract_facts_async(
         self,
         recent_messages: List[Dict[str, Any]],
         llm: Any,
         diary_context: str = "",
         persona: str = "",
+        window_start: str = "",
     ) -> None:
         """Extract new facts from recent messages and append to facts.json.
 
@@ -1555,18 +1591,28 @@ class PersistentMemoryManager:
         has context beyond the sliding window without burning tokens on full
         message history. ``persona`` is the character's system prompt; when
         provided it is prepended so fact selection and pruning reflect what
-        the character would consider memorable.
+        the character would consider memorable. ``window_start`` bounds the
+        low-tier part of the existing-facts listing (see
+        _facts_for_extraction_list); callers pass the earliest date of the
+        input they're feeding in.
         """
         try:
             existing = self._load_facts()
+            shown = self._facts_for_extraction_list(existing, window_start)
+            if len(shown) < len(existing):
+                logger.info(
+                    f"[memory] Existing-facts list trimmed for extraction: "
+                    f"{len(shown)}/{len(existing)} shown (low updated before "
+                    f"{window_start} omitted)"
+                )
             # Show each existing fact's current importance so the LLM tags new
             # facts consistently with the established tiering (it must still
             # never output "user" — see _FACT_EXTRACT_SYSTEM).
             existing_text = (
                 "\n".join(
-                    f"- [{f.get('importance', 'low')}] {f['fact']}" for f in existing
+                    f"- [{f.get('importance', 'low')}] {f['fact']}" for f in shown
                 )
-                if existing
+                if shown
                 else "(まだありません)"
             )
             conv_text = self._format_messages(recent_messages)
@@ -1774,7 +1820,12 @@ class PersistentMemoryManager:
             self.create_diary_async(
                 history_messages, history_uid, llm, persona=persona
             ),
-            self.extract_facts_async(history_messages, llm, persona=persona),
+            self.extract_facts_async(
+                history_messages,
+                llm,
+                persona=persona,
+                window_start=self._earliest_timestamp(history_messages),
+            ),
             return_exceptions=True,
         )
         # Mark diary so backfill knows this session's facts were already extracted.
@@ -1870,6 +1921,7 @@ class PersistentMemoryManager:
                         recent_messages.extend(msgs)
 
                 older_parts: List[str] = []
+                older_dates: List[str] = []
                 for uid in unprocessed_uids:
                     if uid in recent_uids:
                         continue
@@ -1881,9 +1933,19 @@ class PersistentMemoryManager:
                             older_parts.append(
                                 f"[{d.get('date', uid)}]\n{d['content']}"
                             )
+                            if d.get("date"):
+                                older_dates.append(str(d["date"]))
                     except Exception:
                         continue
                 diary_context = "\n\n".join(older_parts)
+                # Earliest date across everything the prompt will contain —
+                # bounds the low-tier existing-facts listing.
+                window_candidates = [
+                    c
+                    for c in [self._earliest_timestamp(recent_messages)] + older_dates
+                    if c
+                ]
+                window_start = min(window_candidates) if window_candidates else ""
 
                 if recent_messages or diary_context:
                     logger.info(
@@ -1896,6 +1958,7 @@ class PersistentMemoryManager:
                         llm,
                         diary_context=diary_context,
                         persona=persona,
+                        window_start=window_start,
                     )
                     # Mark all processed diaries so this doesn't repeat next startup.
                     for uid in unprocessed_uids:
