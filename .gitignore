@@ -98,6 +98,12 @@ conf.yaml.backup
 experiments/_*
 experiments/*/_*
 
+# local memory viewer (deliberately untracked but NOT throwaway — see the
+# 記憶ビューア section in PROJECT.md; do not clean up)
+experiments/memory_viewer/
+# Claude Code local session config (launch.json)
+.claude/
+
 *.exe
 
 tmp/
