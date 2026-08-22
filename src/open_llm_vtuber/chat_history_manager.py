@@ -559,13 +559,11 @@ def strip_tool_markers(text: str) -> str:
 # results (あさひ C1, 2026-07-25).
 # ---------------------------------------------------------------------------
 
-_SEARCH_BUDGET_CHARS = 2800
+_SEARCH_BUDGET_CHARS = 4000  # 08-23: raised from 2800 with full-text rendering
 _SEARCH_MAX_BLOCKS = 8
 _SEARCH_MAX_KEYWORDS = 8
 _SEARCH_MIN_COVERAGE = 0.5  # candidacy bar: ≥ half of a keyword's fragments
 _SEARCH_BLOCK_MAX_MSGS = 7  # merged-block span cap (common-word searches)
-_HIT_WINDOW = 160  # chars shown for the matched message, centered on the hit
-_NEIGHBOR_WINDOW = 120  # chars shown for ±1 neighbor messages
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -611,40 +609,13 @@ def _search_coverage(
     return len(kw_fragments & msg_fragments) / len(kw_fragments)
 
 
-def _search_snippet(
-    content: str, keywords_norm: List[str], width: int, is_hit: bool
-) -> str:
-    """One-line excerpt of a message. Hit messages get a window centered on the
-    first keyword (or keyword-fragment) occurrence; neighbors get the head."""
-    text = content or ""
-    pos = 0
-    if is_hit:
-        # Position search on .lower() (length-preserving in practice, unlike
-        # NFKC) so the window indexes the original text. Best-effort: a
-        # full-width-only match falls back to the message head.
-        low = text.lower()
-        found = -1
-        for kw in keywords_norm:
-            compact = "".join(kw.split())
-            if compact:
-                found = low.find(compact)
-                if found >= 0:
-                    break
-        if found < 0:
-            for kw in keywords_norm:
-                compact = "".join(kw.split())
-                for i in range(len(compact) - 1):
-                    found = low.find(compact[i : i + 2])
-                    if found >= 0:
-                        break
-                if found >= 0:
-                    break
-        if found >= 0:
-            pos = max(0, found - width // 2)
-    start, end = pos, pos + width
-    prefix = "…" if start > 0 else ""
-    suffix = "…" if end < len(text) else ""
-    return prefix + " ".join(text[start:end].split()) + suffix
+def _search_line(content: str) -> str:
+    """One-line rendering of a full message: newlines/whitespace collapse to
+    single spaces, NO length cap. In-message truncation retired (あさひ
+    08-23, perceivable-truncation rule): the old 160/120-char windows cut
+    silently mid-message; now hits and neighbors alike show full text, and
+    the only truncation left is whole-block drops, marked in the output."""
+    return " ".join((content or "").split())
 
 
 def search_history(
@@ -658,11 +629,13 @@ def search_history(
     Returns ``{"status", "total_hits", "shown_hits", "text"}`` where ``text``
     is the ready-to-read report: header (全N件中 K件表示 + narrowing hint),
     then blocks newest-first. A block is a matched message ±1 neighbor
-    (overlapping/adjacent blocks in the same session are merged), each message
-    clipped to a short excerpt, hit lines prefixed with ►. Budgets: max
+    (overlapping/adjacent blocks in the same session are merged), every
+    message rendered in FULL (one line, no in-message clipping — perceivable
+    truncation, あさひ 08-23), hit lines prefixed with ►. Budgets: max
     ``_SEARCH_MAX_BLOCKS`` blocks / ~``_SEARCH_BUDGET_CHARS`` chars — blocks
     are SELECTED by coverage score (then recency) but DISPLAYED newest-first,
-    with whole oldest blocks dropped when over budget.
+    with whole oldest blocks dropped when over budget; a drop is announced
+    with an explicit cut-off marker at the point of truncation.
     """
     keywords = split_search_keywords(keywords)
     if not keywords:
@@ -768,10 +741,7 @@ def search_history(
                     "ユーザー" if m.get("role") == "human" else "AI"
                 )
                 is_hit = i in hit_idxs
-                width = _HIT_WINDOW if is_hit else _NEIGHBOR_WINDOW
-                snippet = _search_snippet(
-                    str(m.get("content", "")), kw_norm, width, is_hit
-                )
+                snippet = _search_line(str(m.get("content", "")))
                 lines.append(f"{'► ' if is_hit else ''}{name}: {snippet}")
             rendered.append((ts, "\n".join(lines), len(hit_idxs)))
     rendered.sort(key=lambda b: b[0], reverse=True)
@@ -785,6 +755,15 @@ def search_history(
         shown_blocks.append(text)
         shown_hits += n_hit
         used += len(text)
+    # Perceivable truncation (あさひ 08-23): a silent whole-block drop reads
+    # as "that's everything" — announce the cut at the exact point it happens.
+    dropped_blocks = len(rendered) - len(shown_blocks)
+    if dropped_blocks:
+        dropped_hits = sum(n_hit for _ts, _text, n_hit in rendered[len(shown_blocks) :])
+        shown_blocks.append(
+            f"〔文字数上限に達したため、ここで打ち切り"
+            f"（未表示: {dropped_blocks}ブロック・ヒット{dropped_hits}件）〕"
+        )
 
     header = f"全{total_hits}件ヒット中 {shown_hits}件を表示（新しい順）。"
     if shown_hits < total_hits:
