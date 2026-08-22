@@ -76,7 +76,9 @@ class OLVBridge:
         *,
         reconnect_initial_delay: float = 2.0,
         reconnect_max_delay: float = 30.0,
-        turn_timeout: float = 120.0,
+        # 180s (あさひ 08-23, was 120): long memory-tool chains — fact edits,
+        # diary writes — regularly outlived 120s and dropped finished replies.
+        turn_timeout: float = 180.0,
     ) -> None:
         self._server_url = server_url
         self._reconnect_initial_delay = reconnect_initial_delay

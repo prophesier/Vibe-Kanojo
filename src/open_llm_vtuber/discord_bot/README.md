@@ -175,7 +175,7 @@ Type something in an allowed channel and the bot will reply.
   are in your whitelist (or the whitelist is empty).
 - **"bridge not connected"** in replies — OLV isn't running, isn't
   listening on the configured host/port, or `olv_ws_url` is wrong.
-- **"timed out waiting for reply"** — the LLM took longer than 120s; the
+- **"timed out waiting for reply"** — the LLM took longer than 180s; the
   default timeout is in `OLVBridge(..., turn_timeout=...)`.
 - **Reply text looks duplicated or empty** — the bridge reads
   `display_text` from OLV's `audio` frames. If the active TTS config
