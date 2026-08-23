@@ -1518,11 +1518,21 @@ class PersistentMemoryManager:
         return key, base
 
     @staticmethod
-    def _earliest_timestamp(messages: List[Dict[str, Any]]) -> str:
+    def _norm_ts(ts: Any) -> str:
+        """Comparable ``YYYY-MM-DD HH:MM:SS`` form. History records stamp
+        ISO-T (isoformat) while facts' ``updated`` uses a space; comparing
+        the two lexicographically breaks on same-day values (' ' < 'T') —
+        which silently emptied the ENTIRE low listing on 08-23 (77/354
+        shown = zero low facts, duplicate re-extraction observed live).
+        Every timestamp entering a window comparison goes through here."""
+        return str(ts or "").strip().replace("T", " ")
+
+    @classmethod
+    def _earliest_timestamp(cls, messages: List[Dict[str, Any]]) -> str:
         """Earliest ``timestamp`` among history records ('' when none carry
-        one). ISO `YYYY-MM-DD HH:MM:SS` strings, so min() = chronological."""
+        one), normalized via _norm_ts so min() = chronological."""
         stamps = [
-            str(m.get("timestamp", "") or "").strip()
+            cls._norm_ts(m.get("timestamp", ""))
             for m in messages
             if isinstance(m, dict)
         ]
@@ -1545,11 +1555,12 @@ class PersistentMemoryManager:
         """
         if not window_start:
             return list(facts)
+        window_start = PersistentMemoryManager._norm_ts(window_start)
         return [
             f
             for f in facts
             if (f.get("importance") or "low") != "low"
-            or str(f.get("updated", "")) >= window_start
+            or PersistentMemoryManager._norm_ts(f.get("updated", "")) >= window_start
         ]
 
     async def extract_facts_async(
@@ -1910,7 +1921,7 @@ class PersistentMemoryManager:
                                 f"[{d.get('date', uid)}]\n{d['content']}"
                             )
                             if d.get("date"):
-                                older_dates.append(str(d["date"]))
+                                older_dates.append(self._norm_ts(d["date"]))
                     except Exception:
                         continue
                 diary_context = "\n\n".join(older_parts)
