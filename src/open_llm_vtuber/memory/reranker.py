@@ -66,20 +66,21 @@ _RERANK_SYSTEM = (
 )
 
 
-# Sentence-mode variant (diary RAG only; facts keep the whole-entry judge).
-# Same 07-24 strictness core, but the judge now picks SENTENCES inside each
-# relevant diary: ordering exists only at diary granularity (あさひ 08-13 —
-# intra-diary sentence order is chronology/semantics and must not be ranked),
-# sentences already in context are marked 注入済み and must not be re-picked,
+# Paragraph-mode variant (diary RAG only; facts keep the whole-entry judge).
+# Same 07-24 strictness core. 08-13 introduced in-diary picking at sentence
+# granularity; 08-23 re-grained it to PARAGRAPHS (あさひ: diaries are written
+# in tidy scene-sized paragraphs now, and sentence excerpts kept losing
+# subject/setting). Ordering still exists only at diary granularity,
+# paragraphs already in context are marked 注入済み and must not be re-picked,
 # and picking nothing from a masked diary is an explicitly normal outcome.
 _RERANK_SENTENCE_SYSTEM = (
     "あなたは記憶検索の関連性判定ツールです。これは会話ではありません。"
     "ロールプレイやキャラクターとしての応答はせず、判定結果のみを出力してください。\n\n"
     "AIキャラクターへのユーザーの「最後のユーザー発言」と、自動検索された"
-    "「日記の候補」のリストが与えられます。各候補の本文は s1, s2, … と"
-    "文番号付きで示されます。あなたの仕事は、キャラクターがその発言に返答する"
-    "にあたって、**その文の具体的な中身を参照しなければ返答の質が落ちる・"
-    "事実を誤る**——という厳格な基準で、関連する日記と、その中の必要な文だけを"
+    "「日記の候補」のリストが与えられます。各候補の本文は p1, p2, … と"
+    "段落番号付きで示されます。あなたの仕事は、キャラクターがその発言に返答する"
+    "にあたって、**その段落の具体的な中身を参照しなければ返答の質が落ちる・"
+    "事実を誤る**——という厳格な基準で、関連する日記と、その中の必要な段落だけを"
     "選ぶことです。\n\n"
     "大原則:\n"
     "- **判定対象は「最後のユーザー発言」ただ一つ**。添付される「最近の会話」は、"
@@ -87,25 +88,24 @@ _RERANK_SENTENCE_SYSTEM = (
     "**関連性の根拠として使ってはならない**。\n"
     "- **前の会話の話題と一致するだけの候補は選ばない**。最後の発言自身がその話題を"
     "持ち出していない限り、それは過ぎた話題である。\n"
-    "- 関連 = 最後の発言に返答するとき、その文の中身を参照しないと"
+    "- 関連 = 最後の発言に返答するとき、その段落の中身を参照しないと"
     "**返答が不正確になる・嘘をつく・的外れになる**もの。"
     "「あれば会話が少し豊かになる」程度は関連ではない。\n"
     "- **空配列が通常の結果である**。挨拶・相槌・スキンシップ・短い感情表現・"
     "その場限りの雑談には、原則として何も要らない。\n"
     "- 迷うときは**落とす**。\n\n"
-    "文の選び方:\n"
-    "- 日記単位では**関連度の高い順**に並べる。文単位の順序付けはしない"
-    "（文は日記内の番号で指定するだけでよい。提示順は原文順で復元される）。\n"
-    "- 関連する日記からは、核心の文に加えて、**その文が誤解なく読める分の"
-    "前後文も一緒に**選ぶ。1文だけの抜粋は場面・主語・経緯を失いやすい——"
-    "場面が伝わる最小のまとまり（目安2〜4文）で切り出すこと。\n"
-    "- 「注入済み」と表示された文は**既にキャラクターの文脈内にある**。"
+    "段落の選び方:\n"
+    "- 日記単位では**関連度の高い順**に並べる。段落単位の順序付けはしない"
+    "（段落は日記内の番号で指定するだけでよい。提示順は原文順で復元される）。\n"
+    "- 段落は場面のまとまりとして書かれている。核心の段落だけで意味が通るなら"
+    "1段落でよい。前後がないと誤解される場合のみ、隣接する段落を足す。\n"
+    "- 「注入済み」と表示された段落は**既にキャラクターの文脈内にある**。"
     "再選択してはならない。注入済みの部分だけで返答に足りるなら、"
     "その日記からは何も選ばない（それも正常な結果である）。\n"
     "- 関連する日記が複数あれば複数選んでよい。選択の合計はおおむね"
-    "{budget}文を目安にする（厳密な上限ではない）。\n\n"
+    "{budget}段落を目安にする（厳密な上限ではない）。\n\n"
     "出力は関連する日記だけを関連度の高い順に並べ、各要素に候補番号・"
-    "選んだ文番号の配列・短い理由を一言添える。"
+    "選んだ段落番号の配列・短い理由を一言添える。"
     "関連するものが無ければ空配列を返す（それが通常の結果である）。"
 )
 
@@ -145,7 +145,8 @@ def _schema(item: str) -> Dict[str, Any]:
 
 
 def _sentence_schema() -> Dict[str, Any]:
-    """Sentence-mode schema: ordered diaries, each with picked sentence numbers."""
+    """Paragraph-mode schema: ordered diaries, each with picked paragraph
+    numbers (field/function names keep the sentence-era spelling)."""
     return {
         "name": "diary_sentence_relevance",
         "strict": True,
@@ -168,7 +169,7 @@ def _sentence_schema() -> Dict[str, Any]:
                                 "type": "array",
                                 "items": {"type": "integer"},
                                 "description": (
-                                    "1-based sentence numbers (the sN labels) "
+                                    "1-based paragraph numbers (the pN labels) "
                                     "picked from this diary"
                                 ),
                             },
@@ -204,6 +205,13 @@ class MemoryReranker:
         self._model = model
         self._item = item_label
         self._timeout = timeout
+        # gpt-4o-era judges run temperature=0 for determinism; gpt-5.x
+        # reasoning models 400-reject an explicit temperature. Omit the param
+        # for anything that isn't a known temperature-taking family (their
+        # defaults are deterministic enough for a structured judge).
+        self._temperature_kwargs: Dict[str, Any] = (
+            {"temperature": 0} if model.lower().startswith("gpt-4") else {}
+        )
 
     async def rerank(
         self,
@@ -249,8 +257,8 @@ class MemoryReranker:
                     "type": "json_schema",
                     "json_schema": _schema(self._item),
                 },
-                temperature=0,
                 timeout=self._timeout,
+                **self._temperature_kwargs,
             )
             data = json.loads(resp.choices[0].message.content or "{}")
         except Exception as e:
@@ -278,13 +286,14 @@ class MemoryReranker:
         query: str,
         candidates: List[Dict[str, Any]],
         context: str = "",
-        budget: int = 8,
+        budget: int = 4,
     ) -> Optional[List[Dict[str, Any]]]:
-        """Sentence-mode judge for diary RAG (あさひ 08-13 redesign).
+        """Paragraph-mode judge for diary RAG (08-13 sentence redesign,
+        re-grained to paragraphs 08-23 — names keep the sentence spelling).
 
         ``candidates`` is ``[{"id", "date", "sents": [str, ...],
-        "injected": [int, ...]}, ...]`` — pre-split sentences (1-based sN
-        numbering matches the diary chunk index) plus the sentence numbers
+        "injected": [int, ...]}, ...]`` — pre-split paragraphs (1-based pN
+        numbering matches the diary chunk index) plus the paragraph numbers
         already injected into context this session (the 既出 mask). Returns
         ``[{"id", "date", "sents", "sentences": [int, ...], "reason"}, ...]``
         in descending diary relevance, with ``sentences`` validated, deduped
@@ -303,7 +312,7 @@ class MemoryReranker:
             if mask:
                 head += f"（注入済み: {_compact_sent_ranges(mask)}）"
             body = "\n".join(
-                f"s{j + 1}: {s}" + ("　←注入済み" if (j + 1) in mask else "")
+                f"p{j + 1}: {s}" + ("　←注入済み" if (j + 1) in mask else "")
                 for j, s in enumerate(c.get("sents") or [])
             )
             blocks.append(f"{head}\n{body}")
@@ -330,8 +339,8 @@ class MemoryReranker:
                     "type": "json_schema",
                     "json_schema": _sentence_schema(),
                 },
-                temperature=0,
                 timeout=self._timeout,
+                **self._temperature_kwargs,
             )
             data = json.loads(resp.choices[0].message.content or "{}")
             relevant = data.get("relevant")
@@ -372,7 +381,7 @@ class MemoryReranker:
 
 
 def _compact_sent_ranges(nums: List[int]) -> str:
-    """``[1,2,3,5]`` → ``"s1-3, s5"`` — compact 既出 mask for prompts/labels."""
+    """``[1,2,3,5]`` → ``"p1-3, p5"`` — compact 既出 mask for prompts/labels."""
     if not nums:
         return ""
     parts: List[str] = []
@@ -381,7 +390,7 @@ def _compact_sent_ranges(nums: List[int]) -> str:
         if n == prev + 1:
             prev = n
             continue
-        parts.append(f"s{start}" if start == prev else f"s{start}-{prev}")
+        parts.append(f"p{start}" if start == prev else f"p{start}-{prev}")
         start = prev = n
-    parts.append(f"s{start}" if start == prev else f"s{start}-{prev}")
+    parts.append(f"p{start}" if start == prev else f"p{start}-{prev}")
     return ", ".join(parts)

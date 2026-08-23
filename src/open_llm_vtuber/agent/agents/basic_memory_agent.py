@@ -1131,10 +1131,10 @@ class BasicMemoryAgent(AgentInterface):
         "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
         "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
-        "日記の囲みは**文単位の抜粋**である："
-        "`〔日記 日付 抜粋・全N句（id: …）〕` の見出しの下に、"
-        "`s番号:` 付きで関連文だけが並ぶ（番号はその日記内の文位置。"
-        "以前のターンに出た文は重複して表示されない）。"
+        "日記の囲みは**段落単位の抜粋**である："
+        "`〔日記 日付 抜粋・全N段（id: …）〕` の見出しの下に、"
+        "`p番号:` 付きで関連段落だけが並ぶ（番号はその日記内の段落位置。"
+        "以前のターンに出た段落は重複して表示されない）。"
         "id を memory_read_diary に渡せば、いつでも全文が読める。\n"
         "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
         "[Strict rules on executing tools]\n\n"
@@ -1245,15 +1245,15 @@ class BasicMemoryAgent(AgentInterface):
         "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
         "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
         "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
-        "日記の囲みは**文単位の抜粋**である："
-        "`〔日記 日付 抜粋・全N句（id: …）〕` の見出しの下に、"
-        "`s番号:` 付きで関連文だけが並ぶ（番号はその日記内の文位置。"
-        "以前のターンに出た文は重複して表示されない）。"
+        "日記の囲みは**段落単位の抜粋**である："
+        "`〔日記 日付 抜粋・全N段（id: …）〕` の見出しの下に、"
+        "`p番号:` 付きで関連段落だけが並ぶ（番号はその日記内の段落位置。"
+        "以前のターンに出た段落は重複して表示されない）。"
         "id を memory_read_diary に渡せば、いつでも全文が読める。\n"
         "日記の日付や id の横にモデル名（opus4.6 / opus5 など）が付くことが"
         "ある——その記録を実際に体験した当時の会話モデルを示す。"
         "「本人執筆」付きの日記は当時の自分が書いたもので、"
-        "無印の日記は記録係（gpt5.1）の代筆。"
+        "無印の日記は記録係（メモリ用の別モデル）の代筆。"
         "ある日にどのモデルが動いていたかは model_history で引ける。\n"
         "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
         "[Thinking]\n\n"
@@ -2245,7 +2245,7 @@ class BasicMemoryAgent(AgentInterface):
             # relevance order; within a diary the picks are already ascending
             # (original order). The budget is a soft stop, not a knife: after
             # a whole diary lands, count >= budget stops FURTHER diaries.
-            budget = int(getattr(mgr.diary_rag_config, "sentence_budget", 8) or 8)
+            budget = int(getattr(mgr.diary_rag_config, "sentence_budget", 4) or 4)
             packed: List[Dict[str, Any]] = []
             count = 0
             for h in hits:
@@ -2287,7 +2287,7 @@ class BasicMemoryAgent(AgentInterface):
             over = f"（予算{budget}超過）" if count > budget else ""
             logger.info(
                 f"[diary_rag] 候補{len(candidates)} → {len(packed)}篇 "
-                f"予算{budget} 実装{count}句{over} | "
+                f"予算{budget} 実装{count}段{over} | "
                 f"台帳 {len(self._diary_sent_ledger)}篇"
             )
         except Exception as e:
@@ -2326,9 +2326,9 @@ class BasicMemoryAgent(AgentInterface):
             # unmapped sessions — the header simply stays id-only.
             tag = mgr.diary_display_tag(p["uid"]) if mgr else ""
             id_part = self._short_diary_id(p["uid"]) + (f" {tag}" if tag else "")
-            lines.append(f"〔日記 {date} 抜粋・全{total}句（id: {id_part}）〕")
+            lines.append(f"〔日記 {date} 抜粋・全{total}段（id: {id_part}）〕")
             for n in p["delta"]:
-                lines.append(f"s{n}: {p['sents'][n - 1]}")
+                lines.append(f"p{n}: {p['sents'][n - 1]}")
         lines.append("［過去の記憶終了］")
         return "\n".join(lines)
 
@@ -4604,7 +4604,7 @@ class BasicMemoryAgent(AgentInterface):
                     "name": "memory_read_diary",
                     "description": (
                         "Read one diary entry in full. memory_search hits and "
-                        "the auto-recalled ［過去の記憶］ blocks are sentence "
+                        "the auto-recalled ［過去の記憶］ blocks are paragraph "
                         "excerpts, so use this when you need the surrounding "
                         "context."
                     ),

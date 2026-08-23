@@ -85,11 +85,11 @@ system_config:
       # Recent conversation turns handed to the judge as context, so it weighs
       # candidates against what's actually being discussed, not just the last line.
       rerank_context_turns: 6
-      # Sentence-excerpt injection (the judge picks sentences, not whole diaries):
-      # per-turn budget of injected sentences. Packing is diary-atomic — a
-      # diary's picked sentences go in whole, so the last one may slightly
-      # exceed the budget.
-      sentence_budget: 8
+      # Paragraph-excerpt injection (the judge picks paragraphs, not whole
+      # diaries; key name kept from the sentence era): per-turn budget of
+      # injected paragraphs. Packing is diary-atomic — a diary's picked
+      # paragraphs go in whole, so the last one may slightly exceed the budget.
+      sentence_budget: 4
       # Max memory_read_diary full-text reads per turn (each read is
       # replay-exempt and stays in context permanently).
       full_reads_per_turn: 5

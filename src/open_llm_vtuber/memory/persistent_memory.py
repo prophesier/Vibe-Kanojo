@@ -19,59 +19,21 @@ from loguru import logger
 
 from .vector_index import VectorIndex, extract_keywords
 
-# Lazily-built Japanese sentence segmenter (pysbd) for diary chunking. Built on
-# first use so importing this module stays cheap when RAG is disabled.
-_JA_SEGMENTER = None
 
+def _split_paragraphs(text: str) -> List[str]:
+    """Split diary content into paragraph chunks on blank lines.
 
-_BRACKET_PAIRS = {"（": "）", "(": ")", "「": "」", "『": "』"}
-
-
-def _open_bracket_balance(text: str) -> int:
-    """Total unclosed opening brackets across all tracked pairs."""
-    total = 0
-    for o, c in _BRACKET_PAIRS.items():
-        total += max(0, text.count(o) - text.count(c))
-    return total
-
-
-def _merge_unbalanced_brackets(sents: List[str]) -> List[str]:
-    """Re-join segments pysbd split inside a bracketed span.
-
-    pysbd handles fullwidth （…）asides fine, but a period inside HALFWIDTH
-    parens shatters the span ("(note: x.) y" → "(note: x." / ") y" — the
-    bracket loses its closing half, あさひ's remembered landmine). A segment
-    left with unclosed brackets swallows following segments until balanced.
-    Capped at 4 merges so an unclosed-bracket typo can't glue a whole diary
-    into one "sentence"."""
-    out: List[str] = []
-    merged = 0
-    for s in sents:
-        if out and _open_bracket_balance(out[-1]) > 0 and merged < 4:
-            out[-1] += s
-            merged += 1
-        else:
-            out.append(s)
-            merged = 0
-    return out
-
-
-def _split_sentences(text: str) -> List[str]:
-    """Split text into sentences for chunk-level embedding (Japanese-aware)."""
+    Paragraph redesign (あさひ 08-23, was pysbd sentence splitting): diaries
+    are written in tidy natural paragraphs now, and a paragraph is the scene-
+    sized unit a recall actually needs — sentence excerpts kept losing
+    subject/setting. A legacy diary with no blank-line breaks comes back as
+    ONE whole-text chunk (short early diaries inject whole, by design).
+    Single newlines inside a paragraph are preserved verbatim.
+    """
     text = (text or "").strip()
     if not text:
         return []
-    global _JA_SEGMENTER
-    try:
-        if _JA_SEGMENTER is None:
-            import pysbd
-
-            _JA_SEGMENTER = pysbd.Segmenter(language="ja", clean=False)
-        sents = _JA_SEGMENTER.segment(text)
-    except Exception:
-        sents = [text]
-    sents = _merge_unbalanced_brackets([s for s in sents if s])
-    return [s.strip() for s in sents if s and s.strip()]
+    return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
 
 
 # Matches timestamp tags injected by _to_text_prompt: "[YYYY-MM-DD HH:MM:SS Weekday]"
@@ -544,7 +506,7 @@ class PersistentMemoryManager:
             "各エントリ冒頭の日付がそのセッションの実時間。"
             "日付の横のモデル名は、その記録を実際に体験した当時の会話モデル。"
             "「本人執筆」付きは当時の自分が書いた日記で、"
-            "無印の日記は記録係（gpt5.1）が代筆したもの。\n"
+            "無印の日記は記録係（メモリ用の別モデル）が代筆したもの。\n"
             "※ 日記中の「未解決」「これから」「明日」など、当時の予定や保留事項を"
             "表す記述は、その日記が書かれた時点の状態を反映している。"
             "その後すでに解決・完了している可能性があるため、現状を断定せず、"
@@ -1256,8 +1218,10 @@ class PersistentMemoryManager:
     def read_diary_full(self, diary_uid: str) -> Optional[Dict[str, Any]]:
         """Full diary entry ``{date, content, model?, written_by?}`` by uid
         (memory_read_diary), or None when missing. ``model`` is the session's
-        experiencer (short form); ``written_by: 本人`` marks a self-written
-        diary — absent = penned by the memory model (gpt5.1)."""
+        experiencer (short form); ``written_by``: 本人 for self-written
+        diaries, the pen model's short name for annotated auto diaries
+        (post-08-20), absent for legacy unmarked ones (= the era's memory
+        model, gpt5.1, per the prompt-side note)."""
         uid = (diary_uid or "").strip()
         entry = self._read_diary(uid)
         if not entry:
@@ -1266,8 +1230,14 @@ class PersistentMemoryManager:
         label = self.model_label_for_session(uid)
         if label:
             out["model"] = label
-        if entry.get("writer") == "self":
+        w = str(entry.get("writer", "") or "")
+        if w == "self":
             out["written_by"] = "本人"
+        elif w:
+            # Annotated pen model (post-08-20 auto diaries) — short form,
+            # e.g. "gpt5.6-luna" (あさひ 08-23: without this, a luna-penned
+            # diary reads identically to a legacy unmarked gpt5.1 one).
+            out["written_by"] = model_short_name(w)
         return out
 
     def write_session_diary(self, history_uid: str, content: str) -> Dict[str, Any]:
@@ -1336,13 +1306,15 @@ class PersistentMemoryManager:
         return None, matches
 
     def diary_sentences(self, diary_uid: str) -> List[str]:
-        """A diary's sentences in order (same splitter as the chunk index, so
-        1-based sentence numbers = chunk ``#i`` + 1 and stay stable across
-        turns — diaries are immutable). ``[]`` when the diary is missing."""
+        """A diary's PARAGRAPHS in order (same splitter as the chunk index, so
+        1-based paragraph numbers = chunk ``#i`` + 1 and stay stable across
+        turns — diaries are immutable). Name kept from the sentence era
+        (08-23 paragraph redesign): every consumer treats the unit opaquely.
+        ``[]`` when the diary is missing."""
         entry = self._read_diary((diary_uid or "").strip())
         if not entry or not entry.get("content"):
             return []
-        return _split_sentences(entry["content"])
+        return _split_paragraphs(entry["content"])
 
     async def retrieve_diary_context(
         self,
@@ -1356,10 +1328,11 @@ class PersistentMemoryManager:
         Pipeline: denoise the query to content keywords (drop framing words) →
         hybrid candidate generation (keywords drive embedding + lexical, grouped
         back to whole diaries — retrieval granularity is unchanged) → LLM judge
-        picks SENTENCES inside each relevant diary (08-13 sentence redesign).
+        picks PARAGRAPHS inside each relevant diary (08-13 sentence redesign,
+        re-grained to paragraphs 08-23; "sentence" names kept, unit is opaque).
         Reads content fresh from disk so it's never stale.
 
-        ``injected_sents`` maps uid → 1-based sentence numbers already injected
+        ``injected_sents`` maps uid → 1-based paragraph numbers already injected
         into context this session; shortlisted diaries carry that mask into the
         judge prompt (the caller still subtracts it when packing).
 
@@ -1442,7 +1415,7 @@ class PersistentMemoryManager:
                 {
                     "id": uid,
                     "date": entry.get("date", date),
-                    "sents": _split_sentences(entry["content"]),
+                    "sents": _split_paragraphs(entry["content"]),
                     "injected": sorted(injected_sents.get(uid, set())),
                 }
             )
@@ -1450,7 +1423,7 @@ class PersistentMemoryManager:
             query,
             shortlist,
             context=context,
-            budget=getattr(cfg, "sentence_budget", 8),
+            budget=getattr(cfg, "sentence_budget", 4),
         )
         if judged is None:
             # Judge API/parse failure → skip this round entirely (宁缺勿整篇
@@ -1485,14 +1458,17 @@ class PersistentMemoryManager:
 
     @staticmethod
     def _diary_chunks(uid: str, content: str, date: str) -> List[Dict[str, Any]]:
-        """Split a diary into sentence-level chunk items for the vector index.
+        """Split a diary into paragraph-level chunk items for the vector index.
 
         Each chunk id is ``<diary_uid>#<n>``; ``meta.parent`` points back at the
-        diary so retrieval can group chunks and recall the whole diary.
+        diary so retrieval can group chunks and recall the whole diary. The
+        first boot after the 08-23 paragraph redesign re-embeds every diary
+        (same id form, drifted text) and prunes the stale sentence chunks —
+        ensure_indexed handles both, no migration pass needed.
         """
         return [
-            {"id": f"{uid}#{i}", "text": sent, "meta": {"parent": uid, "date": date}}
-            for i, sent in enumerate(_split_sentences(content))
+            {"id": f"{uid}#{i}", "text": para, "meta": {"parent": uid, "date": date}}
+            for i, para in enumerate(_split_paragraphs(content))
         ]
 
     def _all_diary_chunks_for_index(self) -> List[Dict[str, Any]]:
