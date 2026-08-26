@@ -349,10 +349,12 @@ class SnapshotManager:
             f"ウィッシュリスト: {len(wishlist)}件"
         )
 
-        top5 = self.top_played(snapshot, 5)
-        if top5:
-            lines.append("プレイ時間トップ5:")
-            for g in top5:
+        # 20 entries (あさひ 08-26, was 5): pulls the mid-tail — souls,
+        # 軌跡, roguelikes — into the standing digest for ~470 extra chars.
+        top = self.top_played(snapshot, 20)
+        if top:
+            lines.append("プレイ時間トップ20:")
+            for g in top:
                 lines.append(f"- {g['name']}: {g['hours']}時間")
 
         recent = [g for g in self.recent_detail(snapshot) if g["hours_2weeks"] > 0]
