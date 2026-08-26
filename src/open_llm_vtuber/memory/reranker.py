@@ -14,8 +14,7 @@ Two improvements over a bare reranker:
   re-inject candidates matching earlier topics turn after turn.
 - Listwise / ordered selection (à la RankGPT) — no numeric scores, since LLMs
   rank reliably but calibrate absolute scores poorly. An empty result is the
-  natural "nothing relevant" exit (framed in the prompt as the NORMAL outcome),
-  so no similarity threshold has to be tuned.
+  natural "nothing relevant" exit, so no similarity threshold has to be tuned.
 
 The same class serves both subsystems via ``item_label`` ("日記" / "事実"); diary
 and facts each construct their own instance over their own data.
@@ -30,70 +29,82 @@ from loguru import logger
 from openai import AsyncOpenAI
 
 # System instruction for the judge. Plain tool prompt — no roleplay. Japanese to
-# match the memory/query language. ``{item}`` is the entry kind ("日記"/"事実").
-# 2026-07-24 tightening (あさひ): the judge was still letting too much through,
-# and kept re-injecting candidates that matched EARLIER topics turn after turn.
-# The context is therefore demoted to reference-resolution ONLY — relevance must
-# come from the latest user message alone — and the default is now framed as
-# "an empty array is the normal outcome".
+# match the memory/query language. ``{item}`` is the entry kind ("日記"/"事実";
+# facts are the only live caller since diaries moved to the paragraph judge).
+# Relevance bar recalibrated 08-26 (あさひ) — same treatment as the diary
+# variant got on 08-23: the 07-24 strictness ("must-reference or drop", "empty
+# is THE normal outcome", "1〜2 picks max") was written to compensate a leaky
+# gpt-4o-mini judge; swapping in the compliant 5.6-luna collapsed the accept
+# rate 87.5% → 25% on an unchanged pre-judge score distribution (day-one log
+# stats, top-hyb median 0.666 vs 0.679). Bar is now "topic actually raised →
+# include"; the anti-repeat core (latest-message-only judging,
+# reference-resolution-only context) and the anti-patterns stay.
 _RERANK_SYSTEM = (
     "あなたは記憶検索の関連性判定ツールです。これは会話ではありません。"
     "ロールプレイやキャラクターとしての応答はせず、判定結果のみを出力してください。\n\n"
     "AIキャラクターへのユーザーの「最後のユーザー発言」と、自動検索された"
     "「{item}の候補」のリストが与えられます。あなたの仕事は、キャラクターが"
-    "その発言に返答するにあたって、**候補の具体的な中身を参照しなければ返答の質が"
-    "落ちる・事実を誤る**——という厳格な基準で候補を絞り込むことです。\n\n"
+    "その発言に返答するにあたって、**中身に触れると返答がより具体的で正確になる**"
+    "候補を選ぶことです。\n\n"
     "大原則:\n"
     "- **判定対象は「最後のユーザー発言」ただ一つ**。添付される「最近の会話」は、"
     "最後の発言に含まれる代名詞・指示語・省略を解決するための**参照解決専用**であり、"
     "**関連性の根拠として使ってはならない**。\n"
     "- **前の会話の話題と一致するだけの候補は選ばない**。最後の発言自身がその話題を"
     "持ち出していない限り、それは過ぎた話題である。過去の話題に紐づく候補を"
-    "ターンごとに繰り返し追加し続けることが、まさに防ぐべき失敗パターンである。\n"
-    "- 関連 = 最後の発言に返答するとき、その候補の中身を参照しないと"
-    "**返答が不正確になる・嘘をつく・的外れになる**もの。"
-    "「あれば会話が少し豊かになる」程度は関連ではない。\n"
-    "- **空配列が通常の結果である**。挨拶・相槌・スキンシップ・短い感情表現・"
-    "その場限りの雑談には、原則として何も要らない。選ぶのは例外的な場合だけで、"
-    "多くても1〜2件、確信があるものに限る。\n"
-    "- 同じ大まかな話題に属するだけでは不十分（「どちらも食べ物の話」程度は無関連）。\n"
-    "- キーワードが一致するだけのもの、別の文脈(デバッグ・テスト・検索の失敗等)で"
+    "ターンごとに繰り返し追加し続けるのは、防ぐべき失敗パターンである。\n"
+    "- 関連 = 最後の発言の話題（人・物・出来事・場所）について、候補に"
+    "**具体的な記録**——好み・習慣・経緯・約束——があり、それに触れると返答が"
+    "具体的で正確になるもの。事実を誤らないために必須のものはもちろん、"
+    "**話題に直接つながる{item}も関連に含める**。\n"
+    "- ただし、同じ大分類に属するだけの緩いつながり（「どちらも食べ物の話」程度）、"
+    "キーワードが重なるだけのもの、別の文脈（デバッグ・テスト・検索の失敗等）で"
     "その語に触れただけのもの、出来事そのものではなく「思い出そうとした/検索した」"
     "というメタな言及は**無関連**。\n"
-    "- 迷うときは**落とす**。「これが無くても自然に返答できる」なら不要。\n\n"
+    "- 挨拶・相槌・スキンシップ・短い感情表現だけの発言には、通常何も要らない。\n"
+    "- 迷うときは:最後の発言がその話題を**実際に持ち出しているなら入れる**、"
+    "キーワードが重なるだけなら落とす。\n\n"
     "出力は関連する候補だけを、**関連度の高い順**に並べ、各要素に短い理由を一言添える。"
-    "関連するものが無ければ空配列を返す（それが通常の結果である）。"
+    "関連するものが無ければ空配列を返す。"
 )
 
 
 # Paragraph-mode variant (diary RAG only; facts keep the whole-entry judge).
-# Same 07-24 strictness core. 08-13 introduced in-diary picking at sentence
-# granularity; 08-23 re-grained it to PARAGRAPHS (あさひ: diaries are written
-# in tidy scene-sized paragraphs now, and sentence excerpts kept losing
-# subject/setting). Ordering still exists only at diary granularity,
-# paragraphs already in context are marked 注入済み and must not be re-picked,
-# and picking nothing from a masked diary is an explicitly normal outcome.
+# 08-13 introduced in-diary picking at sentence granularity; 08-23 re-grained
+# it to PARAGRAPHS. Relevance bar recalibrated same day (あさひ): the 07-24
+# strictness ("must-reference or drop", "empty is THE normal outcome") was
+# written to compensate a leaky gpt-4o-mini judge — the compliant 5.6-luna
+# executed it into near-zero injection on day one, exactly as あさひ
+# predicted. Bar is now "topic actually raised → include"; the anti-repeat
+# core (latest-message-only judging, reference-resolution-only context) and
+# the anti-patterns stay. Ordering still exists only at diary granularity,
+# paragraphs already in context are marked 注入済み and must not be re-picked.
 _RERANK_SENTENCE_SYSTEM = (
     "あなたは記憶検索の関連性判定ツールです。これは会話ではありません。"
     "ロールプレイやキャラクターとしての応答はせず、判定結果のみを出力してください。\n\n"
     "AIキャラクターへのユーザーの「最後のユーザー発言」と、自動検索された"
     "「日記の候補」のリストが与えられます。各候補の本文は p1, p2, … と"
     "段落番号付きで示されます。あなたの仕事は、キャラクターがその発言に返答する"
-    "にあたって、**その段落の具体的な中身を参照しなければ返答の質が落ちる・"
-    "事実を誤る**——という厳格な基準で、関連する日記と、その中の必要な段落だけを"
-    "選ぶことです。\n\n"
+    "にあたって、**中身に触れると返答がより具体的で正確になる**段落を、"
+    "関連する日記から選ぶことです。\n\n"
     "大原則:\n"
     "- **判定対象は「最後のユーザー発言」ただ一つ**。添付される「最近の会話」は、"
     "最後の発言に含まれる代名詞・指示語・省略を解決するための**参照解決専用**であり、"
     "**関連性の根拠として使ってはならない**。\n"
     "- **前の会話の話題と一致するだけの候補は選ばない**。最後の発言自身がその話題を"
-    "持ち出していない限り、それは過ぎた話題である。\n"
-    "- 関連 = 最後の発言に返答するとき、その段落の中身を参照しないと"
-    "**返答が不正確になる・嘘をつく・的外れになる**もの。"
-    "「あれば会話が少し豊かになる」程度は関連ではない。\n"
-    "- **空配列が通常の結果である**。挨拶・相槌・スキンシップ・短い感情表現・"
-    "その場限りの雑談には、原則として何も要らない。\n"
-    "- 迷うときは**落とす**。\n\n"
+    "持ち出していない限り、それは過ぎた話題である。過去の話題に紐づく候補を"
+    "ターンごとに繰り返し追加し続けるのは、防ぐべき失敗パターンである。\n"
+    "- 関連 = 最後の発言の話題（人・物・出来事・場所）について、日記に"
+    "**具体的な記録**——経緯・評価・約束・感想——があり、それに触れると返答が"
+    "具体的で正確になるもの。事実を誤らないために必須のものはもちろん、"
+    "**話題に直接つながる思い出も関連に含める**。\n"
+    "- ただし、同じ大分類に属するだけの緩いつながり（「どちらも食べ物の話」程度）、"
+    "キーワードが重なるだけのもの、別の文脈（デバッグ・テスト・検索の失敗等）で"
+    "その語に触れただけのもの、「思い出そうとした/検索した」というメタな言及は"
+    "**無関連**。\n"
+    "- 挨拶・相槌・スキンシップ・短い感情表現だけの発言には、通常何も要らない。\n"
+    "- 迷うときは:最後の発言がその話題を**実際に持ち出しているなら入れる**、"
+    "キーワードが重なるだけなら落とす。\n\n"
     "段落の選び方:\n"
     "- 日記単位では**関連度の高い順**に並べる。段落単位の順序付けはしない"
     "（段落は日記内の番号で指定するだけでよい。提示順は原文順で復元される）。\n"
@@ -101,12 +112,12 @@ _RERANK_SENTENCE_SYSTEM = (
     "1段落でよい。前後がないと誤解される場合のみ、隣接する段落を足す。\n"
     "- 「注入済み」と表示された段落は**既にキャラクターの文脈内にある**。"
     "再選択してはならない。注入済みの部分だけで返答に足りるなら、"
-    "その日記からは何も選ばない（それも正常な結果である）。\n"
+    "その日記からは何も選ばない。\n"
     "- 関連する日記が複数あれば複数選んでよい。選択の合計はおおむね"
     "{budget}段落を目安にする（厳密な上限ではない）。\n\n"
     "出力は関連する日記だけを関連度の高い順に並べ、各要素に候補番号・"
     "選んだ段落番号の配列・短い理由を一言添える。"
-    "関連するものが無ければ空配列を返す（それが通常の結果である）。"
+    "関連するものが無ければ空配列を返す。"
 )
 
 
