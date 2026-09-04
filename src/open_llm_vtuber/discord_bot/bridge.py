@@ -34,9 +34,15 @@ class TurnResult:
     request_id: str
     text_parts: list[str] = field(default_factory=list)
     error: Optional[str] = None
-    # Expression index for the face to attach on Discord: the LLM-marked primary
-    # if any, otherwise the first expression seen this turn.
+    # Expression index for the face to attach on Discord: the FIRST LLM-marked
+    # primary if any, otherwise the first expression seen this turn. Payloads
+    # arrive per sentence, so with multiple ✦-marked sentences the unconditional
+    # overwrite used to make the LAST marker win (09-02 fix — design is
+    # first-wins, same as extract_primary_emotion within one sentence).
     face_index: Optional[int] = None
+    # True once face_index came from a ✦ primary: later primaries must not
+    # replace it, but a primary may still replace an unmarked fallback.
+    face_is_primary: bool = False
     # Set when the server reports a deliberately silent turn ("think-only" /
     # "tool-only"): she produced a transcript but chose not to speak. Lets the
     # bot show an honest notice instead of a bare "(no reply)".
@@ -103,9 +109,10 @@ class OLVBridge:
             Callable[[str, Optional[int]], Awaitable[None]]
         ] = None
         self._proactive_parts: list[str] = []
-        # Expression face for the in-flight proactive turn (primary wins, else
-        # first expression seen) — mirrors _current_turn.result.face_index.
+        # Expression face for the in-flight proactive turn (FIRST primary wins,
+        # else first expression seen) — mirrors _current_turn.result.face_index.
         self._proactive_face: Optional[int] = None
+        self._proactive_face_primary: bool = False
 
     def set_proactive_callback(
         self, cb: Callable[[str, Optional[int]], Awaitable[None]]
@@ -353,17 +360,22 @@ class OLVBridge:
             actions = data.get("actions") or {}
             primary = actions.get("primary_expression")
             if self._current_turn is not None:
+                result = self._current_turn.result
                 if primary is not None:
-                    self._current_turn.result.face_index = primary
-                elif self._current_turn.result.face_index is None:
+                    if not result.face_is_primary:
+                        result.face_index = primary
+                        result.face_is_primary = True
+                elif result.face_index is None:
                     exprs = actions.get("expressions") or []
                     if exprs:
-                        self._current_turn.result.face_index = exprs[0]
+                        result.face_index = exprs[0]
             else:
                 # Proactive turn (no pending request): capture its face too, so
                 # alarms / keepalive posts carry an expression like normal replies.
                 if primary is not None:
-                    self._proactive_face = primary
+                    if not self._proactive_face_primary:
+                        self._proactive_face = primary
+                        self._proactive_face_primary = True
                 elif self._proactive_face is None:
                     exprs = actions.get("expressions") or []
                     if exprs:
@@ -434,11 +446,13 @@ class OLVBridge:
         """Hand a completed proactive turn's text + face to the callback (if any)."""
         if not self._proactive_parts:
             self._proactive_face = None
+            self._proactive_face_primary = False
             return
         text = " ".join(p.strip() for p in self._proactive_parts if p).strip()
         face = self._proactive_face
         self._proactive_parts = []
         self._proactive_face = None
+        self._proactive_face_primary = False
         if text and self._proactive_callback is not None:
             try:
                 await self._proactive_callback(text, face)

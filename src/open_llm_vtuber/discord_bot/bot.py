@@ -1301,6 +1301,13 @@ class DiscordVTuberBot(discord.Client):
         if not path.is_file():
             path = faces_dir / f"{face_index}.png"
         if not path.is_file():
+            # Not silent: a fresh emotionMap key with no PNG yet (or a typo'd
+            # filename — 09-02: manual103.png vs manual_103.png) looks like
+            # "the face never arrived" with zero trace otherwise.
+            logger.warning(
+                f"[face] no PNG for expression {face_index} in {faces_dir} "
+                f"(expected manual_{face_index}.png or {face_index}.png); skipped."
+            )
             return
         try:
             # Downscale to a fixed size on send from the higher-res cache, so it
