@@ -100,7 +100,10 @@ _FACT_EXTRACT_SYSTEM = (
     "- 中国語・日本語・英語が混在していても、すべての言語の発言を対象にする\n"
     "- 既存の事実リストが提供される場合、それらをそのまま繰り返さない\n"
     "- 既存の事実には先頭に `[importance]`（現在の重要度）が付いている。"
-    "新しい事実の重要度を判定する際の一貫性の参考にしてよい。\n\n"
+    "新しい事実の重要度を判定する際の一貫性の参考にしてよい。\n"
+    "- `[archive]` の付いた既存事実は「古い・期限切れだが残してある」もの。"
+    "同じ内容を再抽出しない（重複扱い）。会話中でその内容が現在の事実として"
+    "明確に再確立された場合のみ、新しい事実として抽出してよい。\n\n"
     "【重要度の判定（importance）】\n"
     '抽出する各事実に importance を付ける。値は "high" か "low" のどちらか。\n'
     '（"user" は使わない——それは人間が手動で指定する専用の値で、あなたが付けてはいけない。）\n'
@@ -744,6 +747,15 @@ class PersistentMemoryManager:
         by_id = {
             self._fact_id(f["fact"]): f for f in self._load_facts() if f.get("fact")
         }
+        # The archive tier (below low, あさひ 08-31) is reachable ONLY through
+        # deliberate memory_search — it stays in the index but never rides any
+        # automatic channel. Excluding here keeps even the floor gate blind to
+        # archived facts (an archived top candidate must not open the judge).
+        exclude_ids = set(exclude_ids) | {
+            fid
+            for fid, f in by_id.items()
+            if (f.get("importance") or "low") == "archive"
+        }
 
         if self._facts_reranker is None:
             hits, candidates = await self._facts_index.retrieve(
@@ -833,7 +845,13 @@ class PersistentMemoryManager:
             facts = self._load_facts()
         except Exception:
             return []
-        by_id = {self._fact_id(f["fact"]): f for f in facts if f.get("fact")}
+        by_id = {
+            self._fact_id(f["fact"]): f
+            for f in facts
+            if f.get("fact")
+            # archive tier: invisible to every automatic channel, both waves.
+            and (f.get("importance") or "low") != "archive"
+        }
         cap = max(1, int(cap))
 
         # ---- Wave B: store-id equality ----
@@ -933,7 +951,7 @@ class PersistentMemoryManager:
     ) -> Dict[str, Any]:
         """Append a fact on the character's behalf (memory_add).
 
-        ``importance`` is clamped to high/low — ``user`` is manual-only and an
+        ``importance`` is clamped to high/low/archive — ``user`` is manual-only and an
         LLM must never assign it. Duplicate content (same fingerprint) is
         rejected instead of silently re-added. ``store_id`` (optional, Uber
         facts only) links the fact to a store for the search-time recall;
@@ -945,7 +963,7 @@ class PersistentMemoryManager:
             return {"status": "error", "message": "fact本文が空。"}
         if importance == "llm":  # legacy spelling of "high"
             importance = "high"
-        importance = importance if importance in ("high", "low") else "low"
+        importance = importance if importance in ("high", "low", "archive") else "low"
         facts = self._load_facts()
         fid = self._fact_id(text)
         if any(self._fact_id(f["fact"]) == fid for f in facts if f.get("fact")):
@@ -991,7 +1009,8 @@ class PersistentMemoryManager:
         2026-07-09: content is editable; what stays forbidden is CREATING
         user-tier facts and DELETING them). The TIER of a user-tier fact is
         equally the user's own — the character may not promote or demote it
-        (あさひ 2026-08-09: importance change added for high/low; ``user``
+        (あさひ 2026-08-09: importance change added for high/low —
+        "archive" joined 08-31 as the search-only shelf tier; ``user``
         stays manual-only in both directions). ``store_id`` (08-15): None =
         untouched, empty string = clear the linkage, else set (stored as
         the 8-char short)."""
@@ -999,10 +1018,10 @@ class PersistentMemoryManager:
         importance = (importance or "").strip().lower() or None
         if importance == "llm":  # legacy spelling of "high"
             importance = "high"
-        if importance is not None and importance not in ("high", "low"):
+        if importance is not None and importance not in ("high", "low", "archive"):
             return {
                 "status": "error",
-                "message": "importance は high / low のみ（user は本人管理で指定不可）。",
+                "message": "importance は high / low / archive のみ（user は本人管理で指定不可）。",
             }
         if store_id is not None:
             store_id = store_id.strip()
@@ -1568,7 +1587,9 @@ class PersistentMemoryManager:
         return [
             f
             for f in facts
-            if (f.get("importance") or "low") != "low"
+            # user/high always shown; low AND archive are window-scoped (an
+            # archived fact outside the window can't be re-summarised anyway).
+            if (f.get("importance") or "low") not in ("low", "archive")
             or PersistentMemoryManager._norm_ts(f.get("updated", "")) >= window_start
         ]
 

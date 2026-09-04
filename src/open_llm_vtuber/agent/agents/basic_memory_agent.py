@@ -1036,9 +1036,11 @@ class BasicMemoryAgent(AgentInterface):
         "were never kept in memory, history_search does a keyword search over "
         "the full conversation logs. To save or correct facts established in "
         "conversation, use memory_add / memory_update (be careful about "
-        "rewriting). Deletion is memory_delete, which requires the user's "
-        "consent. When a session is wrapping up, write the diary of this "
-        "session with memory_write_diary."
+        "rewriting). A fact that has merely become outdated is better moved "
+        "to importance=archive than deleted — archived facts surface only "
+        "when you search for them. Deletion is memory_delete, which requires "
+        "the user's consent. When a session is wrapping up, write the diary "
+        "of this session with memory_write_diary."
     )
 
     # Trailing system block placed right before the message history.
@@ -4374,7 +4376,9 @@ class BasicMemoryAgent(AgentInterface):
                         "the next turn onward. Meaning of importance: "
                         "user = curated by the user himself (resident every "
                         "session) / high = important (resident every session) / "
-                        "low = enters context only when searched or recalled. To "
+                        "low = enters context only when searched or recalled / "
+                        "archive = shelved (outdated but kept): reachable ONLY "
+                        "through this search, never auto-recalled. To "
                         "restrict by date or period, pass date_from/date_to — do "
                         "not write dates into the query text."
                     ),
@@ -4485,12 +4489,14 @@ class BasicMemoryAgent(AgentInterface):
                             },
                             "importance": {
                                 "type": "string",
-                                "enum": ["high", "low"],
+                                "enum": ["high", "low", "archive"],
                                 "description": (
                                     "high = important (resident in the system "
                                     "prompt from the next startup) / low = "
-                                    "normal (recalled via search and RAG). "
-                                    "Default: low."
+                                    "normal (recalled via search and RAG) / "
+                                    "archive = shelved: only explicit "
+                                    "memory_search finds it, nothing recalls "
+                                    "it automatically. Default: low."
                                 ),
                             },
                             "store_id": {
@@ -4537,11 +4543,16 @@ class BasicMemoryAgent(AgentInterface):
                             },
                             "importance": {
                                 "type": "string",
-                                "enum": ["high", "low"],
+                                "enum": ["high", "low", "archive"],
                                 "description": (
                                     "New tier: high = resident in the system "
                                     "prompt from the next startup / low = "
-                                    "enters context only via search or recall. "
+                                    "enters context only via search or recall / "
+                                    "archive = shelved for facts that are "
+                                    "outdated but worth keeping: only explicit "
+                                    "memory_search finds them, automatic recall "
+                                    "never surfaces them. Prefer archiving over "
+                                    "deleting when a fact merely expired. "
                                     "Omit to keep the current tier."
                                 ),
                             },
