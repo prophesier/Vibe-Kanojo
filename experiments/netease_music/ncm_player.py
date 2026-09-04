@@ -519,6 +519,8 @@ def play(
     volume: int = 40,  # both callers pass their own; this is just a sane floor
     song_id: Optional[int] = None,
     wake: bool = False,
+    keep_proc: bool = False,
+    only_if_idle: bool = False,
 ) -> Dict[str, Any]:
     """Play a local audio file, replacing whatever was playing.
 
@@ -526,6 +528,18 @@ def play(
     requested in conversation plays once. ``wake`` marks the playback as an
     alarm ringing, which is what lets ``stop(only_wake=True)`` tell the two
     apart.
+
+    ``keep_proc`` returns the child's ``Popen`` handle under the (in-memory
+    only, never persisted) ``"proc"`` key, so the continuous-playlist loop can
+    wait on the exact process it started and read its exit code — the state
+    file cannot answer "did it end naturally or was it killed", the handle can.
+
+    ``only_if_idle`` makes this a polite start: if any recorded player is
+    still alive — or cannot be confirmed dead — raise instead of reaping it.
+    The playlist loop uses it so that the next chained track can never
+    replace audio someone else started (e.g. a wake alarm that fired while
+    the next song was downloading). An UNKNOWN probe refuses too: failing to
+    start is recoverable, killing a ringing alarm is not.
     """
     audio = pathlib.Path(path)
     if not audio.exists():
@@ -569,6 +583,16 @@ def play(
         survivors: List[Dict[str, Any]] = []
         previous = _read_state()
         if previous is not None:
+            if only_if_idle:
+                blockers = [
+                    entry
+                    for entry in _players(previous)
+                    if _probe_process(entry) != DEAD
+                ]
+                if blockers:
+                    raise PlaybackError(
+                        "別の再生が進行中のため、次の曲は開始しませんでした。"
+                    )
             _, survivors = _reap_entries(_players(previous))
             if survivors:
                 # Two songs at once is bad; refusing to ring an alarm is worse.
@@ -606,4 +630,8 @@ def play(
             raise PlaybackError(
                 "再生状態を安全に保存できなかったため、開始を取り消しました。"
             )
+    if keep_proc:
+        # Added AFTER the state was serialised: the handle lives only in the
+        # returned dict, never in playback.json.
+        state["proc"] = proc
     return state

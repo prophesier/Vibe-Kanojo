@@ -51,15 +51,33 @@ _UA = (
 # via env in case this one ever stops working.
 _REAL_IP = os.environ.get("NCM_REAL_IP", "211.161.244.70")
 _TIMEOUT = 15.0
-_DOWNLOAD_TIMEOUT = 90.0
+# A song that streams normally arrives within a couple of seconds. A song the
+# server has decided to gate (VIP/copyright tier) BURSTS a preview's worth of
+# bytes and then stalls with the socket open — both 08-29 failures froze at
+# exactly 2,621,440 bytes (~65s at 320kbps). The per-read timeout turns that
+# stall into a fast, typed failure instead of silently eating the caller's
+# whole budget. No total bound here: callers wrap fetch_audio themselves.
+_DOWNLOAD_TIMEOUT = httpx.Timeout(15.0, read=8.0)
+_STALE_PART_S = 3600.0  # .part remnants older than this get swept by prune
 _CACHE_KEEP = 40  # songs to keep on disk; the newest are also the alarm fallback
 # Non-audio files living in the cache next to each song. Anything globbing the
 # cache must skip these — a ".json" sidecar handed to the player is not a
 # mysterious failure, it just isn't audio.
 _NON_AUDIO_SUFFIXES = (".json", ".part")
 
-# Play URLs arrive on mNNN.music.126.net; the mNNNc.* hosts carry the same
-# bytes and are the ones that answer reliably.
+# Play URLs arrive on mNNN.music.126.net; the mNNNc.* variants carry the same
+# bytes. Two hosts, two failure modes, BOTH kept on purpose (あさひ 08-29):
+#   - the RAW host enforces the copyright REGION check — tracks with no JP
+#     license refuse to serve from this network. Fast when it serves.
+#   - the c-variant skips the IP check (a deliberately public backdoor in the
+#     NCM CDN), which is why 07-27 standardised on it — but it applies
+#     burst-bucket throttling to (at least) fee=8 tracks: ~2.5MiB instantly,
+#     then a trickle. Both 空の軌跡 failures froze at exactly 2,621,440
+#     bytes; an A/B probe on the same song and session measured c-host 11.3s
+#     vs raw host 0.1s for the full file.
+# fetch_audio therefore tries the URL as issued FIRST (fast for everything
+# JP-licensed) and falls back to the c-variant (slow but border-blind) when
+# the raw host refuses. Do not remove either half.
 _CDN_RE = re.compile(r"(m\d+?)(?!c)\.music\.126\.net")
 
 
@@ -298,17 +316,36 @@ class NeteaseClient:
             )
         return out
 
-    async def playlist_tracks(self, playlist_id: int, limit: int = 1000) -> List[Song]:
+    async def playlist_tracks(self, playlist_id: int, limit: int = 3000) -> List[Song]:
+        """Full track list, created and collected playlists alike.
+
+        v6/playlist/detail inlines at most ~1000 tracks, but ``trackIds``
+        carries the whole list — the tail past the inline prefix is hydrated
+        by id in chunks, otherwise a 1636-track playlist quietly becomes a
+        1000-track draw pool (08-29 audit; three of あさひ's playlists were
+        affected). The web frontend's 20-track cut on collected playlists is
+        a frontend behavior, not this API's — a 446-track collected list
+        inlines fully. A stale collection can also report count > trackIds:
+        ghosts of delisted songs, nothing to hydrate.
+        """
         data = await self.post(
-            "v6/playlist/detail", {"id": playlist_id, "n": limit, "s": 0}
+            "v6/playlist/detail", {"id": playlist_id, "n": 1000, "s": 0}
         )
         playlist = data.get("playlist") or {}
-        tracks = playlist.get("tracks") or []
-        if tracks:
-            return [_song_from(t) for t in tracks]
-        # Long playlists come back as ids only; hydrate them in one call.
-        ids = [t["id"] for t in (playlist.get("trackIds") or [])][:limit]
-        return await self.songs_by_id(ids) if ids else []
+        inline = [_song_from(t) for t in playlist.get("tracks") or []]
+        ids = [int(t["id"]) for t in (playlist.get("trackIds") or [])][:limit]
+        if not ids:
+            return inline[:limit]
+        by_id = {s.id: s for s in inline}
+        missing = [i for i in ids if i not in by_id]
+        for start in range(0, len(missing), 500):
+            try:
+                hydrated = await self.songs_by_id(missing[start : start + 500])
+            except NeteaseUnavailable:
+                break  # keep whatever we have — a partial pool still plays
+            for s in hydrated:
+                by_id[s.id] = s
+        return [by_id[i] for i in ids if i in by_id]
 
     async def songs_by_id(self, ids: List[int]) -> List[Song]:
         data = await self.post(
@@ -335,11 +372,44 @@ class NeteaseClient:
         url = entries[0].get("url") if entries else None
         if not url:
             raise NeteaseUnavailable("この曲は再生できません（版権制限の可能性）。")
-        return _preferred_cdn_host(url)
+        return url
+
+    async def _download(self, url: str, partial: pathlib.Path) -> None:
+        """Stream one URL into ``partial``. Raises typed NeteaseUnavailable on
+        failure; never leaves ``partial`` behind on ANY exit but success."""
+        client = await self.client()
+        try:
+            async with client.stream("GET", url, timeout=_DOWNLOAD_TIMEOUT) as response:
+                response.raise_for_status()
+                with partial.open("wb") as fh:
+                    async for chunk in response.aiter_bytes(65536):
+                        fh.write(chunk)
+        except httpx.TimeoutException as e:
+            # The burst-then-stall signature of a throttled/gated delivery
+            # (see _DOWNLOAD_TIMEOUT). Distinct message so the skip logic
+            # upstream can be honest about WHY the song was skipped.
+            partial.unlink(missing_ok=True)
+            raise NeteaseUnavailable(
+                "配信が途中で止まりました（版権制限の曲の可能性）。"
+            ) from e
+        except httpx.HTTPError as e:
+            partial.unlink(missing_ok=True)
+            raise NeteaseUnavailable("曲の取得に失敗しました。") from e
+        except BaseException:
+            # Cancelled mid-download (caller's budget expired) or anything
+            # else: never leave a .part remnant behind.
+            partial.unlink(missing_ok=True)
+            raise
 
     async def fetch_audio(self, song: Song) -> pathlib.Path:
         """Download a song into the cache and return its path. A cached copy
-        is reused, which is also what makes playback survive a dead network."""
+        is reused, which is also what makes playback survive a dead network.
+
+        The URL is fetched as issued first; the c-variant CDN host is the
+        fallback (see _CDN_RE — the 07-27 preference inverted on 08-29).
+        A cancellation is NOT a reason to try the fallback: the caller's
+        budget is gone either way.
+        """
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         existing = cached_audio_path(song.id)
         if existing:
@@ -350,16 +420,20 @@ class NeteaseClient:
         suffix = pathlib.Path(url.split("?")[0]).suffix or ".mp3"
         target = CACHE_DIR / f"{song.id}{suffix}"
         partial = target.with_suffix(target.suffix + ".part")
-        client = await self.client()
-        try:
-            async with client.stream("GET", url, timeout=_DOWNLOAD_TIMEOUT) as response:
-                response.raise_for_status()
-                with partial.open("wb") as fh:
-                    async for chunk in response.aiter_bytes(65536):
-                        fh.write(chunk)
-        except httpx.HTTPError as e:
-            partial.unlink(missing_ok=True)
-            raise NeteaseUnavailable("曲の取得に失敗しました。") from e
+        candidates = [url]
+        fallback = _preferred_cdn_host(url)
+        if fallback != url:
+            candidates.append(fallback)
+        last_error: Optional[NeteaseUnavailable] = None
+        for candidate in candidates:
+            try:
+                await self._download(candidate, partial)
+                last_error = None
+                break
+            except NeteaseUnavailable as e:
+                last_error = e
+        if last_error is not None:
+            raise last_error
         if partial.stat().st_size == 0:
             partial.unlink(missing_ok=True)
             raise NeteaseUnavailable("空のファイルが返されました。")
@@ -440,6 +514,15 @@ def _prune_cache() -> None:
     for stale in audio[_CACHE_KEEP:]:
         stale.unlink(missing_ok=True)
         stale.with_suffix(".json").unlink(missing_ok=True)
+    # .part remnants are skipped by the keep-list above, so without this they
+    # would accumulate forever. Old ones only — a download may be in flight.
+    now = time.time()
+    for part in CACHE_DIR.glob("*.part"):
+        try:
+            if now - part.stat().st_mtime > _STALE_PART_S:
+                part.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def cached_songs() -> List[Dict[str, Any]]:

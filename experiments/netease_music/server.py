@@ -6,7 +6,9 @@ concerned):
   - music_search(keyword)          -> matching songs
   - music_play(keyword)            -> play the best match through the speakers
   - music_playlists()              -> the user's own playlists
-  - music_play_playlist(name)      -> play a random song from one of them
+  - music_play_playlist(name)      -> continuous random playback from one of
+                                      them (chains tracks until
+                                      stop_after_minutes, default 30)
   - music_now_playing()            -> what is playing, if anything
   - music_stop()                   -> stop playback
 
@@ -101,6 +103,54 @@ _RESULT_NOTE = (
     "必ず自分の言葉で伝えること。この内容は次のターンには消えている。）"
 )
 
+# ---- continuous playlist playback ------------------------------------------
+# The chain loop lives in THIS process (it holds the ffplay Popen handle), so
+# it lasts exactly as long as the MCP server — a stack restart ends the run
+# after the current song, which is the acceptable degradation.
+#
+# Continuation is decided by the child's EXIT CODE, not by polling the state
+# file: -autoexit ends a finished song with 0, while music_stop, an alarm
+# taking the speakers, or a manual taskkill all end it non-zero — every "stop"
+# gesture therefore ends the whole run for free, and a zombie DJ that starts
+# the next track over a kill is impossible by construction.
+_PLAYLIST_MAX_MINUTES = 240
+_PLAYLIST_DEFAULT_MINUTES = 30
+# Per-CANDIDATE fetch bounds. Healthy songs download in ~2s; a gated song
+# fails typed in ~9s (burst + the client's 8s read-stall guard) — so both
+# paths draw several candidates instead of letting one bad song eat
+# everything. First-song slices live inside the 25s tool budget (2-3 draws);
+# between songs there is no tool budget, only the silence gap to keep short.
+_FIRST_FETCH_SLICE_S = 6.0
+_MIN_FETCH_ATTEMPT_S = 2.0
+_CHAIN_FETCH_TIMEOUT_S = 20.0
+_CHAIN_MAX_ATTEMPTS = 5  # worst-case gap ≈ 5 gated draws ≈ 45s of quiet
+
+# Generation counter: every new playback intent (play / stop / new playlist)
+# bumps it, and a loop that notices a different generation lies down. This is
+# in-process state — cross-process takeovers are handled by exit codes and
+# by play(only_if_idle=True) instead.
+_playlist_gen = 0
+_playlist_run: dict | None = None  # {"name","until_ts","gen","task","played"}
+
+
+def _clamp_minutes(minutes) -> int:
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return _PLAYLIST_DEFAULT_MINUTES
+    return max(1, min(_PLAYLIST_MAX_MINUTES, m))
+
+
+def _cancel_playlist_run() -> None:
+    """Every change of playback intent ends the current run (idempotent)."""
+    global _playlist_gen, _playlist_run
+    _playlist_gen += 1
+    run = _playlist_run
+    _playlist_run = None
+    if run is not None and not run["task"].done():
+        run["task"].cancel()
+
+
 mcp = FastMCP("netease-music")
 _client = NeteaseClient()
 
@@ -157,7 +207,9 @@ async def _player(fn, *args, **kwargs):
     )
 
 
-async def _play_song(song: Song, volume: int) -> str:
+async def _start_song(song: Song, volume: int, **player_kwargs) -> tuple[str, dict]:
+    """Start one song under the tool budget. Returns ``(message, state)``;
+    ``state`` is empty when the start could not be confirmed."""
     # Download under whatever is left of the budget, keeping the player's slice
     # in hand — the download can be cancelled cleanly, the start cannot.
     reserve = _PLAYER_BUDGET_S + _PLAYER_RETURN_MARGIN_S
@@ -166,39 +218,198 @@ async def _play_song(song: Song, volume: int) -> str:
         return (
             f"「{song.label()}」は検索に時間がかかり、"
             "安全に再生を開始できる時間が残っていなかったため開始しませんでした。"
-        )
+        ), {}
     try:
         path = await asyncio.wait_for(_client.fetch_audio(song), timeout=fetch_budget)
     except asyncio.TimeoutError:
+        logger.warning(
+            f"fetch {song.id} {song.label()} exceeded its {fetch_budget:.1f}s budget"
+        )
         return (
             f"「{song.label()}」の取得が時間内に終わらなかったため、"
             "再生は開始しませんでした。"
-        )
+        ), {}
     # Earlier search/playlist calls share the outer budget and may have used
     # more time than expected. Never dispatch an uncancellable thread unless
-    # its entire uncertainty window plus response margin still fits.
+    # its entire uncertainty window plus response margin still fits
+    # (_finish_start re-checks exactly that).
+    return await _finish_start(song, path, volume, **player_kwargs)
+
+
+async def _play_song(song: Song, volume: int) -> str:
+    message, _state = await _start_song(song, volume)
+    return message
+
+
+async def _start_random_from(
+    tracks: list[Song], volume: int, **player_kwargs
+) -> tuple[str, dict]:
+    """Draw random candidates until one actually starts (あさひ 08-29).
+
+    A gated song (see ncm_client._DOWNLOAD_TIMEOUT) fails fast and costs one
+    slice of the tool budget, not all of it — so a playlist that mixes
+    playable and copyright-gated tracks skips the bad draw with a warning and
+    keeps going, and only reports failure when the budget ran out on every
+    candidate it could try.
+    """
+    pool = list(tracks)
+    random.shuffle(pool)
+    reserve = _PLAYER_BUDGET_S + _PLAYER_RETURN_MARGIN_S
+    tried = 0
+    for song in pool:
+        slice_s = min(_remaining(reserve=reserve), _FIRST_FETCH_SLICE_S)
+        if slice_s < _MIN_FETCH_ATTEMPT_S:
+            break
+        tried += 1
+        try:
+            path = await asyncio.wait_for(_client.fetch_audio(song), timeout=slice_s)
+        except (asyncio.TimeoutError, NeteaseUnavailable) as e:
+            reason = str(e) or f"no data within {slice_s:.1f}s"
+            logger.warning(
+                f"[playlist] candidate {song.id} {song.label()} skipped "
+                f"({reason}); drawing another."
+            )
+            continue
+        return await _finish_start(song, path, volume, **player_kwargs)
+    if tried:
+        return (
+            f"{tried}曲試しましたが、どれも再生を開始できませんでした"
+            "（版権制限で配信が止まる曲が続いた可能性）。"
+            "もう一度試すと別の曲が引かれます。"
+        ), {}
+    return "時間が足りず、再生を開始できませんでした。", {}
+
+
+async def _finish_start(
+    song: Song, path, volume: int, **player_kwargs
+) -> tuple[str, dict]:
+    """The launch half of _start_song, for callers that fetched themselves."""
+    reserve = _PLAYER_BUDGET_S + _PLAYER_RETURN_MARGIN_S
     if _time_left() < reserve:
         return (
             f"「{song.label()}」は取得できましたが、安全に再生開始を確認できる"
             "時間が残っていなかったため開始しませんでした。"
-        )
+        ), {}
     try:
-        await _player(
+        state = await _player(
             ncm_player.play,
             path,
             label=song.label(),
             loop=False,
             volume=volume,
             song_id=song.id,
+            **player_kwargs,
         )
     except asyncio.TimeoutError:
         logger.warning(f"play {song.id} did not confirm within {_PLAYER_BUDGET_S}s")
         return (
             f"「{song.label()}」の再生を開始できたか確認できませんでした"
             "（少し遅れて鳴り出すかもしれない）。"
-        )
+        ), {}
     logger.info(f"playing {song.id} {song.label()}")
-    return f"再生開始: {song.label()}"
+    return f"再生開始: {song.label()}", (state or {})
+
+
+async def _playlist_loop(
+    proc,
+    tracks: list[Song],
+    playlist_name: str,
+    volume: int,
+    deadline: float,
+    gen: int,
+    last_id: int,
+) -> None:
+    """Chain random tracks until the stop time, yielding the speakers politely.
+
+    Exit paths, all deliberate: non-zero exit code (someone stopped/replaced
+    the player), a newer generation (this process changed intent), the
+    deadline (between songs — the in-flight song always finishes), a fetch
+    that keeps failing, a start that cannot be confirmed, or PlaybackError
+    from ``only_if_idle`` (someone else holds the speakers). Never raises.
+    """
+    global _playlist_run
+    played = 1
+    try:
+        while True:
+            rc = await asyncio.to_thread(proc.wait)
+            if rc != 0:
+                logger.info(
+                    f"[playlist] player exited rc={rc} — stopped or replaced; "
+                    f"run ends after {played} song(s)."
+                )
+                return
+            if gen != _playlist_gen:
+                return
+            if time.monotonic() >= deadline:
+                logger.info(
+                    f"[playlist] {playlist_name}: stop time reached "
+                    f"after {played} song(s)."
+                )
+                return
+            state: dict = {}
+            failed: set[int] = set()
+            for _attempt in range(_CHAIN_MAX_ATTEMPTS):
+                pool = [
+                    t for t in tracks if t.id != last_id and t.id not in failed
+                ] or [t for t in tracks if t.id not in failed]
+                if not pool:
+                    break  # every track in the playlist failed this gap
+                song = random.choice(pool)
+                try:
+                    path = await asyncio.wait_for(
+                        _client.fetch_audio(song), timeout=_CHAIN_FETCH_TIMEOUT_S
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    failed.add(song.id)
+                    logger.warning(
+                        f"[playlist] {song.id} {song.label()} skipped "
+                        f"({e or 'fetch timeout'}); drawing another."
+                    )
+                    continue
+                if gen != _playlist_gen:
+                    return
+                try:
+                    state = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            ncm_player.play,
+                            path,
+                            label=song.label(),
+                            loop=False,
+                            volume=volume,
+                            song_id=song.id,
+                            keep_proc=True,
+                            only_if_idle=True,
+                        ),
+                        timeout=_PLAYER_BUDGET_S,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except ncm_player.PlaybackError as e:
+                    logger.info(f"[playlist] yielding the speakers: {e}")
+                    return
+                except asyncio.TimeoutError:
+                    logger.warning("[playlist] next-song start unconfirmed; run ends.")
+                    return
+                break
+            if not state or "proc" not in state:
+                logger.warning("[playlist] no playable next song; run ends.")
+                return
+            proc = state.pop("proc")
+            last_id = song.id
+            played += 1
+            logger.info(f"[playlist] next: {song.id} {song.label()} (#{played})")
+            run = _playlist_run
+            if run is not None and run.get("gen") == gen:
+                run["played"] = played
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("[playlist] loop crashed; run ends.")
+    finally:
+        if _playlist_run is not None and _playlist_run.get("gen") == gen:
+            _playlist_run = None
 
 
 @mcp.tool()
@@ -227,6 +438,7 @@ async def music_play(
     the top match and lists the other candidates with their ids. When the user
     means a particular recording, or the top match was wrong, search first and
     play the id."""
+    _cancel_playlist_run()  # a single requested song replaces playlist mode
     if song_id:
         songs = await _client.songs_by_id([song_id])
         if not songs:
@@ -269,12 +481,19 @@ async def music_playlists() -> str:
 
 @mcp.tool()
 @_tool
-async def music_play_playlist(name: str, volume: int = _DEFAULT_VOLUME) -> str:
-    """Play a random song from one of the user's playlists, matched by name
-    (partial names are fine; "小红心" or "ハート" reaches the ♥ collection).
-    Several collected playlists are also called "<someone>喜欢的音乐", so his
-    own always wins a tie. Use music_playlists first if you don't know what
-    exists."""
+async def music_play_playlist(
+    name: str,
+    volume: int = _DEFAULT_VOLUME,
+    stop_after_minutes: int = _PLAYLIST_DEFAULT_MINUTES,
+) -> str:
+    """Play the user's playlist continuously: a random song starts now, and
+    each time a song ends another random track from the same playlist follows,
+    until stop_after_minutes (default 30, max 240) have passed — the song
+    playing at that moment finishes naturally. music_stop ends the run early;
+    so does playing anything else. Matched by name (partial names are fine;
+    "小红心" or "ハート" reaches the ♥ collection). Several collected playlists
+    are also called "<someone>喜欢的音乐", so his own always wins a tie. Use
+    music_playlists first if you don't know what exists."""
     playlists = await _client.user_playlists()
     match = find_playlist(playlists, name)
     if match is None:
@@ -284,8 +503,34 @@ async def music_play_playlist(name: str, volume: int = _DEFAULT_VOLUME) -> str:
     tracks = await _client.playlist_tracks(match.id)
     if not tracks:
         return f"「{match.name}」は空でした。"
-    message = await _play_song(random.choice(tracks), volume)
-    return f"{message}（{match.name} から）"
+    _cancel_playlist_run()
+    gen = _playlist_gen
+    minutes = _clamp_minutes(stop_after_minutes)
+    message, state = await _start_random_from(tracks, volume, keep_proc=True)
+    proc = state.pop("proc", None)
+    # The start may be unconfirmed, or another tool call may have raced us at
+    # an await point — in either case return the plain single-song outcome.
+    if proc is None or gen != _playlist_gen:
+        return f"{message}（{match.name} から）"
+    first_id = int(state.get("song_id") or 0)
+    deadline = time.monotonic() + minutes * 60
+    until_ts = time.time() + minutes * 60
+    task = asyncio.get_running_loop().create_task(
+        _playlist_loop(proc, tracks, match.name, volume, deadline, gen, first_id)
+    )
+    global _playlist_run
+    _playlist_run = {
+        "name": match.name,
+        "until_ts": until_ts,
+        "gen": gen,
+        "task": task,
+        "played": 1,
+    }
+    until_hm = time.strftime("%H:%M", time.localtime(until_ts))
+    return (
+        f"{message}（{match.name} から連続再生、{until_hm}頃まで。"
+        "曲が終わるたびに次の曲をランダムに選ぶ）"
+    )
 
 
 @mcp.tool()
@@ -296,19 +541,31 @@ async def music_now_playing() -> str:
         state = await _player(ncm_player.status)
     except asyncio.TimeoutError:
         return "再生状況を確認できませんでした。"
+    run = _playlist_run
+    run_note = ""
+    if run is not None and not run["task"].done():
+        mins_left = max(0, int((run["until_ts"] - time.time()) // 60))
+        run_note = (
+            f"（プレイリスト「{run['name']}」連続再生中 {run['played']}曲目、"
+            f"あと約{mins_left}分）"
+        )
     if state is None:
+        if run_note:
+            return f"曲間です — 次の曲を準備中{run_note}"
         return "今は何も再生していません。"
     elapsed = state.get("playing_for", 0)
     loop = "（繰り返し中）" if state.get("loop") else ""
     wake = "（アラーム）" if state.get("wake") else ""
-    return f"再生中: {state.get('label', '?')}{wake}{loop} — {elapsed}秒経過"
+    return f"再生中: {state.get('label', '?')}{wake}{loop}{run_note} — {elapsed}秒経過"
 
 
 @mcp.tool()
 @_tool
 async def music_stop() -> str:
-    """Stop whatever is playing on the user's speakers. This is also how an
-    alarm that woke the user up gets silenced."""
+    """Stop whatever is playing on the user's speakers, including a continuous
+    playlist run. This is also how an alarm that woke the user up gets
+    silenced."""
+    _cancel_playlist_run()
     try:
         outcome = await _player(ncm_player.stop)
     except asyncio.TimeoutError:
