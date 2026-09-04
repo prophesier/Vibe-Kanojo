@@ -1,10 +1,11 @@
 @echo off
+REM KEEP THIS FILE PURE ASCII: cmd decodes batch files in the console codepage; non-ASCII bytes desync the parser into executing comment fragments (diagnosed 08-28).
 REM ============================================================================
 REM RESUME launcher: same as start_all, but OLV continues the PREVIOUS
 REM conversation instead of starting a new session.
 REM
 REM Use this for frequent test restarts: it skips the diary/fact backfill of the
-REM session you were just in, and keeps the conversation context — so the chat
+REM session you were just in, and keeps the conversation context -- so the chat
 REM picks up where it left off (web + Discord both adopt the continued session).
 REM
 REM SETUP: copy this file to start_all_resume.bat (gitignored) and edit the vars.
