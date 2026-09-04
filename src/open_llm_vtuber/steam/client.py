@@ -6,7 +6,17 @@ Endpoint shapes verified live 2026-07-08 (cc=jp, l=japanese unless noted):
   (902000 == ¥9,020 — always ÷100). Free games omit ``price``.
 - ``/api/appdetails?appids=ID`` → ``{"ID": {success, data}}``. ONE appid per
   call (multi-appid unreliable); rate limit ~200 req / 5 min per IP.
-- ``/appreviews/ID?json=1&num_per_page=0`` → cheap ``query_summary`` only.
+- ``api.steampowered.com/IStoreBrowseService/GetItems/v1/?input_json=…`` with
+  ``data_request.include_reviews`` → KEYLESS, batched store-headline review
+  summaries (verified live 2026-09-04). ``reviews.summary_filtered`` is the
+  figure the store page shows (all languages, Steam purchases, off-topic
+  filtered: ELDEN RING 829,824 / 93%); ``summary_language_specific`` is the
+  ``context.language`` slice (JP: 5,588 / 75%, two score tiers lower).
+  Unknown appid → item with ``success: 15``; no reviews → no ``reviews`` key.
+  Replaces ``/appreviews/ID?json=1&num_per_page=0`` (its ``language`` param
+  FILTERS the counted reviews; the old ``language=japanese`` default handed
+  ヒロ that JP slice as if it were the total) and the search-page review
+  tooltips, which carry the same per-language slice.
 - ``/search/suggest`` → HTML fragment; ``/search/results/?...&json=1`` →
   ``{success, results_html, total_count}`` (``sort_by=Reviews_DESC`` variant
   re-verified live 2026-07-08); ``/recommended/morelike/app/ID/`` → HTML page
@@ -98,6 +108,9 @@ _SEARCH_RELEASED_RE = re.compile(
 )
 # <span class="search_review_summary positive" data-tooltip-html="非常に好評
 #   &lt;br&gt;...490件中88%が好評です...">
+# NOTE: this tooltip is the ``l``-language slice, not the store-wide figure
+# (verified 09-04: ELDEN RING 5,587/75% under l=japanese vs 829k/93% on the
+# store page). Parsed only as the fallback when the GetItems batch fails.
 _SEARCH_REVIEW_RE = re.compile(
     r'class="search_review_summary[^"]*"\s+data-tooltip-html="(.*?)"', re.S
 )
@@ -126,6 +139,21 @@ _FOLLOWED_ROW_RE = re.compile(
     r'gameListRowItemName"><a[^>]*>(.*?)</a>',
     re.S,
 )
+
+
+# GetItems accepts many ids per call; chunk generously below any server cap.
+_GETITEMS_CHUNK = 30
+
+
+def _review_entry(summary: dict) -> dict:
+    """Normalize one GetItems ``reviews.summary_*`` object."""
+    pct = summary.get("percent_positive")
+    return {
+        "review_score": int(summary.get("review_score") or 0),
+        "review_score_desc": str(summary.get("review_score_label") or ""),
+        "review_percent": int(pct) if pct is not None else None,
+        "total_reviews": int(summary.get("review_count") or 0),
+    }
 
 
 class SteamUnavailable(Exception):
@@ -375,31 +403,57 @@ class SteamClient:
                 return name or None
         return None
 
-    async def app_reviews_summary(
-        self, appid: int, language: str = "japanese"
-    ) -> Optional[dict]:
-        """Cheap review summary (num_per_page=0 → query_summary only).
-        Returns ``{review_score, review_score_desc, total_positive,
-        total_negative, total_reviews}`` or None if Steam says no."""
-        data = await self._get_store_json(
-            f"{_STORE}/appreviews/{appid}",
-            {
-                "json": 1,
-                "language": language,
-                "purchase_type": "all",
-                "num_per_page": 0,
-            },
-        )
-        if not data or data.get("success") != 1:
-            return None
-        qs = data.get("query_summary") or {}
-        return {
-            "review_score": int(qs.get("review_score") or 0),
-            "review_score_desc": str(qs.get("review_score_desc", "")),
-            "total_positive": int(qs.get("total_positive") or 0),
-            "total_negative": int(qs.get("total_negative") or 0),
-            "total_reviews": int(qs.get("total_reviews") or 0),
-        }
+    async def reviews_batch(self, appids: list[int]) -> dict[int, dict]:
+        """Store-headline review summaries for many appids in one keyless
+        GetItems call per 30 ids (あさひ 09-04: totals and score must be the
+        store-wide figures, not the per-language slice — see module doc).
+
+        Returns ``{appid: {review_score, review_score_desc (localized via
+        ``lang``), review_percent, total_reviews, language_specific?}}``.
+        ``language_specific`` (``{language, …same keys}``) is present only
+        when Steam returns the ``lang`` slice. Unknown appids and titles
+        without reviews are simply absent. Raises SteamUnavailable on
+        transport/HTTP/JSON failure like every other method."""
+        ids = list(dict.fromkeys(int(a) for a in appids if a))
+        out: dict[int, dict] = {}
+        for i in range(0, len(ids), _GETITEMS_CHUNK):
+            chunk = ids[i : i + _GETITEMS_CHUNK]
+            req = {
+                "ids": [{"appid": a} for a in chunk],
+                "context": {
+                    "language": self._lang,
+                    "country_code": self._cc.upper(),
+                },
+                "data_request": {"include_reviews": True},
+            }
+            data = await self._get_webapi_json(
+                "IStoreBrowseService/GetItems/v1/",
+                {"input_json": json.dumps(req, separators=(",", ":"))},
+                keyed=False,
+            )
+            items = ((data or {}).get("response") or {}).get("store_items") or []
+            for item in items:
+                if not isinstance(item, dict) or item.get("success") != 1:
+                    continue
+                appid = int(item.get("appid") or 0)
+                reviews = item.get("reviews") or {}
+                headline = reviews.get("summary_filtered")
+                if not appid or not isinstance(headline, dict):
+                    continue
+                entry = _review_entry(headline)
+                slice_ = reviews.get("summary_language_specific")
+                if isinstance(slice_, dict):
+                    entry["language_specific"] = {
+                        "language": self._lang,
+                        **_review_entry(slice_),
+                    }
+                out[appid] = entry
+        return out
+
+    async def app_reviews_summary(self, appid: int) -> Optional[dict]:
+        """One game's store-headline review summary (see :meth:`reviews_batch`
+        for the shape) or None when Steam has nothing for that appid."""
+        return (await self.reviews_batch([appid])).get(int(appid))
 
     async def search_suggest(self, term: str) -> list[dict]:
         """Prefix/substring title matcher (NO typo correction). Returns
@@ -444,7 +498,11 @@ class SteamClient:
         e.g. Reviews_DESC|Released_DESC (both families verified live).
         Returns ``(total_count, rows)`` where rows are
         ``{appid, name, price_yen, discount_percent, release_date,
-        review_desc, review_percent}``. Non-app rows (pure bundles) and
+        review_desc, review_percent, review_count}``. The review fields are
+        the store-wide headline figures from :meth:`reviews_batch` (one extra
+        keyless call per page); the page's own tooltip is only the
+        per-language slice and serves as the fallback (``review_count``
+        absent) when that batch fails. Non-app rows (pure bundles) and
         unparseable rows are skipped. Steam ignores small ``count`` values
         (count=5 still returned 25 rows, verified live), so rows are trimmed
         to ``count`` here.
@@ -502,6 +560,21 @@ class SteamClient:
             )
             if count > 0 and len(rows) >= count:
                 break
+        if rows:
+            try:
+                batch = await self.reviews_batch([r["appid"] for r in rows])
+            except SteamUnavailable as e:
+                logger.warning(
+                    "[steam] review batch failed; search rows keep the "
+                    f"per-language tooltip figures: {e}"
+                )
+                batch = {}
+            for row in rows:
+                summary = batch.get(row["appid"])
+                if summary:
+                    row["review_desc"] = summary["review_score_desc"]
+                    row["review_percent"] = summary["review_percent"]
+                    row["review_count"] = summary["total_reviews"]
         return total_count, rows
 
     async def morelike(self, appid: int) -> list[dict]:
