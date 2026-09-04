@@ -17,6 +17,7 @@ from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Set
 from loguru import logger
 
+from ..chat_history_manager import SESSION_UID_RE, strip_context_excluded
 from .vector_index import VectorIndex, extract_keywords
 
 
@@ -45,7 +46,9 @@ _TIMESTAMP_RE = re.compile(
 # are named by it; directory scans filter on this so a stray file dropped
 # into diaries/ or chat_history/ never gets injected or embedded
 # (あさひ 08-20).
-_SESSION_UID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[0-9a-f]+$")
+# Single source in chat_history_manager (get_history_list allowlists on the
+# same pattern since 09-02); the old local name stays for the callers here.
+_SESSION_UID_RE = SESSION_UID_RE
 
 
 _FACT_EXTRACT_SYSTEM = (
@@ -1590,6 +1593,9 @@ class PersistentMemoryManager:
         input they're feeding in.
         """
         try:
+            # Excluded turns (api_error / thinking_only) never reached the
+            # character's context — they are not extraction material.
+            recent_messages = strip_context_excluded(recent_messages)
             existing = self._load_facts()
             shown = self._facts_for_extraction_list(existing, window_start)
             if len(shown) < len(existing):
@@ -1722,6 +1728,9 @@ class PersistentMemoryManager:
         is written in the character's voice rather than a generic narrator.
         """
         try:
+            # Excluded turns (api_error / thinking_only) never reached the
+            # character's context — the diary must not "remember" them either.
+            history_messages = strip_context_excluded(history_messages)
             if not history_messages:
                 return
             conv_text = self._format_messages(history_messages)
@@ -1809,6 +1818,9 @@ class PersistentMemoryManager:
         fact selection / pruning reflect the character's perspective.
         Runs as a fire-and-forget background task.
         """
+        # Filter here too (both workers also self-filter) so window_start is
+        # computed over the messages that will actually be processed.
+        history_messages = strip_context_excluded(history_messages)
         await asyncio.gather(
             self.create_diary_async(
                 history_messages, history_uid, llm, persona=persona
@@ -1909,7 +1921,10 @@ class PersistentMemoryManager:
                 recent_uids = set(unprocessed_uids[-self._recent_sessions :])
                 recent_messages: List[Dict[str, Any]] = []
                 for uid in unprocessed_uids[-self._recent_sessions :]:
-                    msgs = get_history(conf_uid, uid)
+                    # Excluded turns are filtered here so the extraction
+                    # window (min timestamp below) matches the filtered input;
+                    # extract_facts_async filters again defensively.
+                    msgs = strip_context_excluded(get_history(conf_uid, uid))
                     if msgs:
                         recent_messages.extend(msgs)
 

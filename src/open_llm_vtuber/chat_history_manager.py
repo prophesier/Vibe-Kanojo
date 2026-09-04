@@ -28,6 +28,15 @@ def _is_safe_filename(filename: str) -> bool:
     return bool(pattern.match(filename))
 
 
+# Session files are named "<YYYY-MM-DD_HH-MM-SS>_<hex uid>.json" and NOTHING
+# else in the conf dir is a session. Every scanner must allowlist on this —
+# the conf dir keeps growing sidecars (facts.json, alarms.json, *.embeddings,
+# 09-02 nearly a header snapshot too), and denylisting them one by one is the
+# trap this project has stepped in repeatedly (chat-history-sidecar lesson).
+# Single source: persistent_memory imports this same pattern.
+SESSION_UID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[0-9a-f]+$")
+
+
 def _sanitize_path_component(component: str) -> str:
     """Sanitize and validate a path component"""
     # Remove any path components, get just the basename
@@ -355,13 +364,13 @@ def get_history_list(conf_uid: str) -> List[dict]:
         for filename in os.listdir(conf_dir):
             if not filename.endswith(".json"):
                 continue
-            # Skip sidecar files that share the conf dir but aren't chat history:
-            # the facts store, the self-set alarms store, and the diary/fact RAG
-            # embedding indexes. (These would otherwise be parsed as sessions and
-            # error out per scan.)
-            if filename in ("facts.json", "alarms.json") or filename.endswith(
-                ".embeddings.json"
-            ):
+            # Allowlist on the session-uid shape (09-02, replacing the old
+            # sidecar denylist): backfill, history_search, the sliding window
+            # and the frontend list all come through here, and every new
+            # sidecar dropped into the conf dir used to error out per scan
+            # until someone extended the denylist. Non-session files are now
+            # simply invisible.
+            if not SESSION_UID_RE.match(filename[:-5]):
                 continue
 
             history_uid = filename[:-5]
@@ -544,6 +553,19 @@ def strip_tool_markers(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", TOOL_MARKER_RE.sub("", text)).strip()
 
 
+def strip_context_excluded(messages: List[dict]) -> List[dict]:
+    """Drop records tagged ``context_excluded`` (api_error / thinking_only)
+    from a session's message list. From the model's perspective those turns
+    never happened — context assembly already skips them, and every other
+    model-facing read (history_search, diary generation, fact extraction)
+    must skip them the same way, or the excluded turn resurfaces through
+    search results and memory summaries. The records themselves stay on disk
+    for human review (frontend history, /clip, memory viewer are untouched)."""
+    return [
+        m for m in messages if not (isinstance(m, dict) and m.get("context_excluded"))
+    ]
+
+
 # ---------------------------------------------------------------------------
 # history_search — keyword full-scan over the chat log (memory-tool family).
 #
@@ -657,7 +679,10 @@ def search_history(
     hits: List[tuple] = []
     for entry in get_history_list(conf_uid):  # newest-first
         uid = entry["uid"]
-        messages = get_history(conf_uid, uid, quiet=True)
+        # context_excluded records (api_error / thinking_only) never happened
+        # from the model's perspective — filter BEFORE indexing so they can
+        # neither score as hits nor surface as block neighbors.
+        messages = strip_context_excluded(get_history(conf_uid, uid, quiet=True))
         if not messages:
             continue
         for m in messages:
