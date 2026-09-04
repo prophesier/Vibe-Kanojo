@@ -23,6 +23,61 @@ _UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+# Appended to every SUCCESSFUL web result (あさひ 08-31). Both think-only
+# incidents that day were web rounds: the model digested the results in a
+# long thinking block and ended the turn without ever speaking. The music
+# MCP has carried the same result-adjacent instruction since 07-27 with zero
+# silent turns on record — this is that mechanism, not a "use tools more"
+# prompt nudge (those are proven useless). Honest wording: web results DO
+# persist in context (truncated per round), so no "this disappears" claim.
+#
+# ⚠ WORDING CONSTRAINT (09-01, first classifier hit on record): the original
+# clause 「頭の中で整理するだけで終わらせず…自分の言葉にして」 tripped
+# Anthropic's safety classifier as CoT DISTILLATION — any instruction that
+# references the model's internal thinking and asks it to externalise it
+# reads as a thinking-extraction attempt. Phrase result-notes as a positive
+# "tell the user in your reply" only; never contrast thinking vs speaking.
+_RESULT_NOTE = (
+    "\n\n（メモ：この結果はあなたの参照用の資料。調べて分かった内容は、"
+    "このターンの返信本文の中で必ず自分の言葉でユーザーに伝えること。）"
+)
+
+
+def format_search_results(query: str, results: Any) -> Any:
+    """Successful searches become readable text (uber-style) + the note.
+
+    Error shapes pass through UNCHANGED — the agent's is_error detection
+    branches on the list/dict shape (08-09 lesson), so errors must keep it.
+    """
+    if (
+        not isinstance(results, list)
+        or not results
+        or any(isinstance(r, dict) and r.get("error") for r in results)
+    ):
+        return results
+    lines = [f"「{query}」の検索結果:"]
+    for i, r in enumerate(results, 1):
+        if not isinstance(r, dict):
+            continue
+        lines.append(f"{i}. {(r.get('title') or '').strip() or '(無題)'}")
+        if r.get("url"):
+            lines.append(f"   {r['url']}")
+        snippet = (r.get("snippet") or "").strip()
+        if snippet:
+            lines.append(f"   {snippet}")
+    return "\n".join(lines) + _RESULT_NOTE
+
+
+def format_fetch_result(result: Any) -> Any:
+    """Successful fetches become readable text + the note; errors unchanged."""
+    if not isinstance(result, dict) or result.get("error"):
+        return result
+    header = f"取得: {result.get('url', '')}"
+    title = (result.get("title") or "").strip()
+    if title:
+        header += f"\nタイトル: {title}"
+    return f"{header}\n\n{result.get('text', '')}{_RESULT_NOTE}"
+
 
 async def web_search(
     query: str,

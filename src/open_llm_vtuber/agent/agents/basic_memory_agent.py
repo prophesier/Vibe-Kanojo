@@ -19,7 +19,12 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 from loguru import logger
 from .agent_interface import AgentInterface
-from ...web_tools import web_search, web_fetch
+from ...web_tools import (
+    format_fetch_result,
+    format_search_results,
+    web_fetch,
+    web_search,
+)
 from ...alarms import resolve_fire_at, format_local
 from ..output_types import SentenceOutput, DisplayText
 from ..stateless_llm.stateless_llm_interface import StatelessLLMInterface
@@ -2838,11 +2843,17 @@ class BasicMemoryAgent(AgentInterface):
                     if marker and marker not in emitted_markers:
                         emitted_markers.add(marker)
                         yield marker
+                    # Formatted web results are plain text already — dumping a
+                    # str would wrap it in quotes and escape every newline.
                     tool_results_for_llm.append(
                         {
                             "type": "tool_result",
                             "tool_use_id": c["id"],
-                            "content": json.dumps(result, ensure_ascii=False),
+                            "content": (
+                                result
+                                if isinstance(result, str)
+                                else json.dumps(result, ensure_ascii=False)
+                            ),
                             "is_error": self._inproc_result_is_error(result),
                         }
                     )
@@ -3908,7 +3919,7 @@ class BasicMemoryAgent(AgentInterface):
         marker = f"\n🔗 *Web取得: {url[:120] or '...'}*\n"
         cfg = getattr(self, "_web_tools_config", None) or {}
         max_chars = int(cfg.get("max_fetch_chars", 20000) or 20000)
-        result = await web_fetch(url, max_chars=max_chars)
+        result = format_fetch_result(await web_fetch(url, max_chars=max_chars))
         return marker, result
 
     @staticmethod
@@ -3956,11 +3967,14 @@ class BasicMemoryAgent(AgentInterface):
         logger.info(f"[web_search] query: {query or '(empty)'}")
         marker = f"\n🔍 *Web検索: {query[:80] or '...'}*\n"
         cfg = getattr(self, "_web_tools_config", None) or {}
-        result = await web_search(
+        result = format_search_results(
             query,
-            provider=cfg.get("provider", "brave"),
-            api_key=cfg.get("api_key", ""),
-            max_results=5,
+            await web_search(
+                query,
+                provider=cfg.get("provider", "brave"),
+                api_key=cfg.get("api_key", ""),
+                max_results=5,
+            ),
         )
         return marker, result
 
@@ -4758,11 +4772,14 @@ class BasicMemoryAgent(AgentInterface):
                     "type": "web_search_marker",
                     "text": f"\n🔍 *Web検索: {query[:80] or '...'}*\n",
                 }
-                result = await web_search(
+                result = format_search_results(
                     query,
-                    provider=cfg.get("provider", "brave"),
-                    api_key=cfg.get("api_key", ""),
-                    max_results=5,
+                    await web_search(
+                        query,
+                        provider=cfg.get("provider", "brave"),
+                        api_key=cfg.get("api_key", ""),
+                        max_results=5,
+                    ),
                 )
         elif name == "web_fetch":
             url = str(args.get("url", "")).strip()
@@ -4775,8 +4792,11 @@ class BasicMemoryAgent(AgentInterface):
                     "type": "web_search_marker",
                     "text": f"\n🔗 *Web取得: {url[:120] or '...'}*\n",
                 }
-                result = await web_fetch(
-                    url, max_chars=int(cfg.get("max_fetch_chars", 20000) or 20000)
+                result = format_fetch_result(
+                    await web_fetch(
+                        url,
+                        max_chars=int(cfg.get("max_fetch_chars", 20000) or 20000),
+                    )
                 )
         elif name in self._ALARM_TOOL_NAMES:
             marker, result = await self._run_alarm_tool(name, args)
@@ -4802,7 +4822,12 @@ class BasicMemoryAgent(AgentInterface):
             "message": {
                 "role": "tool",
                 "tool_call_id": tc.id,
-                "content": json.dumps(result, ensure_ascii=False),
+                # str passthrough: formatted web results are already text.
+                "content": (
+                    result
+                    if isinstance(result, str)
+                    else json.dumps(result, ensure_ascii=False)
+                ),
             },
         }
 
