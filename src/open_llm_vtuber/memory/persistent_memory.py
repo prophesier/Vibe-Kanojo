@@ -412,6 +412,24 @@ class PersistentMemoryManager:
         # Frozen diaries-block snapshot, same discipline and lifecycle as the
         # facts snapshot above (rendered string — no downstream consumers).
         self._diaries_snapshot: Optional[str] = None
+        # The frozen header is also persisted to disk at freeze time, and a
+        # --resume boot RELOADS it instead of re-reading live facts.json
+        # (あさひ 09-02): mid-session fact writes changed the rebuilt header
+        # on resume and busted the whole prefix cache — resume means "same
+        # session", so it must mean "same bytes". Fresh boots overwrite the
+        # file; a missing/corrupt file degrades to a live freeze (one-time
+        # rewrite, logged). Lives OUTSIDE the conf dir — the excerpts.json /
+        # _model_map.json precedent — on top of get_history_list's uid
+        # allowlist: session scanners must never even see it.
+        self._resume_boot = os.environ.get("OLV_RESUME") == "1"
+        self._header_snapshot_path = os.path.join(
+            "chat_history", f"_prompt_header_snapshot_{conf_uid}.json"
+        )
+        # Read once and cached: the facts half freezes (and re-persists the
+        # file) before the diaries half is even asked for, so the diaries
+        # restore must NOT re-read the just-overwritten file.
+        self._resume_snap_loaded = False
+        self._resume_snap: Optional[Dict[str, Any]] = None
         os.makedirs(self._diaries_dir, exist_ok=True)
         # Run the importance migrations unconditionally (not only when facts
         # RAG is on) so the llm→high rename reaches every setup.
@@ -495,11 +513,22 @@ class PersistentMemoryManager:
         context, and diary RAG excludes in-window sessions anyway.
         """
         if self._diaries_snapshot is None:
-            self._diaries_snapshot = self._render_diaries_prompt()
-            logger.info(
-                "[memory] diaries header frozen for this session "
-                f"({len(self._diaries_snapshot)} chars)."
-            )
+            if self._resume_boot:
+                snap = self._resume_header_snapshot()
+                restored = snap.get("diaries_prompt") if snap else None
+                if isinstance(restored, str):
+                    self._diaries_snapshot = restored
+                    logger.info(
+                        "[memory] diaries header restored from resume "
+                        f"snapshot ({len(restored)} chars)."
+                    )
+            if self._diaries_snapshot is None:
+                self._diaries_snapshot = self._render_diaries_prompt()
+                logger.info(
+                    "[memory] diaries header frozen for this session "
+                    f"({len(self._diaries_snapshot)} chars)."
+                )
+            self._persist_header_snapshot()
         return self._diaries_snapshot
 
     def _render_diaries_prompt(self) -> str:
@@ -635,6 +664,44 @@ class PersistentMemoryManager:
             if (f.get("importance") or "low") in ("user", "high", "llm")
         ]
 
+    def _persist_header_snapshot(self) -> None:
+        """Best-effort atomic write of the frozen header (facts + diaries).
+
+        Called whenever either half freezes; the file always describes the
+        session currently on the wire, which is exactly what a --resume boot
+        needs back. Never raises."""
+        try:
+            data = {
+                "frozen_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "facts": self._header_snapshot,
+                "diaries_prompt": self._diaries_snapshot,
+            }
+            tmp = self._header_snapshot_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, self._header_snapshot_path)
+        except Exception as e:
+            logger.warning(f"[memory] header snapshot persist failed: {e}")
+
+    def _load_header_snapshot(self) -> Optional[Dict[str, Any]]:
+        """The persisted frozen header, or None (missing/corrupt — logged)."""
+        try:
+            with open(self._header_snapshot_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else None
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.warning(f"[memory] header snapshot unreadable: {e}")
+            return None
+
+    def _resume_header_snapshot(self) -> Optional[Dict[str, Any]]:
+        """The pre-restart frozen header on a --resume boot, loaded once."""
+        if not self._resume_snap_loaded:
+            self._resume_snap_loaded = True
+            self._resume_snap = self._load_header_snapshot()
+        return self._resume_snap
+
     def _header_facts_frozen(self) -> List[Dict[str, Any]]:
         """Header facts, captured once and reused for the whole session.
 
@@ -651,11 +718,27 @@ class PersistentMemoryManager:
         cache, 08-07).
         """
         if self._header_snapshot is None:
-            self._header_snapshot = [dict(f) for f in self._header_facts()]
-            logger.info(
-                f"[memory] facts header frozen for this session "
-                f"({len(self._header_snapshot)} fact(s))."
-            )
+            if self._resume_boot:
+                snap = self._resume_header_snapshot()
+                if snap and isinstance(snap.get("facts"), list):
+                    self._header_snapshot = [dict(f) for f in snap["facts"]]
+                    logger.info(
+                        "[memory] facts header restored from resume snapshot "
+                        f"({len(self._header_snapshot)} fact(s), frozen_at="
+                        f"{snap.get('frozen_at', '?')}) — byte-stable resume."
+                    )
+                else:
+                    logger.warning(
+                        "[memory] --resume but no usable header snapshot; "
+                        "freezing from live facts (one-time cache rewrite)."
+                    )
+            if self._header_snapshot is None:
+                self._header_snapshot = [dict(f) for f in self._header_facts()]
+                logger.info(
+                    f"[memory] facts header frozen for this session "
+                    f"({len(self._header_snapshot)} fact(s))."
+                )
+            self._persist_header_snapshot()
         return self._header_snapshot
 
     def injected_fact_ids(self) -> Set[str]:
