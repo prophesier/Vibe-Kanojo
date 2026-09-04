@@ -177,7 +177,17 @@ class VectorIndex:
     ) -> None:
         self._store_path = store_path
         self._model = model
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+        # Bounded on purpose (Roadmap item, fixed 09-02): the library default
+        # is a 600s timeout — one wedged TCP stream turned a turn's RAG stage
+        # into an 88s stall during a local-network flap. Embeds normally take
+        # <1s; 8s is generous, one retry covers transient blips, and every
+        # caller already degrades cleanly (skip injection / skip indexing).
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url or None,
+            timeout=8.0,
+            max_retries=1,
+        )
 
         self._ids: List[str] = []
         self._meta: Dict[str, Dict[str, Any]] = {}

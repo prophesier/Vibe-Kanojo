@@ -212,7 +212,14 @@ class MemoryReranker:
         item_label: str = "日記",
         timeout: float = 20.0,
     ) -> None:
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+        # max_retries=0: the per-request timeout below is only a real bound
+        # without the library's default 2 retries (20s × 3 + backoff ≈ 60s+ —
+        # observed as 56s/88s RAG stalls when a flaky local network wedged
+        # individual connections, 09-02). A failed judge degrades to the
+        # score-based fallback for that turn, which is the cheaper failure.
+        self._client = AsyncOpenAI(
+            api_key=api_key, base_url=base_url or None, max_retries=0
+        )
         self._model = model
         self._item = item_label
         self._timeout = timeout
