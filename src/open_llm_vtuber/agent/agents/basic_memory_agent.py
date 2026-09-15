@@ -1718,11 +1718,20 @@ class BasicMemoryAgent(AgentInterface):
         """
         weekdays = ["月", "火", "水", "木", "金", "土", "日"]
         label = "現在進行中のセッション" if is_current else "セッション"
-        suffix = ""
+        # Diary status (あさひ 09-12): she kept re-writing a diary for a
+        # same-day session that already had one, because nothing in the
+        # transcript said so. A past session's diary uid IS its session uid
+        # (diaries/<uid>.json, written by her or by startup backfill, which
+        # covers every past session with messages), so the id is known
+        # without touching disk — no load-time dependency, byte-stable across
+        # a resume even when backfill lands the file after the transcript
+        # was frozen. The in-progress session is by definition unrecorded.
+        diary = "未記録" if is_current else f"記録済み {self._short_diary_id(uid)}"
+        suffix = f"（日記: {diary}）"
         if is_current:
             model = getattr(getattr(self, "_llm", None), "model", "") or ""
             if model:
-                suffix = f" | モデル: {model}"
+                suffix += f" | モデル: {model}"
         parts = uid.split("_")
         if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
             try:
