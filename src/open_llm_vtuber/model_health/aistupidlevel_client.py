@@ -1,28 +1,37 @@
 """Read-only client for aistupidlevel.info's public API (no auth).
 
 Tracks per-model benchmark scores so we can detect degradation the site's own
-alert feed misses. Field shapes confirmed live 2026-07-06:
+alert feed misses. Endpoint reality as of 2026-09-16 — the site moved
+``/dashboard/scores`` and ``/dashboard/alerts`` behind a free API key at
+``/api/v1``; the old paths answer 401 ``api_key_required``, which silently
+killed the monitor from 09-04 until this rewrite:
 
-- ``GET /dashboard/scores?period=latest&sortBy=<combined|coding|reasoning|tooling>``
-  → ``data[]`` of model cards. Score is ``currentScore`` (a blended/uncertainty-
-  weighted estimate; falls back to ``score``); ``status`` ∈ {good, warning,
-  critical}; ``isStale`` marks a repeat of the previous batch (skip it).
-- ``GET /models/{id}/history?period=<7d|30d>`` → points live under the
-  ``history`` key (NOT ``data``); the score field is ``displayScore`` (== the
-  raw per-run "stupidScore"), one ``suite`` ("hourly"). ``currentScore`` from
-  /scores can diverge from the latest ``displayScore`` because it blends more
-  than the hourly suite — so the detector keeps its OWN currentScore series and
-  only bootstraps the baseline from history.
+- ``GET /dashboard/cached?period=<latest|7d>&sortBy=<axis>&analyticsPeriod=<same>``
+  — still keyless (it is what the dashboard page itself renders from) and the
+  ONE request we now make per axis. ``data.modelScores[]`` are the model cards
+  with the same fields the retired ``/dashboard/scores`` returned:
+  ``currentScore``, ``status`` ∈ {excellent, good, warning, critical},
+  ``trend``, ``isStale``, and with ``period=7d`` the aggregates ``periodAvg``
+  / ``stability`` / ``dataPoints`` (``trend`` becomes the 7-day trend).
+  ``data.historyMap[model_id]`` is the per-point timeline the chart plots
+  (newest first; each point carries a ``suite`` — ``hourly`` for
+  combined/coding, ``deep`` for reasoning, ``tooling`` for tooling). The
+  timeline is the same 7-day window whichever ``period`` is asked for; only
+  the card blend differs (``latest`` shows a higher, differently blended
+  score — never mix the two).
+- ``GET /models/{id}/history?period=<7d|30d>`` → points under ``history``
+  (NOT ``data``), score field ``displayScore``; over half of a 7d window is
+  ``[SYNTHETIC]`` backfill. Still keyless; kept for ad-hoc use only.
 - ``GET /dashboard/batch-status`` → ``data.{nextScheduledRun, ...}``.
 
-Model ids move with versions (opus-4-8 was 268, opus-4-6 was 220) — always
-resolve by ``name`` prefix, never hardcode an id.
+Model ids move with versions (opus-4-8 was 268, opus-4-6 was 220, opus-5 is
+281 today) — always resolve by ``name`` prefix, never hardcode an id.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -37,7 +46,7 @@ class AiStupidLevelUnavailable(Exception):
 
 @dataclass
 class ModelScore:
-    """One model card from ``/dashboard/scores`` for a single ``sortBy`` axis."""
+    """One model card (``data.modelScores[]`` of /dashboard/cached) for one axis."""
 
     id: str
     name: str
@@ -123,17 +132,34 @@ class AiStupidLevelClient:
         except Exception as e:  # network, JSON, timeout
             raise AiStupidLevelUnavailable(f"aistupidlevel unreachable: {e}") from e
 
-    async def fetch_scores(
-        self, sort_by: str = "combined", period: str = "latest"
-    ) -> List[ModelScore]:
-        """All model cards for one axis (combined/coding/reasoning/tooling).
+    async def fetch_dashboard(
+        self, sort_by: str = "combined", period: str = "7d"
+    ) -> Tuple[List[ModelScore], Dict[str, List[float]]]:
+        """One axis in one request: ``(model cards, {model_id: [scores]})``.
 
-        ``period="7d"`` additionally returns ``periodAvg`` (the 7-day average
-        currentScore) and ``stability``, and ``trend`` becomes the 7-day trend
-        (more meaningful than the latest-only trend for spotting degradation)."""
-        data = await self._get(f"dashboard/scores?period={period}&sortBy={sort_by}")
-        rows = (data or {}).get("data") or []
-        return [ModelScore.from_json(r) for r in rows if isinstance(r, dict)]
+        Cards come from ``data.modelScores`` (``period="7d"`` adds
+        ``periodAvg``/``stability``/``dataPoints`` and makes ``trend`` the
+        7-day trend — the baseline the detector and the self-check report
+        want); the series from ``data.historyMap`` (see
+        _series_from_history_map). Both consumers call this once per axis."""
+        data = await self._get(
+            f"dashboard/cached?period={period}&sortBy={sort_by}"
+            f"&analyticsPeriod={period}"
+        )
+        payload = (data or {}).get("data") or {}
+        cards = [
+            ModelScore.from_json(r)
+            for r in (payload.get("modelScores") or [])
+            if isinstance(r, dict)
+        ]
+        return cards, self._series_from_history_map(payload.get("historyMap") or {})
+
+    async def fetch_scores(
+        self, sort_by: str = "combined", period: str = "7d"
+    ) -> List[ModelScore]:
+        """Cards half of fetch_dashboard (same full request underneath — a
+        caller that also wants the series should call fetch_dashboard)."""
+        return (await self.fetch_dashboard(sort_by, period))[0]
 
     async def fetch_history(
         self, model_id: str, period: str = "7d"
@@ -164,18 +190,21 @@ class AiStupidLevelClient:
         out.sort(key=lambda p: p.timestamp)
         return out
 
-    async def fetch_series(self, sort_by: str = "combined") -> Dict[str, List[float]]:
-        """The real per-model score TIMELINE the dashboard chart plots, keyed by
-        model id. Lives in ``/dashboard/cached`` → ``data.historyMap`` (the plain
-        ``/history`` endpoint is >½ synthetic and diverges). ``sortBy`` selects
-        the axis. Each point has a ``suite`` — we keep the ``hourly`` suite (what
-        the COMBINED/CODING chart shows) when present, else all points (reasoning
-        uses ``deep``, tooling uses ``tooling``). Returns ``{model_id: [scores]}``.
-        """
-        data = await self._get(
-            f"dashboard/cached?period=latest&sortBy={sort_by}&analyticsPeriod=latest"
-        )
-        history_map = ((data or {}).get("data") or {}).get("historyMap") or {}
+    async def fetch_series(
+        self, sort_by: str = "combined", period: str = "7d"
+    ) -> Dict[str, List[float]]:
+        """Series half of fetch_dashboard (same full request underneath)."""
+        return (await self.fetch_dashboard(sort_by, period))[1]
+
+    @staticmethod
+    def _series_from_history_map(
+        history_map: Dict[str, Any],
+    ) -> Dict[str, List[float]]:
+        """``{model_id: [scores]}`` from ``data.historyMap`` — the real per-model
+        TIMELINE the dashboard chart plots (the plain ``/history`` endpoint is
+        >½ synthetic and diverges). Each point has a ``suite``: keep ``hourly``
+        (what the COMBINED/CODING chart shows) when present, else all points
+        (reasoning uses ``deep``, tooling uses ``tooling``)."""
         out: Dict[str, List[float]] = {}
         for mid, pts in history_map.items():
             if not isinstance(pts, list):

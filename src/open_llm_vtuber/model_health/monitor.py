@@ -49,24 +49,21 @@ class DegradationMonitor:
 
     async def _fetch_all(self):
         """Fetch, once per poll and shared across models, the current cards AND
-        the scraped timeline series for all four axes. Returns (cards, series) or
-        (None, None) if the combined axis is unreachable."""
+        the scraped timeline series for all four axes — one /dashboard/cached
+        request per axis (09-16: the separate /dashboard/scores call went
+        behind an API key and had been answering 401 since 09-04). Returns
+        (cards, series) or (None, None) if the combined axis is unreachable."""
         cards: Dict[str, list] = {}
         series: Dict[str, dict] = {}
         for ax in self.AXES:
             try:
-                cards[ax] = await self._asl.fetch_scores(ax, period="7d")
+                cards[ax], series[ax] = await self._asl.fetch_dashboard(ax, period="7d")
             except AiStupidLevelUnavailable as e:
                 if ax == "combined":
-                    logger.warning(f"[model_health] poll skipped (scores): {e}")
+                    logger.warning(f"[model_health] poll skipped (dashboard): {e}")
                     return None, None
-                logger.warning(f"[model_health] {ax} scores unavailable: {e}")
-                cards[ax] = []
-            try:
-                series[ax] = await self._asl.fetch_series(ax)
-            except AiStupidLevelUnavailable as e:
-                logger.warning(f"[model_health] {ax} series unavailable: {e}")
-                series[ax] = {}
+                logger.warning(f"[model_health] {ax} axis unavailable: {e}")
+                cards[ax], series[ax] = [], {}
         return cards, series
 
     def _assemble(self, name, cards, series) -> Optional[dict]:

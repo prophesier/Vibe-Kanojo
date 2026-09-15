@@ -69,14 +69,13 @@ async def build_assessment(
     try:
         for ax in _AXES:
             try:
-                card = AiStupidLevelClient.find(
-                    await asl.fetch_scores(ax, period="7d"), model_name
-                )
-                series = (await asl.fetch_series(ax)).get(card.id, []) if card else []
+                cards, series_map = await asl.fetch_dashboard(ax, period="7d")
             except AiStupidLevelUnavailable:
                 continue
+            card = AiStupidLevelClient.find(cards, model_name)
             if not card:
                 continue
+            series = series_map.get(card.id, [])
             a.axes[ax] = Detector.axis_stats(
                 card.current_score, card.status, card.trend, series
             )
