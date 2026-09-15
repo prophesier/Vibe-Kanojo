@@ -161,7 +161,6 @@ class BasicMemoryAgent(AgentInterface):
         # NEXT outgoing user message the same persist-not-ephemeral way as the
         # RAG blocks (stored == sent, never assistant-role), so results stay
         # visible across turns without teaching the model to imitate them.
-        self._steam_pending_blocks: List[str] = []
 
         # Character self-service memory tools (memory_* CRUD on facts + search
         # over facts/diaries). Gated on config (set_memory_tools_enabled) AND
@@ -1001,10 +1000,7 @@ class BasicMemoryAgent(AgentInterface):
         "[Steam] A snapshot of the library overview is already in this system "
         "prompt. For detailed lookups, store searches, and finding "
         "recommendations, use the steam_* tools — and when recommending a game "
-        "from the store, always pick from the tool results.\n"
-        "A copy of tool results may persist at the head of the next user "
-        "message as a '【Steamデータ】' block — that is not something the user "
-        "said."
+        "from the store, always pick from the tool results."
     )
 
     # When-to-use only; the two-phase delete flow and tier rules live in the
@@ -1821,7 +1817,6 @@ class BasicMemoryAgent(AgentInterface):
         self._bp_anchor_turn_start = None
         self._session_injected_fact_ids = set()
         self._pending_facts_block = ""
-        self._steam_pending_blocks = []
         self._pending_memory_deletes = {}
         # Reset banner state; will be set True below if the current
         # session already has messages here, or later by _add_message
@@ -2043,17 +2038,11 @@ class BasicMemoryAgent(AgentInterface):
         # outgoing payload, above the user's actual text. It is NOT passed to
         # _add_message below, so _memory — and therefore the persisted history
         # and the cache prefix — stay clean (see _maybe_inject_diary_rag).
-        # Diary block first, then the facts block (independent subsystem), then
-        # any pending Steam tool-result blocks (staged by _run_steam_tool during
-        # earlier turns), then the user's actual text. All ride only on the
-        # outgoing payload — which is then stored verbatim (stored == sent).
-        steam_blocks = self._steam_pending_blocks
-        self._steam_pending_blocks = []
+        # Diary block first, then the facts block (independent subsystem),
+        # then the user's actual text. All ride only on the outgoing
+        # payload — which is then stored verbatim (stored == sent).
         rag_block = "\n\n".join(
-            b
-            for b in (self._pending_rag_block, self._pending_facts_block)
-            + tuple(steam_blocks)
-            if b
+            b for b in (self._pending_rag_block, self._pending_facts_block) if b
         )
         self._pending_rag_block = ""
         self._pending_facts_block = ""
@@ -5017,9 +5006,11 @@ class BasicMemoryAgent(AgentInterface):
         """Execute one steam_* tool call. Returns (marker_text|None, result_dict).
 
         Never raises: SteamUnavailable (and anything else) is converted into a
-        Japanese, actionable error dict. On success the result is also staged
-        as a compact 【Steamデータ】 block folded into the NEXT outgoing user
-        message (cross-turn visibility; see _stage_steam_block)."""
+        Japanese, actionable error dict. Results reach later turns through the
+        protocol replay like every other tool's (the 07-08 【Steamデータ】 copy
+        folded into the next user message was retired 09-15: the ~500-token
+        replay cap keeps more than its 1200-char JSON clip did, so it only
+        duplicated data — and vanished with the message on a turn rollback)."""
         self._turn_inproc_calls.append(name)
         if (
             not self._steam_enabled
@@ -5070,8 +5061,6 @@ class BasicMemoryAgent(AgentInterface):
                 "message": "Steamデータの処理中に内部エラーが起きた。再試行してよい。",
             }
             return self._steam_marker(name, args, result), result
-        if result.get("status") == "ok":
-            self._stage_steam_block(name, args, result)
         return self._steam_marker(name, args, result), result
 
     @staticmethod
@@ -5531,30 +5520,6 @@ class BasicMemoryAgent(AgentInterface):
             return _finish(rows, {"section": "specials"})
 
         return {"status": "error", "message": f"不明なmode: {mode!r}"}
-
-    def _stage_steam_block(
-        self, tool: str, args: Dict[str, Any], result: Dict[str, Any]
-    ) -> None:
-        """Stage a compact plain-text copy of a successful steam tool result.
-
-        The blocks are folded into the NEXT outgoing user message by
-        _to_messages (persist-not-ephemeral, exactly like the RAG blocks:
-        stored == sent, never assistant-role), so the data stays visible
-        across turns without the model learning to imitate tool output."""
-        try:
-            arg_desc = json.dumps(args or {}, ensure_ascii=False)[:120]
-            body = json.dumps(result, ensure_ascii=False)
-            if len(body) > 1200:
-                body = body[:1200] + "…"
-            self._steam_pending_blocks.append(
-                f"【Steamデータ】(tool={tool}, args={arg_desc})\n{body}"
-            )
-            # Bound the buffer: chained calls in one turn (or an interrupted
-            # turn) must not balloon the next user message.
-            if len(self._steam_pending_blocks) > 6:
-                self._steam_pending_blocks = self._steam_pending_blocks[-6:]
-        except Exception as e:
-            logger.warning(f"[steam] failed to stage cross-turn block: {e}")
 
     # ------------------------------------------------------------------
     # Memory self-service tools (in-process, provider-agnostic)
