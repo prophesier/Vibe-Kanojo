@@ -399,7 +399,12 @@ class ServiceContext:
                 )
                 logger.warning("[steam] no snapshot available; using fallback digest.")
             # Must happen before the first turn — the digest joins the cached
-            # system-prompt prefix and must never change mid-session.
+            # system-prompt prefix and must never change mid-session. It is
+            # frozen with the facts/diaries header so a --resume boot mounts
+            # the pre-restart bytes instead of a freshly built digest (09-12).
+            mm = getattr(self, "memory_manager", None)
+            if mm is not None and hasattr(mm, "freeze_steam_digest"):
+                digest = mm.freeze_steam_digest(digest)
             agent.set_steam_runtime(client, snapshot_mgr, digest)
             logger.info("[steam] agent wired: 4 steam_* tools + resident digest.")
 

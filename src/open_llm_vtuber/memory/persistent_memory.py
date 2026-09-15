@@ -430,6 +430,12 @@ class PersistentMemoryManager:
         # restore must NOT re-read the just-overwritten file.
         self._resume_snap_loaded = False
         self._resume_snap: Optional[Dict[str, Any]] = None
+        # Third tenant of the frozen block: the Steam library digest shares
+        # the facts+diaries cache block, and playtime moves while a session
+        # runs — a resume that rebuilt it from the live snapshot missed the
+        # whole block and everything behind it (09-12: read 12k, write 115k,
+        # digest 933→954 chars). Frozen through freeze_steam_digest().
+        self._steam_digest_snapshot: Optional[str] = None
         os.makedirs(self._diaries_dir, exist_ok=True)
         # Run the importance migrations unconditionally (not only when facts
         # RAG is on) so the llm→high rename reaches every setup.
@@ -675,6 +681,7 @@ class PersistentMemoryManager:
                 "frozen_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "facts": self._header_snapshot,
                 "diaries_prompt": self._diaries_snapshot,
+                "steam_digest": getattr(self, "_steam_digest_snapshot", None),
             }
             tmp = self._header_snapshot_path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
@@ -701,6 +708,41 @@ class PersistentMemoryManager:
             self._resume_snap_loaded = True
             self._resume_snap = self._load_header_snapshot()
         return self._resume_snap
+
+    def freeze_steam_digest(self, digest: str) -> str:
+        """Freeze the Steam library digest for this session and return the
+        text the agent must actually mount.
+
+        The digest sits in the same cached system block as the facts and
+        diaries headers, so it obeys the same rule: one value per session,
+        byte-identical across a --resume. A fresh boot freezes the live
+        digest; a resume boot returns the one persisted with the header
+        snapshot (playtime that accrued mid-session is picked up by the next
+        FRESH boot, exactly like facts.json edits). A resume whose snapshot
+        predates this field degrades to the live digest with a warning —
+        one rewrite, then the file carries it. Persists immediately when the
+        header halves already froze (Steam wiring normally finishes before
+        the first turn, but an overdue alarm can fire first)."""
+        live = (digest or "").strip()
+        chosen = live
+        if self._resume_boot:
+            snap = self._resume_header_snapshot()
+            restored = snap.get("steam_digest") if snap else None
+            if isinstance(restored, str) and restored.strip():
+                chosen = restored
+                logger.info(
+                    "[steam] digest restored from resume snapshot "
+                    f"({len(chosen)} chars; live build was {len(live)} chars)."
+                )
+            else:
+                logger.warning(
+                    "[steam] --resume but the header snapshot carries no "
+                    "digest; freezing the live one (one-time cache rewrite)."
+                )
+        self._steam_digest_snapshot = chosen
+        if self._header_snapshot is not None or self._diaries_snapshot is not None:
+            self._persist_header_snapshot()
+        return chosen
 
     def _header_facts_frozen(self) -> List[Dict[str, Any]]:
         """Header facts, captured once and reused for the whole session.
