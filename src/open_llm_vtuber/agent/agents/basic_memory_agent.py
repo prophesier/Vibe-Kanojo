@@ -1515,6 +1515,15 @@ class BasicMemoryAgent(AgentInterface):
     # for one placement (worst case: one avoidable full messages-region
     # rewrite, the 08-16 failure shape).
     _bp_anchor_turn_start: Optional[int] = None
+    # Retrieval/banner state as of the START of the current turn (snapshot in
+    # chat_with_memory, before retrieval runs). The same failure exits restore
+    # it: retrieval marks its picks as in-context BEFORE the request is sent,
+    # and a discarded turn takes the block out of _memory with the user
+    # message — without the rollback those facts never re-surface this
+    # session and the diary sentences stay 既出 for text the model never saw
+    # (あさひ 09-15; 53 excluded turns since 08-05 had orphaned 18 facts and
+    # 46 diary sentences). None until the first turn / after a rollback.
+    _turn_start_state: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _wire_blocks(message: Dict[str, Any]) -> int:
@@ -3374,6 +3383,10 @@ class BasicMemoryAgent(AgentInterface):
             self._diary_reads_this_turn = 0
             # Stale seeds must not leak into an unrelated turn's store.
             self._last_thinking_seed = None
+            # Turn-start snapshot for the failure exits (see _turn_start_state):
+            # taken before retrieval, which marks its picks as in-context
+            # before the request is even sent.
+            self._snapshot_turn_state()
 
             await self._inject_memory_rags(input_data)
             messages = self._to_messages(input_data)
@@ -3744,6 +3757,36 @@ class BasicMemoryAgent(AgentInterface):
             or cls._uber_tool_marker(tool_name, content)
         )
 
+    def _snapshot_turn_state(self) -> None:
+        """Capture the per-turn state the failure exits roll back (see
+        _turn_start_state). Taken before retrieval so it predates every
+        mutation a turn can make: RAG dedup (diary ledger, injected fact
+        ids), tool-loop marks (memory_read_diary full reads, uber facts),
+        the first-message session banner flag and the time-banner
+        baselines. Cheap: the ledger holds a few dozen rows at most."""
+        self._turn_start_state = {
+            "ledger": deepcopy(getattr(self, "_diary_sent_ledger", {})),
+            "fact_ids": set(getattr(self, "_session_injected_fact_ids", ())),
+            "banner_added": self._current_session_banner_added,
+            "last_dt": getattr(self, "_last_message_dt", None),
+            "last_user_dt": getattr(self, "_last_user_message_dt", None),
+        }
+
+    def _rollback_turn_state(self) -> None:
+        """Discarded turn: restore the cache anchor (see
+        _bp_anchor_turn_start) and everything _snapshot_turn_state captured.
+        Callers have already popped the user message from _memory."""
+        self._bp_wire_anchor = self._bp_anchor_turn_start
+        s = self._turn_start_state
+        if s is None:
+            return
+        self._diary_sent_ledger = s["ledger"]
+        self._session_injected_fact_ids = s["fact_ids"]
+        self._current_session_banner_added = s["banner_added"]
+        self._last_message_dt = s["last_dt"]
+        self._last_user_message_dt = s["last_user_dt"]
+        self._turn_start_state = None
+
     def _handle_api_error_turn(self, error_message: str) -> str:
         """Clean up after an API error and build the visible notice.
 
@@ -3767,10 +3810,10 @@ class BasicMemoryAgent(AgentInterface):
             short = short[:160] + "…"
         if self._memory and self._memory[-1].get("role") == "user":
             self._memory.pop()
-        # Discarded turn → the cache anchor advanced for wire blocks that no
-        # longer exist; roll it back to the turn-start snapshot (see
-        # _bp_anchor_turn_start).
-        self._bp_wire_anchor = self._bp_anchor_turn_start
+        # Discarded turn → roll the cache anchor and the retrieval/banner
+        # state back to their turn-start snapshots (see _bp_anchor_turn_start
+        # and _turn_start_state).
+        self._rollback_turn_state()
         marked_disk = False
         try:
             if self._conf_uid and self._history_uid:
@@ -3814,8 +3857,8 @@ class BasicMemoryAgent(AgentInterface):
         gate — an excluded record is for human eyes only."""
         if self._memory and self._memory[-1].get("role") == "user":
             self._memory.pop()
-        # Same anchor rollback as the API-error exit (see there).
-        self._bp_wire_anchor = self._bp_anchor_turn_start
+        # Same rollback as the API-error exit (see there).
+        self._rollback_turn_state()
         marked_disk = False
         try:
             if self._conf_uid and self._history_uid:
@@ -3854,6 +3897,9 @@ class BasicMemoryAgent(AgentInterface):
         category = info.get("category") or "unknown"
         if self._memory and self._memory[-1].get("role") == "user":
             self._memory.pop()
+        # Same rollback as the API-error exit (see there): this turn's
+        # retrieval marks and anchor advance belong to a message that is gone.
+        self._rollback_turn_state()
         removed_disk = False
         try:
             if self._conf_uid and self._history_uid:
