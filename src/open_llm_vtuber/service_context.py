@@ -270,6 +270,7 @@ class ServiceContext:
         # enrichment task bind to the loop that will actually serve requests.
         # Guarded inside so only the first connection does the work.
         await self._init_steam_runtime()
+        await self._init_weather_runtime()
 
         # Kick off persistent-memory backfill on the live event loop. The
         # class-level in-progress guard makes this safe to call on every
@@ -315,6 +316,38 @@ class ServiceContext:
             ran = True  # facts won't change further; don't block the bot forever
         if ran:
             mark_backfill_settled(conf_uid=conf_uid)
+
+    async def _init_weather_runtime(self) -> None:
+        """Hand a WeatherService to the shared agent (the weather tool).
+
+        Cheap at wiring time — no network: the JMA area tables load in a
+        background warm-up so the first call is quick, and lazily if that
+        failed. Wired at most once per agent instance (same check-and-set
+        guard as Steam); a config switch builds a fresh agent and re-wires.
+        Never raises; a failure leaves the tool off."""
+        try:
+            agent = self.agent_engine
+            if agent is None or not hasattr(agent, "set_weather_runtime"):
+                return
+            cfg = getattr(self.config, "weather_config", None)
+            if not cfg or not getattr(cfg, "enabled", False):
+                logger.debug("[weather] disabled (weather_config.enabled is false).")
+                return
+            if getattr(agent, "_weather_wiring_started", False):
+                return
+            agent._weather_wiring_started = True
+            from .weather import WeatherService
+
+            service = WeatherService(
+                home=getattr(cfg, "home", "") or "",
+                open_meteo_fallback=bool(getattr(cfg, "open_meteo_fallback", True)),
+                home_hint=getattr(cfg, "home_hint", "") or "",
+            )
+            agent.set_weather_runtime(service)
+            asyncio.create_task(service.warmup())
+            logger.info("[weather] agent wired: weather tool (JMA + Open-Meteo).")
+        except Exception as e:
+            logger.error(f"[weather] wiring failed; tool stays off: {e}")
 
     async def _init_steam_runtime(self) -> None:
         """Build the Steam client + startup snapshot and hand them to the agent.
@@ -833,6 +866,7 @@ class ServiceContext:
                 # A config switch may have built a fresh agent (which lacks the
                 # steam runtime); re-wire it here on the live loop.
                 await self._init_steam_runtime()
+                await self._init_weather_runtime()
                 logger.debug(f"New config: {self}")
                 logger.debug(
                     f"New character config: {redact_secrets(self.character_config.model_dump())}"

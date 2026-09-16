@@ -712,3 +712,18 @@ steam_config:
   achievements_top_n: 40
   # 快照增强时，为游玩时长前 N 的游戏抓取商店页社区标签。
   tags_top_n: 40
+
+# 天气工具：通过气象厅（気象庁）的免密钥 JSON 获取预报、实况和注意报；
+# 地名检索与日本以外的地点走 Open-Meteo。无需任何 API 密钥。
+weather_config:
+  # 启用进程内天气工具。
+  enabled: false
+  # 默认地区（日语），不指定地点时使用（如 "東京都中央区"、"箱根町"）。
+  # 市区町村名在多个县重名时请带上都道府県。
+  home: ""
+  # 工具向模型描述默认地区的说法，如 "home/school (Tokyo area)"——常去的地方
+  # 共用一份预报时写明，免得模型逐个地点分别查询。留空 = "the user's home"。
+  home_hint: ""
+  # 地名不在气象厅区域表里时改用 Open-Meteo 地名检索
+  # （日本以外的地点直接用 Open-Meteo 的模式预报）。
+  open_meteo_fallback: true

@@ -156,6 +156,13 @@ class BasicMemoryAgent(AgentInterface):
         self._steam_snapshot_mgr = None  # steam.SnapshotManager
         self._steam_digest = ""
         self._steam_snapshot_cache: Optional[Dict[str, Any]] = None
+
+        # Weather tool (in-process; JMA bosai JSON + Open-Meteo). Set via
+        # set_weather_runtime(); no resident prompt block, so wiring time is
+        # free of cache concerns. Same check-and-set guard shape as Steam.
+        self._weather_service = None  # weather.WeatherService
+        self._weather_enabled = False
+        self._weather_wiring_started = False
         self._steam_snapshot_loaded_at: float = 0.0
         # Compact copies of successful steam tool results. Folded into the
         # NEXT outgoing user message the same persist-not-ephemeral way as the
@@ -484,6 +491,11 @@ class BasicMemoryAgent(AgentInterface):
     # (per-round cap); the next stored user payload carries
     # _THINKING_DROP_NOTICE. Class-level default for __new__-built tests.
     _pending_thinking_drop_notice = False
+    # Weather tool runtime (set via set_weather_runtime); class-level
+    # defaults so __new__-built test agents read 'off' instead of raising.
+    _weather_enabled = False
+    _weather_service = None
+    _weather_wiring_started = False
 
     def pop_context_excluded(self) -> Optional[str]:
         """One-shot getter for the just-completed turn's context_excluded tag.
@@ -851,6 +863,12 @@ class BasicMemoryAgent(AgentInterface):
             f"[steam] agent runtime set (enabled={self._steam_enabled}, "
             f"digest={len(self._steam_digest)} chars)."
         )
+
+    def set_weather_runtime(self, service) -> None:
+        """Attach the WeatherService, enabling the in-process weather tool."""
+        self._weather_service = service
+        self._weather_enabled = service is not None
+        logger.info(f"[weather] agent runtime set (enabled={self._weather_enabled}).")
 
     def set_memory_tools_enabled(self, enabled: bool) -> None:
         """Turn the character's memory_* self-service tools on/off (config).
@@ -2804,6 +2822,8 @@ class BasicMemoryAgent(AgentInterface):
                     inproc_names.add(self._MODEL_HEALTH_TOOL_NAME)
                 if self._steam_enabled:
                     inproc_names.update(self._STEAM_TOOL_NAMES)
+                if self._weather_enabled:
+                    inproc_names.add(self._WEATHER_TOOL_NAME)
                 if self._memory_tools_active:
                     inproc_names.update(self._MEMORY_TOOL_NAMES)
                 if getattr(self._llm, "_enable_web_fetch", False):
@@ -2836,6 +2856,10 @@ class BasicMemoryAgent(AgentInterface):
                     elif cname in self._STEAM_TOOL_NAMES:
                         marker, result = await self._run_steam_tool(
                             cname, c.get("input") or {}
+                        )
+                    elif cname == self._WEATHER_TOOL_NAME:
+                        marker, result = await self._run_weather_tool(
+                            c.get("input") or {}
                         )
                     elif cname in self._MEMORY_TOOL_NAMES:
                         marker, result = await self._run_memory_tool(
@@ -3403,6 +3427,8 @@ class BasicMemoryAgent(AgentInterface):
                     claude_tools.extend(self._build_model_health_tools_claude())
                 if self._steam_enabled:
                     claude_tools.extend(self._build_steam_tools_claude())
+                if self._weather_enabled:
+                    claude_tools.extend(self._build_weather_tools_claude())
                 if self._memory_tools_active:
                     claude_tools.extend(self._build_memory_tools_claude())
                 if getattr(self._llm, "_enable_web_fetch", False):
@@ -3611,6 +3637,8 @@ class BasicMemoryAgent(AgentInterface):
             tools.extend(self._build_model_health_tools_openai())
         if self._steam_enabled:
             tools.extend(self._build_steam_tools_openai())
+        if self._weather_enabled:
+            tools.extend(self._build_weather_tools_openai())
         if self._memory_tools_active:
             tools.extend(self._build_memory_tools_openai())
         return tools
@@ -4412,6 +4440,76 @@ class BasicMemoryAgent(AgentInterface):
             },
         ]
 
+    def _build_weather_tools_openai(self) -> List[Dict[str, Any]]:
+        """OpenAI schema for the in-process weather tool (JMA + Open-Meteo).
+
+        The "omit area for …" hint comes from weather_config.home_hint so a
+        user whose usual places share one forecast column can say so
+        (あさひ 09-16: home and school are both 東京地方 — without the hint
+        the model would query them one after the other)."""
+        hint = getattr(self._weather_service, "home_hint", "") or "the user's home"
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "weather",
+                    "description": (
+                        "Weather report from the Japan Meteorological Agency "
+                        "as compact Japanese text: current conditions, "
+                        "today/tomorrow, weekly outlook, advisories. Use it "
+                        f"whenever the weather is needed. Omit area for {hint}."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "area": {
+                                "type": "string",
+                                "description": (
+                                    "Japanese place name, e.g. 箱根町 / 京都市. "
+                                    f"Omit for {hint}. If asked to clarify, "
+                                    "prefix the prefecture (広島県府中市)."
+                                ),
+                            }
+                        },
+                        "required": [],
+                    },
+                },
+            }
+        ]
+
+    def _build_weather_tools_claude(self) -> List[Dict[str, Any]]:
+        return self._to_claude_schema(self._build_weather_tools_openai())
+
+    async def _run_weather_tool(self, args: Dict[str, Any]) -> tuple:
+        """Execute the weather tool. Returns (marker_text|None, result).
+
+        Success hands the compact Japanese report back as plain text (str
+        passthrough, like web_fetch — dumping it as JSON would escape every
+        newline); failures and clarification requests are dicts. Never
+        raises."""
+        self._turn_inproc_calls.append(self._WEATHER_TOOL_NAME)
+        area = str((args or {}).get("area") or "").strip()
+        if not self._weather_enabled or self._weather_service is None:
+            return None, {
+                "status": "error",
+                "message": "天気機能は現在利用できない（未設定）。",
+            }
+        try:
+            res = await self._weather_service.describe(area or None)
+        except Exception as e:  # the service already guards; belt and braces
+            logger.exception(f"[weather] tool failed: {e}")
+            res = {
+                "status": "error",
+                "message": "天気データの処理中に内部エラーが起きた。",
+            }
+        label = f"天気: {self._clip_marker(res.get('area') or area or '自宅')}"
+        if res.get("status") not in ("ok", "need_clarification"):
+            label += "(失敗)"
+        marker = f"\n🌤 *{label}*\n"
+        if res.get("status") == "ok":
+            return marker, res.get("text", "")
+        return marker, res
+
     def _build_steam_tools_claude(self) -> List[Dict[str, Any]]:
         return self._to_claude_schema(self._build_steam_tools_openai())
 
@@ -4854,6 +4952,10 @@ class BasicMemoryAgent(AgentInterface):
             marker, result = await self._run_steam_tool(name, args)
             if marker:
                 yield {"type": "tool_marker", "text": marker}
+        elif name == self._WEATHER_TOOL_NAME:
+            marker, result = await self._run_weather_tool(args)
+            if marker:
+                yield {"type": "tool_marker", "text": marker}
         elif name in self._MEMORY_TOOL_NAMES:
             marker, result = await self._run_memory_tool(name, args)
             if marker:
@@ -4877,6 +4979,7 @@ class BasicMemoryAgent(AgentInterface):
 
     _ALARM_TOOL_NAMES = ("set_alarm", "list_alarms", "cancel_alarm")
     _MODEL_HEALTH_TOOL_NAME = "check_model_status"
+    _WEATHER_TOOL_NAME = "weather"
     _STEAM_TOOL_NAMES = (
         "steam_library",
         "steam_search",

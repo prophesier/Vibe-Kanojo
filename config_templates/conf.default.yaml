@@ -780,3 +780,20 @@ steam_config:
   # Fetch store-page community tags for this many top-playtime games during
   # snapshot enrichment.
   tags_top_n: 40
+
+# Weather tool: Japan Meteorological Agency (気象庁) forecasts, observations
+# and advisories via its keyless JSON; Open-Meteo for place lookup and for
+# places outside Japan. No API key needed.
+weather_config:
+  # Enable the in-process weather tool.
+  enabled: false
+  # Home area in Japanese, used when no place is named (e.g. "東京都中央区",
+  # "箱根町"). Prefix the prefecture if the name exists in several prefectures.
+  home: ""
+  # How the tool describes the default area to the model, e.g.
+  # "home/school (Tokyo area)" when your usual places share one forecast
+  # (stops it querying each place separately). Empty = "the user's home".
+  home_hint: ""
+  # Look up places missing from the JMA table with Open-Meteo geocoding
+  # (places outside Japan get Open-Meteo's own model forecast).
+  open_meteo_fallback: true

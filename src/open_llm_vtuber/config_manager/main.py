@@ -8,6 +8,7 @@ from .live import LiveConfig
 from .discord import DiscordConfig
 from .model_health import ModelHealthConfig
 from .steam import SteamConfig
+from .weather import WeatherConfig
 from .i18n import I18nMixin, Description
 
 
@@ -26,6 +27,9 @@ class Config(I18nMixin, BaseModel):
         default=ModelHealthConfig(), alias="model_health_config"
     )
     steam_config: SteamConfig = Field(default=SteamConfig(), alias="steam_config")
+    weather_config: WeatherConfig = Field(
+        default=WeatherConfig(), alias="weather_config"
+    )
 
     DESCRIPTIONS: ClassVar[Dict[str, Description]] = {
         "system_config": Description(
@@ -47,5 +51,9 @@ class Config(I18nMixin, BaseModel):
         "steam_config": Description(
             en="Steam integration settings (storefront + library reading)",
             zh="Steam 集成配置（商店 + 库读取）",
+        ),
+        "weather_config": Description(
+            en="Weather tool settings (JMA + Open-Meteo, keyless)",
+            zh="天气工具配置（气象厅 + Open-Meteo，无需密钥）",
         ),
     }

@@ -532,6 +532,7 @@ TOOL_MARKER_RE = re.compile(
     r"|⏰[ \t]*\*Alarm[^*\n]*\*"
     r"|🧠[ \t]*\*自己診断[^*\n]*\*"
     r"|🎮[ \t]*\*Steam[^*\n]*\*"
+    r"|🌤[ \t]*\*天気[^*\n]*\*"
     # 記憶◯◯ plus the diary ops (日記閲覧/日記記入) — the 記憶-only anchor
     # let diary markers slip through to the replay (caught by あさひ 08-14)
     r"|📝[ \t]*\*(?:記憶|日記)[^*\n]*\*"
