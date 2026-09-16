@@ -36,6 +36,30 @@ SESSION_FILE = HERE / "uber_session.json"
 _BASE = "https://www.ubereats.com/_p/api"
 _LOCALE = "jp"
 _CALL_TIMEOUT_MS = 15000  # per API call; well under the MCP client's read timeout
+# Cloudflare (2026-09-14/15): the API now sits behind bot management. Only
+# requests issued by a real Chrome network stack pass, and only after the
+# site's "JS detections" beacon (cdn-cgi/challenge-platform/h/…) has run in
+# that browser session — so every call first loads one HTML page, waits for
+# the beacon, then POSTs from inside the page. See _call.
+_WARM_URL = "https://www.ubereats.com/jp"
+_WARM_TIMEOUT_MS = 30000
+_JSD_WAIT_S = 8.0
+# Headers Chrome must set itself for an in-page fetch: forcing them makes
+# the client-hint consistency check fail (headless UA → 403 even with the
+# clearance cookie; the UA goes in via --user-agent instead).
+_BROWSER_OWNED = frozenset(
+    {
+        "user-agent",
+        "sec-ch-ua",
+        "sec-ch-ua-mobile",
+        "sec-ch-ua-platform",
+        "accept-language",
+    }
+)
+_FETCH_JS = """async ({url, headers, body}) => {
+  const r = await fetch(url, {method: 'POST', headers, body, credentials: 'include'});
+  return {status: r.status, cf: r.headers.get('cf-mitigated'), text: await r.text()};
+}"""
 
 # Header keys worth replaying (stable auth/session/location). x-uber-request-id
 # is regenerated per call; cookies are supplied by the context, not here.
@@ -386,6 +410,39 @@ _CATEGORY_MERCHANT_TYPES = {
 }
 
 
+async def _drop_location_cookie(ctx) -> None:
+    """Remove any persisted ``uev2.loc`` from the profile (best-effort)."""
+    try:
+        await ctx.clear_cookies(name="uev2.loc")
+    except Exception:
+        pass
+
+
+async def _warm_up(page) -> None:
+    """Load one HTML page and wait (bounded) for Cloudflare's JS-detection
+    beacon to complete, which is what makes the following in-page API call
+    acceptable. A challenge page that never completes just falls through:
+    the call then returns the 403 that _call reports as a Cloudflare block."""
+    loop = asyncio.get_running_loop()
+    beacon = loop.create_future()
+
+    def _on_response(resp) -> None:
+        if "cdn-cgi/challenge-platform/h/" in resp.url and not beacon.done():
+            beacon.set_result(True)
+
+    page.on("response", _on_response)
+    try:
+        await page.goto(
+            _WARM_URL, wait_until="domcontentloaded", timeout=_WARM_TIMEOUT_MS
+        )
+        try:
+            await asyncio.wait_for(beacon, timeout=_JSD_WAIT_S)
+        except asyncio.TimeoutError:
+            pass
+    finally:
+        page.remove_listener("response", _on_response)
+
+
 class UberEatsClient:
     def __init__(self, headless: bool = True) -> None:
         self._headless = headless
@@ -419,58 +476,104 @@ class UberEatsClient:
         """Open a browser context, make ONE API call, close it. Opening per call
         (instead of keeping a context warm) means we never hold the profile lock
         between calls — no lingering browser, no zombie if the server is killed,
-        and login.py / probes can run without first stopping OLV. Costs ~1s of
-        launch per call, fine for occasional browsing. Uses bundled Chromium (not
-        channel=chrome) so it never conflicts with the user's everyday Chrome;
-        bot detection is irrelevant here since we only make API calls, no page
-        render. The lock serialises concurrent calls in this process.
+        and login.py / probes can run without first stopping OLV. The lock
+        serialises concurrent calls in this process.
+
+        2026-09-16 (あさひ: "still cut off" after a fresh login): Cloudflare
+        started challenging the API. Playwright's ``ctx.request`` never was a
+        browser request — it is Node's own fetch with Node's TLS fingerprint —
+        and that is what got blocked (401/403 both read as "session expired",
+        which sent us to login.py for nothing; the session was fine). Every
+        variant of ``ctx.request`` fails (bundled/Chrome/Edge, headed or not).
+        What passes: REAL Chrome (channel="chrome") with a normal user agent
+        (headless Chrome's own "HeadlessChrome" UA is refused), one HTML page
+        loaded so Cloudflare's JS-detection beacon runs, then the POST issued
+        from inside that page. Headless is fine once the UA is overridden.
+        ~2 s per call. Bundled Chromium stays as a launch fallback only.
         """
         async with self._lock:
             headers = dict(self._load_session())
+            ua = headers.get("user-agent", "")
             headers["x-uber-request-id"] = str(uuid.uuid4())
             headers.setdefault("content-type", "application/json")
+            fetch_headers = {
+                k: v for k, v in headers.items() if k.lower() not in _BROWSER_OWNED
+            }
             url = f"{_BASE}/{endpoint}?localeCode={_LOCALE}"
             pw = ctx = None
             try:
+                launch = dict(
+                    user_data_dir=str(PROFILE),
+                    headless=self._headless,
+                    locale="ja-JP",
+                    timezone_id="Asia/Tokyo",
+                    args=["--disable-blink-features=AutomationControlled"]
+                    + ([f"--user-agent={ua}"] if ua else []),
+                    ignore_default_args=["--enable-automation"],
+                )
                 try:
                     pw = await async_playwright().start()
-                    ctx = await pw.chromium.launch_persistent_context(
-                        user_data_dir=str(PROFILE),
-                        headless=self._headless,
-                        locale="ja-JP",
-                        timezone_id="Asia/Tokyo",
-                        args=["--disable-blink-features=AutomationControlled"],
-                        ignore_default_args=["--enable-automation"],
-                    )
+                    try:
+                        ctx = await pw.chromium.launch_persistent_context(
+                            channel="chrome", **launch
+                        )
+                    except Exception:
+                        ctx = await pw.chromium.launch_persistent_context(**launch)
                 except Exception as e:
                     raise UberUnavailable(
                         f"ブラウザの起動に失敗しました（profile使用中かもしれません）: {e}"
                     )
-                loc = _location_cookie(headers)
-                if loc is not None:
-                    try:
-                        await ctx.add_cookies([loc])
-                    except Exception:
-                        pass  # best-effort; the call itself may still succeed
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
                 try:
-                    resp = await ctx.request.post(
-                        url,
-                        headers=headers,
-                        data=json.dumps(body),
-                        timeout=_CALL_TIMEOUT_MS,
+                    # The delivery-location cookie must NOT be present while
+                    # the home page loads: with it the page renders the
+                    # location feed and Cloudflare's beacon never fires, so
+                    # the call sits out the full 8 s wait (09-16). Our own
+                    # injected copy persists in the profile (2033 expiry), so
+                    # clear it first, warm up, inject for the request, and
+                    # clear again on the way out. The API reads cookies per
+                    # request, so the injection point makes no difference to
+                    # the call itself.
+                    await _drop_location_cookie(ctx)
+                    await _warm_up(page)
+                    loc = _location_cookie(headers)
+                    if loc is not None:
+                        try:
+                            await ctx.add_cookies([loc])
+                        except Exception:
+                            pass  # best-effort; the call itself may still succeed
+                    res = await page.evaluate(
+                        _FETCH_JS,
+                        {
+                            "url": url,
+                            "headers": fetch_headers,
+                            "body": json.dumps(body),
+                        },
                     )
+                    await _drop_location_cookie(ctx)
                 except Exception as e:
                     raise UberUnavailable(f"Uberへの接続に失敗しました: {e}")
-                if resp.status in (401, 403):
+                status = int(res.get("status") or 0)
+                text = str(res.get("text") or "")
+                if status in (401, 403):
+                    if (
+                        res.get("cf") == "challenge"
+                        or "Just a moment" in text
+                        or "お待ちください" in text
+                    ):
+                        raise UberUnavailable(
+                            "Cloudflareのボット検証に阻まれた（ログインの問題ではない）。"
+                            "少し待って再試行してほしい。"
+                        )
                     raise UberUnavailable(
                         "Uberのセッションが切れました。login.py で再ログインしてください。"
                     )
-                if resp.status != 200:
+                if status != 200:
                     raise UberUnavailable(
-                        f"Uber APIエラー (status {resp.status})。少し待って再試行してください。"
+                        f"Uber APIエラー (status {status})。少し待って再試行してください。"
                     )
                 try:
-                    data = json.loads(_strip_xssi(await resp.text()))
+                    data = json.loads(_strip_xssi(text))
                 except Exception as e:
                     raise UberUnavailable(f"Uberの応答を解析できませんでした: {e}")
                 inner = data.get("data") if isinstance(data, dict) else None
