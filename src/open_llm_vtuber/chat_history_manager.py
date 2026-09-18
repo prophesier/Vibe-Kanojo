@@ -4,7 +4,7 @@ import json
 import uuid
 import unicodedata
 from datetime import datetime
-from typing import Literal, List, TypedDict, Optional
+from typing import Any, Dict, Literal, List, TypedDict, Optional
 from loguru import logger
 
 
@@ -240,6 +240,53 @@ def mark_last_message_excluded(
         f"context_excluded={reason!r}."
     )
     return True
+
+
+def mark_last_turn_excluded(
+    conf_uid: str, history_uid: str, reason: str
+) -> Optional[Dict[str, Any]]:
+    """Tag the newest COMPLETED exchange — the file's last ``ai`` record and
+    the ``human`` record right before it — with ``context_excluded`` (manual
+    rollback, あさひ 09-18).
+
+    Both records must be the tail of the file and still untagged; anything
+    else (a lone human, an already-excluded pair, an empty file) is a no-op
+    returning None, so a mistimed call can never reach back and void an
+    older exchange. Returns the pair's timestamps and lengths."""
+    if not conf_uid or not history_uid:
+        return None
+    filepath = _get_safe_history_path(conf_uid, history_uid)
+    if not os.path.exists(filepath):
+        return None
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            history_data = json.load(f)
+    except Exception:
+        logger.error(f"Failed to load history file: {filepath}")
+        return None
+    if len(history_data) < 2:
+        return None
+    ai, human = history_data[-1], history_data[-2]
+    if (
+        ai.get("role") != "ai"
+        or human.get("role") != "human"
+        or ai.get("context_excluded")
+        or human.get("context_excluded")
+    ):
+        return None
+    ai["context_excluded"] = reason
+    human["context_excluded"] = reason
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(history_data, f, ensure_ascii=False, indent=2)
+    logger.info(
+        f"Marked last exchange of history {history_uid} context_excluded={reason!r}."
+    )
+    return {
+        "human_ts": human.get("timestamp") or "",
+        "ai_ts": ai.get("timestamp") or "",
+        "human_chars": len(str(human.get("content") or "")),
+        "ai_chars": len(str(ai.get("content") or "")),
+    }
 
 
 def get_metadata(conf_uid: str, history_uid: str) -> dict:

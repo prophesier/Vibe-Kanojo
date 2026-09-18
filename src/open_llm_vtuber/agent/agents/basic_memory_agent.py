@@ -40,6 +40,7 @@ from ...chat_history_manager import (
     get_history,
     get_recent_histories,
     mark_last_message_excluded,
+    mark_last_turn_excluded,
     pop_last_message,
     search_history,
     split_search_keywords,
@@ -3798,6 +3799,13 @@ class BasicMemoryAgent(AgentInterface):
             "banner_added": self._current_session_banner_added,
             "last_dt": getattr(self, "_last_message_dt", None),
             "last_user_dt": getattr(self, "_last_user_message_dt", None),
+            # One-shot "thinking was dropped from replay" notice: _to_messages
+            # spends it into this turn's user payload, so a discarded turn
+            # must hand it back for the next payload to carry.
+            "drop_notice": self._pending_thinking_drop_notice,
+            # Lets a manual rollback prove the snapshot belongs to the very
+            # exchange at the tail of _memory (see rollback_last_turn).
+            "mem_len": len(getattr(self, "_memory", None) or []),
         }
 
     def _rollback_turn_state(self) -> None:
@@ -3813,7 +3821,69 @@ class BasicMemoryAgent(AgentInterface):
         self._current_session_banner_added = s["banner_added"]
         self._last_message_dt = s["last_dt"]
         self._last_user_message_dt = s["last_user_dt"]
+        self._pending_thinking_drop_notice = bool(s.get("drop_notice", False))
         self._turn_start_state = None
+
+    def rollback_last_turn(self) -> Dict[str, Any]:
+        """Manual rollback of the last COMPLETED exchange (Discord /rollback,
+        あさひ 09-18: nip a bad turn in the bud, then re-send).
+
+        Same treatment as the failure exits — both sides leave _memory and
+        stay on disk tagged ``context_excluded="manual_rollback"``, the cache
+        anchor and the retrieval/banner state return to the turn-start
+        snapshot — except that here the turn had completed normally.
+
+        Exactly ONE step: the snapshot is one turn deep and any rollback
+        spends it, so a second call, or a call right after an auto-discarded
+        turn, refuses instead of guessing. The snapshot must also belong to
+        the pair at the tail of _memory (``mem_len`` + user + assistant);
+        anything else — an interrupted turn, a skip_memory turn in between —
+        refuses. Tool side effects (facts written, alarms set, music) are NOT
+        undone, same rule as the failure exits. Never raises."""
+        s = self._turn_start_state
+        mem = self._memory
+        if s is None:
+            return {
+                "ok": False,
+                "error": "no_snapshot",
+                "message": "取り消せる往復がない（直前の往復は既に取り消し済みか、"
+                "このセッションではまだ会話していない）。",
+            }
+        if (
+            len(mem) != int(s.get("mem_len", -1)) + 2
+            or mem[-1].get("role") != "assistant"
+            or mem[-2].get("role") != "user"
+        ):
+            return {
+                "ok": False,
+                "error": "tail_mismatch",
+                "message": "直前の往復が通常の形で完了していないため取り消せない。",
+            }
+        ai = mem.pop()
+        user = mem.pop()
+        self._rollback_turn_state()
+        tagged = None
+        try:
+            if self._conf_uid and self._history_uid:
+                tagged = mark_last_turn_excluded(
+                    self._conf_uid, self._history_uid, "manual_rollback"
+                )
+        except Exception as e:
+            logger.warning(f"[rollback] disk tagging failed: {e}")
+        result: Dict[str, Any] = {
+            "ok": True,
+            "disk_tagged": bool(tagged),
+            "user_chars": len(str(user.get("content") or "")),
+            "ai_chars": len(str(ai.get("content") or "")),
+        }
+        if tagged:
+            result.update(tagged)
+        logger.warning(
+            "[rollback] last exchange removed from context on request "
+            f"(disk_tagged={result['disk_tagged']}, user={result['user_chars']} chars, "
+            f"ai={result['ai_chars']} chars)."
+        )
+        return result
 
     def _handle_api_error_turn(self, error_message: str) -> str:
         """Clean up after an API error and build the visible notice.

@@ -102,6 +102,7 @@ class OLVBridge:
         self._capture_future: Optional[asyncio.Future] = None
         # Resolves when a thinking-mode-result arrives (for /thinking).
         self._thinking_future: Optional[asyncio.Future] = None
+        self._rollback_future: Optional[asyncio.Future] = None
         # Server-initiated (proactive) turns — e.g. a fired alarm or a cache
         # keepalive — arrive with no pending request. Buffer their text + face
         # and flush on chain-end.
@@ -192,6 +193,21 @@ class OLVBridge:
             return await asyncio.wait_for(self._thinking_future, timeout=timeout)
         finally:
             self._thinking_future = None
+
+    async def request_rollback(self, *, timeout: float = 15.0) -> dict[str, Any]:
+        """Ask the server to void the last completed exchange (``/rollback``).
+        Returns the server's result dict (``ok`` plus sizes/timestamps, or
+        ``error``/``message``). Raises on timeout or if not connected."""
+        if self._ws is None:
+            raise RuntimeError("bridge not connected")
+        loop = asyncio.get_running_loop()
+        self._rollback_future = loop.create_future()
+        try:
+            async with self._send_lock:
+                await self._ws.send(json.dumps({"type": "rollback-last-turn"}))
+            return await asyncio.wait_for(self._rollback_future, timeout=timeout)
+        finally:
+            self._rollback_future = None
 
     async def send_text(
         self,
@@ -335,6 +351,12 @@ class OLVBridge:
 
         if msg_type == "thinking-mode-result":
             fut = self._thinking_future
+            if fut is not None and not fut.done():
+                fut.set_result(dict(data))
+            return
+
+        if msg_type == "rollback-result":
+            fut = self._rollback_future
             if fut is not None and not fut.done():
                 fut.set_result(dict(data))
             return

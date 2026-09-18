@@ -153,6 +153,7 @@ class WebSocketHandler:
             "expression-capture-chunk": self._handle_expression_capture_chunk,
             "expression-capture-done": self._handle_expression_capture_done,
             "set-thinking-mode": self._handle_set_thinking_mode,
+            "rollback-last-turn": self._handle_rollback_last_turn,
         }
 
     async def handle_new_connection(
@@ -1237,6 +1238,43 @@ class WebSocketHandler:
         await websocket.send_text(
             json.dumps({"type": "thinking-mode-result", **result})
         )
+
+    async def _handle_rollback_last_turn(
+        self, websocket: WebSocket, client_uid: str, data: WSMessage
+    ) -> None:
+        """Manual one-step rollback of the last exchange (Discord ``/rollback``).
+
+        Refused while any turn is running or an alarm/keepalive delivery
+        holds the lock — the agent is shared across clients, and popping
+        _memory under a live request would corrupt the turn in flight. The
+        work itself lives in the agent (rollback_last_turn); nothing about
+        the exchange's content is logged here."""
+        context = self.client_contexts.get(client_uid)
+        agent = getattr(context, "agent_engine", None) if context else None
+        fn = getattr(agent, "rollback_last_turn", None)
+        busy = self._alarm_delivery_lock.locked() or any(
+            task is not None and not task.done()
+            for task in self.current_conversation_tasks.values()
+        )
+        if busy:
+            result = {
+                "ok": False,
+                "error": "busy",
+                "message": "いま応答の途中なので取り消せない。終わってからもう一度。",
+            }
+        elif not callable(fn):
+            result = {
+                "ok": False,
+                "error": "unsupported",
+                "message": "このエージェントは取り消しに対応していない。",
+            }
+        else:
+            result = fn()
+        logger.info(
+            f"[rollback] rollback-last-turn via {client_uid}: ok={result.get('ok')} "
+            f"error={result.get('error')} disk_tagged={result.get('disk_tagged')}"
+        )
+        await websocket.send_text(json.dumps({"type": "rollback-result", **result}))
 
     async def _handle_request_expression_capture(
         self, websocket: WebSocket, client_uid: str, data: WSMessage

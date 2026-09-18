@@ -351,6 +351,40 @@ class DiscordVTuberBot(discord.Client):
             await interaction.followup.send("\n".join(lines), ephemeral=True)
 
         @self._tree.command(
+            name="rollback",
+            description="直前の1往復を取り消す: 文脈から除外（記録は除外タグ付きで残る）→ 送り直し (admin only)",
+        )
+        async def rollback_cmd(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self._admin_user_id:
+                await interaction.response.send_message("Unauthorized.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=False)
+            try:
+                result = await self._bridge.request_rollback()
+            except Exception as e:
+                await interaction.followup.send(
+                    f"取り消し失敗: {type(e).__name__}: {e}", ephemeral=True
+                )
+                return
+            if not result.get("ok"):
+                await interaction.followup.send(
+                    f"取り消せなかった: {result.get('message') or result.get('error')}",
+                    ephemeral=True,
+                )
+                return
+            when = str(result.get("human_ts") or "")[11:19]
+            head = f"あなた {when} " if when else "あなた "
+            lines = [
+                f"↩️ 直前の往復を取り消した（{head}{result.get('user_chars')}字 → "
+                f"返信 {result.get('ai_chars')}字）。文脈からは消えたので、送り直してほしい。"
+            ]
+            if not result.get("disk_tagged"):
+                lines.append(
+                    "※ 記録ファイル側のタグ付けに失敗した — 再起動すると文脈に戻る可能性がある（ログ参照）。"
+                )
+            await interaction.followup.send("\n".join(lines))
+
+        @self._tree.command(
             name="wake",
             description="PC 定時起動: arm=次の wake アラームに合わせ登録 / status / cancel (admin only)",
         )
