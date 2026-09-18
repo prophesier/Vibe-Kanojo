@@ -1058,6 +1058,18 @@ class WebSocketHandler:
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         logger.info(f"[keepalive] {kind} cache keepalive timer started.")
 
+    def _keepalive_ttl_s(self) -> float:
+        """Provider cache lifetime the keepalive is racing against."""
+        return 1800.0 if self._keepalive_provider() == "openai" else 3600.0
+
+    @staticmethod
+    def _keepalive_state(idle_s: float, threshold_s: float, ttl_s: float) -> str:
+        """'wait' below the nudge threshold, 'fire' between threshold and the
+        cache TTL, 'expired' once the cache cannot be alive any more."""
+        if idle_s > ttl_s:
+            return "expired"
+        return "fire" if idle_s >= threshold_s else "wait"
+
     async def _keepalive_loop(self) -> None:
         """When the conversation idles toward the cache TTL (Claude 1h /
         OpenAI explicit 30m), nudge the character to speak so the cache is
@@ -1072,9 +1084,24 @@ class WebSocketHandler:
                     # No turn has warmed the cache yet — nothing to keep alive.
                     await asyncio.sleep(60)
                     continue
-                remaining = (mins * 60) - (time.monotonic() - self._last_turn_at)
-                if remaining > 0:
-                    await asyncio.sleep(min(remaining, 60.0))
+                idle = time.monotonic() - self._last_turn_at
+                state = self._keepalive_state(idle, mins * 60, self._keepalive_ttl_s())
+                if state == "expired":
+                    # The provider's cache is already gone (Claude 1h / OpenAI
+                    # explicit 30m): a nudge now keeps nothing alive, it pays a
+                    # cold write for a conversation nobody is having. Wait for
+                    # the next real turn instead. Also the wake-from-sleep case
+                    # (あさひ 09-18): monotonic time counts the sleep, so the
+                    # first tick after a night saw 7 h of "idle" and fired
+                    # straight into a network that was not up yet.
+                    logger.info(
+                        f"[keepalive] cache TTL passed ({idle / 60:.0f} min idle); "
+                        "not warming a dead cache — waiting for the next real turn."
+                    )
+                    self._last_turn_at = None
+                    continue
+                if state == "wait":
+                    await asyncio.sleep(min((mins * 60) - idle, 60.0))
                     continue
                 # Idle reached the threshold. Stop once we've nudged enough times
                 # with no real user message in between (assume the user left);
