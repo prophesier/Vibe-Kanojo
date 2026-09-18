@@ -1393,6 +1393,19 @@ class PersistentMemoryManager:
             out["written_by"] = model_short_name(w)
         return out
 
+    def self_written_diary(self, diary_uid: str) -> str:
+        """Text of the diary the character wrote HERSELF for this session
+        (``writer == "self"``), or "" — for the past-transcript inline
+        (あさひ 09-19). Auto-generated diaries never qualify: they only
+        summarise a transcript that is already in context, and startup
+        backfill may land them AFTER the transcript froze, so a resume
+        would re-render different bytes. A self-written diary is on disk
+        before the next boot and immutable from then on."""
+        entry = self._read_diary((diary_uid or "").strip())
+        if not entry or entry.get("writer") != "self":
+            return ""
+        return str(entry.get("content") or "").strip()
+
     def write_session_diary(self, history_uid: str, content: str) -> Dict[str, Any]:
         """Save the CURRENT session's diary written by the character herself
         (memory_write_diary, あさひ 08-14).

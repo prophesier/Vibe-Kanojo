@@ -1422,24 +1422,59 @@ class BasicMemoryAgent(AgentInterface):
         "現在進行中のセッションのやりとりは、この後のメッセージ欄に続く。\n"
     )
 
+    # Label of a diary inlined at the end of its session in the transcript
+    # (あさひ 09-19, copy approved). A self-written diary is NOT a duplicate of
+    # the transcript above it: its text was the argument of a
+    # memory_write_diary call, and tool arguments never reach the transcript
+    # — while every other path (header block, auto-RAG) suppresses diaries of
+    # in-window sessions as "already in context". opus5 used its diaries as a
+    # message board for the next model, which therefore could not read them
+    # for recent_sessions more sessions. Inlining makes that suppression true.
+    _INLINE_DIARY_LABEL = "【このセッションの日記（本人執筆）】"
+    # (index of a past session's last _memory entry, session uid) pairs, fixed
+    # at load with the cut. Class-level default for __new__-built tests.
+    _past_session_ends: tuple = ()
+
     def _render_past_transcript(self) -> str:
         """Text transcript of the past-session entries (_memory[:cut]).
 
         Claude path only. Entry content — session banners, time banners,
         timestamp tags — is carried verbatim; only the role becomes a
-        ユーザー:/アシスタント: label. Rendered once at load time and frozen
-        (see set_memory_from_recent_histories).
+        ユーザー:/アシスタント: label. Each session closes with the diary she
+        wrote for it herself, when there is one (see _INLINE_DIARY_LABEL);
+        _memory itself is untouched, so the cut, seeds and rollback indices
+        are unaffected. Rendered once at load time and frozen (see
+        set_memory_from_recent_histories).
         """
         if not self._past_history_cut:
             return ""
+        ends = dict(self._past_session_ends or ())
+        mgr = getattr(self, "_memory_manager", None)
+        own_diary = getattr(mgr, "self_written_diary", None) if ends else None
         lines = []
-        for entry in self._memory[: self._past_history_cut]:
+        inlined = chars = 0
+        for i, entry in enumerate(self._memory[: self._past_history_cut]):
             label = "ユーザー" if entry.get("role") == "user" else "アシスタント"
             content = entry.get("content", "")
             if content:
                 lines.append(f"{label}: {content}")
+            if i in ends and callable(own_diary):
+                try:
+                    diary = own_diary(ends[i])
+                except Exception as e:
+                    logger.warning(f"[history] inline diary skipped: {e}")
+                    diary = ""
+                if diary:
+                    lines.append(f"{self._INLINE_DIARY_LABEL}\n{diary}")
+                    inlined += 1
+                    chars += len(diary)
         if not lines:
             return ""
+        if inlined:
+            logger.info(
+                f"[history] {inlined} self-written diary(ies) inlined into the "
+                f"past transcript ({chars} chars)."
+            )
         return self._PAST_TRANSCRIPT_HEADER + "\n" + "\n\n".join(lines)
 
     def _build_system_for_llm(self) -> Union[str, List[Dict[str, Any]]]:
@@ -1812,6 +1847,7 @@ class BasicMemoryAgent(AgentInterface):
         # current-session entries out of `messages`.
         self._past_history_cut = 0
         self._past_transcript = ""
+        self._past_session_ends = ()
         for msg in messages:
             entry = self._msg_from_history_record(msg)
             if entry:
@@ -1885,6 +1921,7 @@ class BasicMemoryAgent(AgentInterface):
         # (memory index, on-disk thinking seed) of assistant records that
         # carry a persisted final message — see _apply_thinking_seeds.
         seed_candidates: List[tuple] = []
+        session_ends: List[tuple] = []
         resumed_with_messages = False
 
         def _maybe_collect_seed(msg: Dict[str, Any], entry: Dict[str, str]) -> None:
@@ -1916,7 +1953,12 @@ class BasicMemoryAgent(AgentInterface):
                 self._memory.append(entry)
                 if not had_banner:
                     _maybe_collect_seed(msg, entry)
+            if not first_in_session:  # the session contributed entries
+                session_ends.append((len(self._memory) - 1, uid))
 
+        # Where each past session ends — the transcript renderer closes a
+        # session with her own diary of it (see _INLINE_DIARY_LABEL).
+        self._past_session_ends = tuple(session_ends)
         # Everything loaded so far came from past sessions. Freeze the cut
         # index and the transcript text NOW — the Claude path sends these
         # entries as one system block, and that block must stay byte-stable
