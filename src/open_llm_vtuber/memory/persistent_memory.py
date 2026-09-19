@@ -2370,11 +2370,17 @@ class PersistentMemoryManager:
     def model_label_for_session(self, uid: str) -> str:
         """Short experiencer label for a session uid ('opus5'; a mixed
         session joins its models with '/'; unknown/unmapped → '')."""
+        return "/".join(model_short_name(m) for m in self.session_model_ids(uid))
+
+    def session_model_ids(self, uid: str) -> List[str]:
+        """Full model ids attributed to a session, in order of first
+        appearance ([] when unknown/unmapped) — the past-session banner shows
+        them in the same form the current-session banner shows the running
+        model. Reads the snapshot only, like every other annotation."""
         s = (self._model_map_snapshot or {}).get(uid)
         if not isinstance(s, dict):
-            return ""
-        models = list((s.get("models") or {}).keys())
-        return "/".join(model_short_name(m) for m in models)
+            return []
+        return [str(m) for m in (s.get("models") or {}).keys() if m]
 
     def diary_display_tag(
         self, uid: str, entry: Optional[Dict[str, Any]] = None

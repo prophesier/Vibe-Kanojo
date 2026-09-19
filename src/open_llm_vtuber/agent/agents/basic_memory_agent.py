@@ -1430,10 +1430,32 @@ class BasicMemoryAgent(AgentInterface):
     # in-window sessions as "already in context". opus5 used its diaries as a
     # message board for the next model, which therefore could not read them
     # for recent_sessions more sessions. Inlining makes that suppression true.
+    # 09-20: the parenthesis carries the same annotation as the header
+    # block's entry heads ("opus5 本人執筆" — the session's model from the
+    # attribution map), so a successor can tell WHO left the note; the plain
+    # form below remains for sessions the map cannot attribute.
     _INLINE_DIARY_LABEL = "【このセッションの日記（本人執筆）】"
+    _INLINE_DIARY_LABEL_TAGGED = "【このセッションの日記（{tag}）】"
     # (index of a past session's last _memory entry, session uid) pairs, fixed
     # at load with the cut. Class-level default for __new__-built tests.
     _past_session_ends: tuple = ()
+
+    def _inline_diary_label(self, uid: str) -> str:
+        """Label line for a self-written diary inlined into the transcript,
+        annotated like the header block's entry heads when the session is
+        attributed (the map is refreshed before the transcript renders)."""
+        tag_of = getattr(
+            getattr(self, "_memory_manager", None), "diary_display_tag", None
+        )
+        try:
+            tag = str(tag_of(uid) or "").strip() if callable(tag_of) else ""
+        except Exception:
+            tag = ""
+        # diary_display_tag appends 本人執筆 from the diary file itself; a bare
+        # model name would mean the file stopped saying writer="self".
+        if tag.endswith("本人執筆"):
+            return self._INLINE_DIARY_LABEL_TAGGED.format(tag=tag)
+        return self._INLINE_DIARY_LABEL
 
     def _render_past_transcript(self) -> str:
         """Text transcript of the past-session entries (_memory[:cut]).
@@ -1465,7 +1487,7 @@ class BasicMemoryAgent(AgentInterface):
                     logger.warning(f"[history] inline diary skipped: {e}")
                     diary = ""
                 if diary:
-                    lines.append(f"{self._INLINE_DIARY_LABEL}\n{diary}")
+                    lines.append(f"{self._inline_diary_label(ends[i])}\n{diary}")
                     inlined += 1
                     chars += len(diary)
         if not lines:
@@ -1760,6 +1782,18 @@ class BasicMemoryAgent(AgentInterface):
             ],
         }
 
+    def _past_session_models(self, uid: str) -> str:
+        """Model id(s) a past session ran on, "/"-joined ("" when the
+        attribution map does not know). Never raises."""
+        ids_of = getattr(
+            getattr(self, "_memory_manager", None), "session_model_ids", None
+        )
+        try:
+            ids = ids_of(uid) if callable(ids_of) else []
+        except Exception:
+            ids = []
+        return "/".join(str(m) for m in ids if m)
+
     def _session_header_text(self, uid: str, is_current: bool = False) -> str:
         """Format a session-boundary banner from a history UID.
 
@@ -1771,9 +1805,19 @@ class BasicMemoryAgent(AgentInterface):
         08-10: facts can lag a model switch and leave the character unsure
         what she runs on; the banner never reaches disk — chat_history
         stores the clean input — so this stays in-memory only, and a resume
-        under a new model shows the new one). Past-session banners stay
-        model-free. Bytes are stable within a session: the model comes from
-        conf and is fixed for the process lifetime.
+        under a new model shows the new one). Bytes are stable within a
+        session: the model comes from conf and is fixed for the process
+        lifetime.
+
+        PAST-session banners name the model(s) that session actually ran on
+        (あさひ 09-20: models get switched often now, and a transcript whose
+        diary label says who wrote it but whose banner says nothing invites
+        confusion) — never the running model: the ids come from the
+        session→model attribution map, in the same form as above, a mixed
+        session joined with "/". An unattributed session stays model-free.
+        A finished session is attributed once and persisted, and the map is
+        refreshed before any banner is built, so the bytes survive a resume
+        and a second load alike.
         """
         weekdays = ["月", "火", "水", "木", "金", "土", "日"]
         label = "現在進行中のセッション" if is_current else "セッション"
@@ -1789,8 +1833,10 @@ class BasicMemoryAgent(AgentInterface):
         suffix = f"（日記: {diary}）"
         if is_current:
             model = getattr(getattr(self, "_llm", None), "model", "") or ""
-            if model:
-                suffix += f" | モデル: {model}"
+        else:
+            model = self._past_session_models(uid)
+        if model:
+            suffix += f" | モデル: {model}"
         parts = uid.split("_")
         if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
             try:
@@ -1931,6 +1977,21 @@ class BasicMemoryAgent(AgentInterface):
             if entry["role"] == "assistant" and isinstance(seed, dict):
                 seed_candidates.append((len(self._memory) - 1, seed))
 
+        if self._memory_manager:
+            # Session→model attribution (あさひ 08-20): tell the manager who
+            # the experiencer is, then refresh the map (attributes finished
+            # sessions the map missed, snapshots for annotations + the
+            # model_history tool). Cheap: only unmapped session files scan.
+            # Runs BEFORE anything is assembled (09-20): the past-session
+            # banners and the transcript's inline diary labels read the map,
+            # and this is its only refresh — with the old order (end of this
+            # function) the first load of a process rendered against an empty
+            # snapshot and a second load (another client joining) would have
+            # produced different bytes. A finished session's entry is computed
+            # once and persisted, so both annotations are resume-stable.
+            self._memory_manager.set_chat_model(getattr(self._llm, "model", "") or "")
+            self._memory_manager.refresh_model_map(current_uid=current_uid)
+
         for uid, messages in sessions:
             loaded_uids.append(uid)
             first_in_session = True
@@ -2017,12 +2078,6 @@ class BasicMemoryAgent(AgentInterface):
             # Diaries for all loaded sessions are suppressed — their content
             # is already present verbatim in self._memory.
             self._memory_manager.set_active_sessions(loaded_uids)
-            # Session→model attribution (あさひ 08-20): tell the manager who
-            # the experiencer is, then refresh the map (attributes finished
-            # sessions the map missed, snapshots for annotations + the
-            # model_history tool). Cheap: only unmapped session files scan.
-            self._memory_manager.set_chat_model(getattr(self._llm, "model", "") or "")
-            self._memory_manager.refresh_model_map(current_uid=current_uid)
         logger.info(
             f"Loaded {len(self._memory)} messages from {len(sessions)} recent session(s)"
             + (" + current session" if current_uid else "")
