@@ -440,6 +440,7 @@ class PersistentMemoryManager:
         # Run the importance migrations unconditionally (not only when facts
         # RAG is on) so the llm→high rename reaches every setup.
         self._migrate_facts_importance()
+        self._migrate_fact_ids()
 
     # ------------------------------------------------------------------
     # Public API
@@ -488,7 +489,7 @@ class PersistentMemoryManager:
         for f in facts:
             updated = str(f.get("updated", ""))
             date = updated[:10] if len(updated) >= 10 else "不明"
-            tag = f"{date} {self._fact_id(f['fact'])[:8]}"
+            tag = f"{date} {self._fact_ref(f)[:8]}"
             sid = str(f.get("store_id", "") or "")[:8]
             if sid:
                 tag += f" {sid}"
@@ -629,21 +630,100 @@ class PersistentMemoryManager:
         sid = str(f.get("store_id", "") or "")[:8]
         return {"store_id": sid} if sid else {}
 
+    # Persistent handle (あさひ 09-22). The content hash used to do three jobs:
+    # vector-index key, "this exact text is already in context" dedup key, and
+    # the id the character addresses a fact by. The first two MUST follow the
+    # content (an edited fact is new content: re-embed it, allow re-injection;
+    # it is also what makes external edits sync for free). The third must NOT:
+    # her long "shelf" facts are edited daily, and an id that changes on every
+    # edit dies in the frozen header block after the first edit of a session.
+    # So a fact carries its own ``id`` — the content hash AT CREATION, 16 hex,
+    # same shape as before — and only the model-facing paths (display rows,
+    # tool arguments, tool results) use it. Existing facts are stamped with
+    # their current hash, so no displayed id changed when this shipped.
+
+    @staticmethod
+    def _fact_ref(f: Dict[str, Any]) -> str:
+        """A fact's persistent handle; a not-yet-stamped fact answers with its
+        content hash — exactly the value stamping will give it."""
+        return str(f.get("id") or "") or PersistentMemoryManager._fact_id(
+            f.get("fact", "")
+        )
+
+    @staticmethod
+    def _ensure_fact_ids(facts: List[Dict[str, Any]]) -> int:
+        """Stamp ``id`` on every fact that lacks one (in place); returns how
+        many were stamped. Mutation paths call this BEFORE touching a text —
+        stamping afterwards would hash the new text and the handle would move
+        on a fact's first edit. Handles are unique: a hash already taken (a
+        fact edited away from that text, or a duplicate) gets a deterministic
+        salt. Static so the memory viewer stamps by the very same rule."""
+        fid = PersistentMemoryManager._fact_id
+        taken = {str(f.get("id")) for f in facts if f.get("id")}
+        stamped = 0
+        for f in facts:
+            if f.get("id") or not f.get("fact"):
+                continue
+            ref = fid(f["fact"])
+            n = 0
+            while ref in taken:
+                n += 1
+                ref = fid(f"{f['fact']}\0{f.get('updated', '')}\0{n}")
+            f["id"] = ref
+            taken.add(ref)
+            stamped += 1
+        return stamped
+
+    def _migrate_fact_ids(self) -> None:
+        """Stamp the persistent handle on every fact that lacks one, at boot
+        (09-22) — the whole existing pool on the first boot with this code,
+        and afterwards any straggler a hand edit added. Each gets its CURRENT
+        content hash, i.e. exactly the id it was already showing. Uniquely
+        named backup first, like the importance migration. An unreadable
+        facts.json loads as [] and is left alone. Idempotent; never raises."""
+        try:
+            facts = self._load_facts()
+            if not any(f.get("fact") and not f.get("id") for f in facts):
+                return
+            backup = self._facts_path + ".pre-fact-id.bak"
+            if os.path.exists(self._facts_path) and not os.path.exists(backup):
+                shutil.copy2(self._facts_path, backup)
+                logger.info(
+                    f"[memory] Backed up facts.json → {backup} before id stamping."
+                )
+            stamped = self._ensure_fact_ids(facts)
+            self._save_facts(facts)
+            logger.info(
+                f"[memory] persistent fact ids stamped: {stamped} of {len(facts)} "
+                "(each = its current content hash; no displayed id changed)."
+            )
+        except Exception as e:
+            logger.warning(f"[memory] fact id stamping failed: {e}")
+
     def _facts_by_given_id(self, facts, fact_id: str):
-        """All (index, fact) whose content id matches ``fact_id`` (prefix
-        aware). More than one hit = ambiguous prefix; callers must refuse."""
-        out = []
-        for i, f in enumerate(facts):
-            if f.get("fact") and self._id_matches(self._fact_id(f["fact"]), fact_id):
-                out.append((i, f))
-        return out
+        """All (index, fact) whose handle matches ``fact_id`` (prefix aware).
+        More than one hit = ambiguous prefix; callers must refuse. Content
+        hashes are still honoured when no handle matches (ids shown by
+        anything that predates the handle, e.g. the memory viewer)."""
+        out = [
+            (i, f)
+            for i, f in enumerate(facts)
+            if f.get("fact") and self._id_matches(self._fact_ref(f), fact_id)
+        ]
+        if out:
+            return out
+        return [
+            (i, f)
+            for i, f in enumerate(facts)
+            if f.get("fact") and self._id_matches(self._fact_id(f["fact"]), fact_id)
+        ]
 
     def _ambiguous_id_error(self, fact_id: str, matches) -> Dict[str, Any]:
         """Refusal for an ambiguous short id. Every display path shows only
         the 8-hex form, so the model has nowhere else to get a longer id —
         the error itself must carry the full ids (08-20 あさひ)."""
         listing = " / ".join(
-            f"{self._fact_id(f['fact'])}＝{f['fact'][:30]}" for _, f in matches
+            f"{self._fact_ref(f)}＝{f['fact'][:30]}" for _, f in matches
         )
         return {
             "status": "error",
@@ -892,9 +972,12 @@ class PersistentMemoryManager:
                 lexical_weight=lex_w,
                 keywords=keywords,
             )
+            # Rows: "id" stays the CONTENT hash (the agent's in-context dedup
+            # key); "ref" is the persistent handle the row displays.
             out = [
                 {
                     "id": h["id"],
+                    "ref": self._fact_ref(by_id[h["id"]]),
                     "fact": by_id[h["id"]]["fact"],
                     "date": str(by_id[h["id"]].get("updated", ""))[:10],
                     "score": h["score"],
@@ -931,6 +1014,7 @@ class PersistentMemoryManager:
         out = [
             {
                 "id": j["id"],
+                "ref": self._fact_ref(by_id[j["id"]]) if j["id"] in by_id else j["id"],
                 "fact": j["content"],
                 "date": j.get("date", "")
                 or str(by_id.get(j["id"], {}).get("updated", ""))[:10],
@@ -1026,6 +1110,7 @@ class PersistentMemoryManager:
         return [
             {
                 "id": fid,
+                "ref": self._fact_ref(by_id[fid]),
                 "fact": by_id[fid]["fact"],
                 "date": str(by_id[fid].get("updated", ""))[:10],
                 "via": "store" if fid in scored else "topic",
@@ -1083,7 +1168,7 @@ class PersistentMemoryManager:
         stored as the 8-char short form. It is NOT part of the fingerprint,
         so adding/fixing it later never churns the embedding index.
         """
-        text = " ".join((text or "").split())
+        text = self._clean_fact_text(text)
         if not text:
             return {"status": "error", "message": "fact本文が空。"}
         if importance == "llm":  # legacy spelling of "high"
@@ -1091,11 +1176,15 @@ class PersistentMemoryManager:
         importance = importance if importance in ("high", "low", "archive") else "low"
         facts = self._load_facts()
         fid = self._fact_id(text)
-        if any(self._fact_id(f["fact"]) == fid for f in facts if f.get("fact")):
+        dup = next(
+            (f for f in facts if f.get("fact") and self._fact_id(f["fact"]) == fid),
+            None,
+        )
+        if dup is not None:
             return {
                 "status": "error",
                 "message": "同内容の記憶が既にある。",
-                "id": fid[:8],
+                "id": self._fact_ref(dup)[:8],
             }
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         entry = {
@@ -1109,14 +1198,15 @@ class PersistentMemoryManager:
         if store_id:
             entry["store_id"] = store_id[:8]
         facts.append(entry)
-        self._save_facts(facts)
+        self._save_facts(facts)  # stamps the handle (entry["id"])
         await self._sync_facts_index()
+        ref = self._fact_ref(entry)
         # Full text on purpose — the log is the recovery trail for accidental
         # memory operations (facts.json.bak is only one save deep).
-        logger.info(f"[memory_tool] fact ADDED ({importance}, {fid}): {text}")
+        logger.info(f"[memory_tool] fact ADDED ({importance}, {ref}): {text}")
         return {
             "status": "ok",
-            "id": fid[:8],
+            "id": ref[:8],
             "importance": importance,
             "note": "保存した。検索には即時反映、常駐の事実リストへは次回起動から。",
         }
@@ -1139,7 +1229,7 @@ class PersistentMemoryManager:
         stays manual-only in both directions). ``store_id`` (08-15): None =
         untouched, empty string = clear the linkage, else set (stored as
         the 8-char short)."""
-        new_text = " ".join((new_text or "").split())
+        new_text = self._clean_fact_text(new_text)
         importance = (importance or "").strip().lower() or None
         if importance == "llm":  # legacy spelling of "high"
             importance = "high"
@@ -1156,6 +1246,7 @@ class PersistentMemoryManager:
                 "message": "新しい本文か importance か store_id のどれかが必要。",
             }
         facts = self._load_facts()
+        self._ensure_fact_ids(facts)  # before any text moves — see there
         matches = self._facts_by_given_id(facts, fact_id)
         if len(matches) > 1:
             return self._ambiguous_id_error(fact_id, matches)
@@ -1188,19 +1279,19 @@ class PersistentMemoryManager:
             )
             self._save_facts(facts)
             await self._sync_facts_index()
-            new_id = self._fact_id(f["fact"])
+            ref = self._fact_ref(f)
             # Full old/new text on purpose — recovery trail for accidental
             # edits (restore by hand from the log if needed).
             logger.info(
-                f"[memory_tool] fact UPDATED {fact_id}→{new_id} "
+                f"[memory_tool] fact UPDATED {ref} "
                 f"(tier {old_tier}→{f.get('importance') or 'low'}):\n"
                 f"  OLD: {old}\n  NEW: {f['fact']}"
             )
             notes = []
             if new_text:
-                notes.append("本文を更新した（idは内容ハッシュのため変わった）。")
+                notes.append("本文を更新した（idはそのまま）。")
             else:
-                notes.append("本文は変更なし（idも不変）。")
+                notes.append("本文は変更なし。")
             if importance is not None and importance != old_tier:
                 notes.append(f"importance を {old_tier}→{importance} に変更。")
             if store_id is not None:
@@ -1215,13 +1306,114 @@ class PersistentMemoryManager:
             # text from here to stay legible.
             return {
                 "status": "ok",
-                "id": new_id[:8],
+                "id": ref[:8],
                 "fact": f["fact"],
                 "note": " ".join(notes),
             }
         return {
             "status": "error",
             "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
+        }
+
+    @staticmethod
+    def _clean_fact_text(text: str) -> str:
+        """Stored form of a fact text: line endings unified, outer whitespace
+        trimmed — nothing else. The old collapse-to-one-line rule is gone
+        (あさひ 09-22): long shelf facts were an unreadable slab in the memory
+        viewer, and line breaks are hers to place. ``_fact_id`` still hashes
+        whitespace-insensitively, so re-wrapping a text never changes its
+        content hash (no re-embed, duplicates still caught)."""
+        return (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    @staticmethod
+    def _apply_partial_edit(
+        text: str, old_string: str, new_string: str, append: str
+    ) -> tuple:
+        """One partial edit of ``text`` → ``(new_text, error_message)``.
+
+        Two forms, never both: ``old_string``→``new_string`` on a passage that
+        occurs EXACTLY once (the str_replace contract coding agents use: zero
+        or several matches change nothing), or ``append`` added verbatim at
+        the end. Matching is literal — no whitespace or width folding (あさひ
+        09-22: a model copies its own tokens faithfully; that class of slip
+        is a human one). Shared by memory_edit and memory_edit_diary."""
+        if append and (old_string or new_string):
+            return None, "old_string/new_string と append は同時に指定できない。"
+        if append:
+            return text + append, ""
+        if not old_string:
+            return None, "old_string（置き換える箇所）か append のどちらかが必要。"
+        n = text.count(old_string)
+        if n == 0:
+            return None, "old_string が本文に見つからない（何も変更していない）。"
+        if n > 1:
+            return None, (
+                f"old_string が{n}箇所に一致した（何も変更していない）。"
+                "前後を含めて一意になるように指定を。"
+            )
+        if old_string == new_string:
+            return None, "old_string と new_string が同じ。"
+        return text.replace(old_string, new_string, 1), ""
+
+    async def edit_fact_manual(
+        self,
+        fact_id: str,
+        old_string: str = "",
+        new_string: str = "",
+        append: str = "",
+    ) -> Dict[str, Any]:
+        """Partial edit of one fact (memory_edit, あさひ/ヒロ 09-22): a 1500-
+        character shelf used to be re-emitted in full to change one clause.
+        Tier rules as memory_update's text path — every tier's text is
+        editable, ``user`` included. The handle never moves."""
+        facts = self._load_facts()
+        self._ensure_fact_ids(facts)
+        matches = self._facts_by_given_id(facts, fact_id)
+        if len(matches) > 1:
+            return self._ambiguous_id_error(fact_id, matches)
+        if not matches:
+            return {
+                "status": "error",
+                "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
+            }
+        f = matches[0][1]
+        old = f["fact"]
+        edited, err = self._apply_partial_edit(
+            old, str(old_string or ""), str(new_string or ""), str(append or "")
+        )
+        if err:
+            return {"status": "error", "message": err}
+        edited = self._clean_fact_text(edited)
+        if not edited:
+            return {
+                "status": "error",
+                "message": "編集後の本文が空になる（削除は memory_delete で）。",
+            }
+        new_hash = self._fact_id(edited)
+        if new_hash != self._fact_id(old) and any(
+            g is not f and g.get("fact") and self._fact_id(g["fact"]) == new_hash
+            for g in facts
+        ):
+            return {"status": "error", "message": "編集後と同内容の記憶が既にある。"}
+        f["fact"] = edited
+        f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        f.setdefault("history", []).append(
+            self._history_event("edit", self._chat_model, f["updated"])
+        )
+        self._save_facts(facts)
+        await self._sync_facts_index()
+        ref = self._fact_ref(f)
+        # Full old/new text on purpose — same recovery trail as UPDATED.
+        logger.info(
+            f"[memory_tool] fact EDITED {ref} "
+            f"({'append' if append else 'replace'}, {len(old)}→{len(edited)} chars):\n"
+            f"  OLD: {old}\n  NEW: {edited}"
+        )
+        return {
+            "status": "ok",
+            "id": ref[:8],
+            "chars": len(edited),
+            "note": "編集した（idはそのまま）。常駐リストへの反映は次回起動から。",
         }
 
     async def delete_fact_manual(self, fact_id: str) -> Dict[str, Any]:
@@ -1315,7 +1507,7 @@ class PersistentMemoryManager:
                 )
                 out["facts"] = [
                     {
-                        "id": h["id"][:8],
+                        "id": self._fact_ref(by_id[h["id"]])[:8],
                         "fact": by_id[h["id"]].get("fact", ""),
                         "date": str(by_id[h["id"]].get("updated", ""))[:10],
                         "importance": by_id[h["id"]].get("importance", "low"),
@@ -1450,6 +1642,62 @@ class PersistentMemoryManager:
         except Exception as e:
             logger.warning(f"[memory] write_session_diary failed: {e}")
             return {"status": "error", "message": "日記の保存に失敗した。"}
+
+    def edit_session_diary(
+        self,
+        history_uid: str,
+        old_string: str = "",
+        new_string: str = "",
+        append: str = "",
+    ) -> Dict[str, Any]:
+        """Partial edit of the CURRENT session's self-written diary
+        (memory_edit_diary, 09-22) — same two forms as memory_edit. A session
+        that continues past its first goodnight used to cost a full re-emit
+        of the diary to add one paragraph. No writer check (あさひ 09-22):
+        backfill only ever ghost-writes PAST sessions, so the current
+        session's diary is hers by construction — and the one odd path
+        (resuming a session a fresh boot had already backfilled) shows her
+        "日記: 未記録", so she rewrites rather than edits. Past diaries stay
+        immutable (the caller only ever passes the current uid). All other
+        fields of the file, ``writer`` included, are preserved. Never raises."""
+        uid = (history_uid or "").strip()
+        try:
+            entry = self._read_diary(uid) if uid else None
+            if not entry or not entry.get("content"):
+                return {
+                    "status": "error",
+                    "message": "このセッションの日記はまだ無い。memory_write_diary で書くこと。",
+                }
+            old = str(entry["content"]).replace("\r\n", "\n")
+            edited, err = self._apply_partial_edit(
+                old,
+                str(old_string or "").replace("\r\n", "\n"),
+                str(new_string or "").replace("\r\n", "\n"),
+                str(append or "").replace("\r\n", "\n"),
+            )
+            if err:
+                return {"status": "error", "message": err}
+            edited = edited.strip()
+            if len(edited) < 100:
+                return {
+                    "status": "error",
+                    "message": "編集後の日記が短すぎる（100字以上）。",
+                }
+            entry = dict(entry, content=edited)
+            entry.setdefault("history_uid", uid)
+            with open(
+                os.path.join(self._diaries_dir, f"{uid}.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(entry, f, ensure_ascii=False, indent=2)
+            return {
+                "status": "ok",
+                "date": entry.get("date", ""),
+                "chars": len(edited),
+                "note": "日記を編集した。",
+            }
+        except Exception as e:
+            logger.warning(f"[memory] edit_session_diary failed: {e}")
+            return {"status": "error", "message": "日記の編集に失敗した。"}
 
     def resolve_diary_uid(self, fragment: str) -> tuple:
         """Full diary uid from a fragment — the 8-hex short id shown in RAG
@@ -2206,6 +2454,10 @@ class PersistentMemoryManager:
                 shutil.copy2(self._facts_path, bak)
             except Exception as e:
                 logger.warning(f"[memory] Failed to backup facts.json: {e}")
+        # Every fact leaves here with its persistent handle (see _fact_ref):
+        # new ones from any writer — tools, extraction, the viewer's handle-
+        # less additions — get stamped on the first production save.
+        self._ensure_fact_ids(facts)
         # Always persist in chronological order so the file is predictable
         # both for the LLM (oldest-first reading) and human review.
         ordered = self._sort_facts(facts)

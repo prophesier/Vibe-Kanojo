@@ -1035,7 +1035,8 @@ class BasicMemoryAgent(AgentInterface):
         "conversation logs. For both: to narrow by date or period, use the "
         "date_from/date_to arguments — do not mix dates into the query or the "
         "keywords. To save or correct facts established in conversation, use "
-        "memory_add / memory_update (be careful about rewriting). Deletion is "
+        "memory_add / memory_update (be careful about rewriting) — for a small "
+        "change to a long fact, memory_edit. Deletion is "
         "memory_delete, which requires the user's consent. Additions and "
         "corrections are reflected in search immediately, and enter the "
         "resident list from the next startup. user-tier memories are the "
@@ -1056,7 +1057,8 @@ class BasicMemoryAgent(AgentInterface):
         "were never kept in memory, history_search does a keyword search over "
         "the full conversation logs. To save or correct facts established in "
         "conversation, use memory_add / memory_update (be careful about "
-        "rewriting). A fact that has merely become outdated is better moved "
+        "rewriting) — for a small change to a long fact, memory_edit. A fact "
+        "that has merely become outdated is better moved "
         "to importance=archive than deleted — archived facts surface only "
         "when you search for them. Deletion is memory_delete, which requires "
         "the user's consent. When a session is wrapping up, write the diary "
@@ -2662,9 +2664,11 @@ class BasicMemoryAgent(AgentInterface):
     @staticmethod
     def _fact_row_tag(e: Dict[str, Any]) -> str:
         """`記録日 id` or `記録日 id store_id` — the bracket tag every fact
-        row carries (08-20 format; the facts header explains it once)."""
+        row carries (08-20 format; the facts header explains it once). The id
+        shown is the fact's persistent handle (``ref``, 09-22); a row's own
+        ``id`` stays the content hash the in-context dedup sets key on."""
         date = (e.get("date") or "")[:10]
-        fid = str(e.get("id") or "")[:8]
+        fid = str(e.get("ref") or e.get("id") or "")[:8]
         sid = str(e.get("store_id") or "")[:8]
         return " ".join(t for t in (date, fid, sid) if t)
 
@@ -4897,6 +4901,52 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "function",
                 "function": {
+                    "name": "memory_edit",
+                    "description": (
+                        "Edit part of an existing fact without rewriting it: "
+                        "replace one passage, or append to the end. Use "
+                        "memory_update only when the whole fact needs "
+                        "rewriting."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact_id": {
+                                "type": "string",
+                                "description": "id of the fact to edit.",
+                            },
+                            "old_string": {
+                                "type": "string",
+                                "description": (
+                                    "The passage to replace, copied exactly. "
+                                    "Must match exactly one place in the fact; "
+                                    "otherwise nothing changes."
+                                ),
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": (
+                                    "What replaces old_string (empty string "
+                                    "deletes the passage)."
+                                ),
+                            },
+                            "append": {
+                                "type": "string",
+                                "description": (
+                                    "Text added verbatim to the end of the fact "
+                                    "— include your own leading punctuation or "
+                                    "space. Use instead of "
+                                    "old_string/new_string."
+                                ),
+                            },
+                        },
+                        "required": ["fact_id"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "memory_delete",
                     "description": (
                         "Delete one fact. If the user's current message itself "
@@ -4983,6 +5033,47 @@ class BasicMemoryAgent(AgentInterface):
                             }
                         },
                         "required": ["content"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "memory_edit_diary",
+                    "description": (
+                        "Edit the diary you have already written for THIS "
+                        "session without rewriting it: replace one passage, "
+                        "or append to the end. memory_write_diary still "
+                        "overwrites the whole draft."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": {
+                                "type": "string",
+                                "description": (
+                                    "The passage to replace, copied exactly. "
+                                    "Must match exactly one place in the diary; "
+                                    "otherwise nothing changes."
+                                ),
+                            },
+                            "new_string": {
+                                "type": "string",
+                                "description": (
+                                    "What replaces old_string (empty string "
+                                    "deletes the passage)."
+                                ),
+                            },
+                            "append": {
+                                "type": "string",
+                                "description": (
+                                    "Text added verbatim to the end of the "
+                                    "diary — include your own leading line "
+                                    "break. Use instead of "
+                                    "old_string/new_string."
+                                ),
+                            },
+                        },
                     },
                 },
             },
@@ -5170,9 +5261,11 @@ class BasicMemoryAgent(AgentInterface):
         "history_search",
         "memory_add",
         "memory_update",
+        "memory_edit",
         "memory_delete",
         "memory_read_diary",
         "memory_write_diary",
+        "memory_edit_diary",
         "model_history",
     )
     # Per-operation marker text is built by _memory_marker (📝 *記憶◯◯: …*);
@@ -5908,6 +6001,13 @@ class BasicMemoryAgent(AgentInterface):
                     importance=(str(args.get("importance", "")).strip() or None),
                     store_id=None if raw_sid is None else str(raw_sid),
                 )
+            elif name == "memory_edit":
+                result = await mgr.edit_fact_manual(
+                    str(args.get("fact_id", "")).strip(),
+                    old_string=str(args.get("old_string") or ""),
+                    new_string=str(args.get("new_string") or ""),
+                    append=str(args.get("append") or ""),
+                )
             elif name == "memory_delete":
                 result = await self._memory_delete_flow(args)
             elif name == "memory_read_diary":
@@ -5916,6 +6016,8 @@ class BasicMemoryAgent(AgentInterface):
                 result = self._model_history_query(args)
             elif name == "memory_write_diary":
                 result = self._memory_write_diary_query(args)
+            elif name == "memory_edit_diary":
+                result = self._memory_edit_diary_query(args)
             else:
                 return None, {
                     "status": "error",
@@ -5968,6 +6070,18 @@ class BasicMemoryAgent(AgentInterface):
             label = f"日記記入: {_clip(result.get('date') or '')}" + (
                 "（上書き）" if result.get("overwrote") else ""
             )
+        elif name in ("memory_edit", "memory_edit_diary"):
+            # WHAT changed, not the whole text: the appended passage, or the
+            # replacement (the removed passage when it replaces with nothing).
+            if args.get("append"):
+                kind, body = "追記", args.get("append")
+            else:
+                kind = "置換"
+                body = (
+                    args.get("new_string") or f"（削除）{args.get('old_string') or ''}"
+                )
+            head = "記憶編集" if name == "memory_edit" else "日記編集"
+            label = f"{head}({kind}): {_clip(body)}"
         elif status == "pending_approval":
             label = f"記憶削除申請: {_clip(result.get('fact'))}"
         else:
@@ -6108,6 +6222,26 @@ class BasicMemoryAgent(AgentInterface):
             logger.info(
                 f"[diary_write] session diary saved by the character "
                 f"({len(content)}字, overwrote={result.get('overwrote', False)})"
+            )
+        return result
+
+    def _memory_edit_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Partial edit of THIS session's diary (memory_edit_diary, 09-22) —
+        the current uid is the only one ever passed down, so past diaries
+        stay immutable exactly as with memory_write_diary."""
+        if not self._history_uid:
+            return {"status": "error", "message": "現在のセッションが特定できない。"}
+        result = self._memory_manager.edit_session_diary(
+            self._history_uid,
+            old_string=str(args.get("old_string") or ""),
+            new_string=str(args.get("new_string") or ""),
+            append=str(args.get("append") or ""),
+        )
+        if result.get("status") == "ok":
+            logger.info(
+                "[diary_write] session diary edited by the character "
+                f"({'append' if args.get('append') else 'replace'}, "
+                f"now {result.get('chars')}字)"
             )
         return result
 
