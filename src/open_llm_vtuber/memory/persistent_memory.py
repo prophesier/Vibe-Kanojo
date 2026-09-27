@@ -502,7 +502,7 @@ class PersistentMemoryManager:
             "出来事が実際に起きた日ではない"
             "（事実抽出は次のセッション開始時にまとめて行われるため、"
             "実際の出来事はその数時間〜数日前の可能性がある）。"
-            "id は事実そのものの短縮IDで、memory_update / memory_delete に"
+            "id は事実そのものの短縮IDで、memory_read / memory_edit / memory_update / memory_delete に"
             "そのまま渡せる。store_id は Uber の店舗ID——uber_store に渡せば"
             "その店のメニューが開き、memory_add / memory_update の store_id "
             "引数と同じもの。"
@@ -1134,6 +1134,55 @@ class PersistentMemoryManager:
         the distinction; this read path stays conservative."""
         matches = self._facts_by_given_id(self._load_facts(), fact_id)
         return matches[0][1] if len(matches) == 1 else None
+
+    def read_facts_by_ids(self, fact_ids) -> Dict[str, Any]:
+        """Facts in full by id (memory_read, あさひ 09-28): the handle shown
+        wherever a fact is displayed, 8-hex short or full, 1-10 per call.
+        Rows come back in request order; an id that resolves to nothing or
+        to several facts is reported per id instead of failing the call, and
+        a fact asked for twice comes back once. Each row also carries
+        ``_hash`` (the content hash) for the agent's in-context dedup set —
+        the agent strips it before the model sees the result."""
+        ids = [str(x or "").strip() for x in (fact_ids or []) if str(x or "").strip()]
+        if not ids or len(ids) > 10:
+            return {"status": "error", "message": "fact_ids は1〜10件。"}
+        facts = self._load_facts()
+        rows: List[Dict[str, Any]] = []
+        problems: List[str] = []
+        seen: Set[str] = set()
+        for fid in ids:
+            matches = self._facts_by_given_id(facts, fid)
+            if len(matches) > 1:
+                problems.append(self._ambiguous_id_error(fid, matches)["message"])
+                continue
+            if not matches:
+                problems.append(f"id {fid} の記憶が見つからない。")
+                continue
+            f = matches[0][1]
+            ref = self._fact_ref(f)
+            if ref in seen:
+                continue
+            seen.add(ref)
+            rows.append(
+                {
+                    "id": ref[:8],
+                    "date": str(f.get("updated", ""))[:10],
+                    "importance": f.get("importance") or "low",
+                    "fact": f.get("fact", ""),
+                    **self._row_store_id(f),
+                    "_hash": self._fact_id(f.get("fact", "")),
+                }
+            )
+        if not rows:
+            return {"status": "error", "message": " ".join(problems)}
+        out: Dict[str, Any] = {
+            "status": "ok",
+            "facts": rows,
+            "note": "この全文はこのまま会話の文脈に残る（再読は不要）。",
+        }
+        if problems:
+            out["problems"] = problems
+        return out
 
     async def _sync_facts_index(self) -> None:
         """Re-sync the fact vector index after a manual mutation (no-op when

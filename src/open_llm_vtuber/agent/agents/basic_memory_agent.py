@@ -441,7 +441,10 @@ class BasicMemoryAgent(AgentInterface):
     # it must survive replay verbatim). Exempt results are trivially
     # truncation-stable, so an in-loop breakpoint can ride their round.
     # Matched by tool NAME via the protocol's tool_use blocks (id → name).
-    _PROTOCOL_EXEMPT_RESULT_TOOLS = frozenset({"memory_read_diary", "model_history"})
+    # memory_read joined 09-28 on the same reasoning (facts read by id).
+    _PROTOCOL_EXEMPT_RESULT_TOOLS = frozenset(
+        {"memory_read_diary", "memory_read", "model_history"}
+    )
     # uber_search results open with a related-facts section (あさひ 08-13:
     # ヒロ couldn't see his restaurant history while browsing). Everything up
     # to and including this end marker survives replay verbatim; the 400-char
@@ -4985,6 +4988,31 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "function",
                 "function": {
+                    "name": "memory_read",
+                    "description": (
+                        "Read facts in full by id — the id shown in the "
+                        "resident memory list, in auto-recalled ［関連する事実］ "
+                        "blocks, and in memory_search hits. Use memory_search "
+                        "when you don't have an id."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "fact_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "The ids of the facts to read (up to 10 per call)."
+                                ),
+                            }
+                        },
+                        "required": ["fact_ids"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "memory_read_diary",
                     "description": (
                         "Read one diary entry in full. memory_search hits and "
@@ -5258,6 +5286,7 @@ class BasicMemoryAgent(AgentInterface):
     }
     _MEMORY_TOOL_NAMES = (
         "memory_search",
+        "memory_read",
         "history_search",
         "memory_add",
         "memory_update",
@@ -6010,6 +6039,8 @@ class BasicMemoryAgent(AgentInterface):
                 )
             elif name == "memory_delete":
                 result = await self._memory_delete_flow(args)
+            elif name == "memory_read":
+                result = self._memory_read_query(args)
             elif name == "memory_read_diary":
                 result = self._memory_read_diary_query(args)
             elif name == "model_history":
@@ -6062,6 +6093,8 @@ class BasicMemoryAgent(AgentInterface):
                     kind = "店舗ID" + ("設定" if args.get("store_id") else "解除")
                 body = result.get("fact") or args.get("fact_id")
                 label = f"記憶更新({kind}): {_clip(body)}"
+        elif name == "memory_read":
+            label = f"記憶閲覧: {len(result.get('facts') or [])}件"
         elif name == "memory_read_diary":
             label = f"日記閲覧: {_clip(result.get('date') or args.get('diary_uid'))}"
         elif name == "model_history":
@@ -6139,6 +6172,31 @@ class BasicMemoryAgent(AgentInterface):
                 else "この日のセッション記録はない。"
             )
         return out
+
+    def _memory_read_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """Facts in full by id (memory_read, あさひ 09-28). Replay-EXEMPT like
+        memory_read_diary — reading = injecting, permanently — so every fact
+        read joins the session's injected set and auto-RAG never re-surfaces
+        it; the set is in the turn-start snapshot, so a discarded turn hands
+        the marks back. Bounded by the manager's 10-per-call cap."""
+        raw = args.get("fact_ids")
+        if isinstance(raw, str):
+            # Observed misuse elsewhere (history_search): one comma-joined
+            # string instead of an array — split rather than char-shatter.
+            raw = [s for s in re.split(r"[,、\s]+", raw) if s]
+        elif not isinstance(raw, list):
+            raw = []
+        result = self._memory_manager.read_facts_by_ids(raw)
+        if result.get("status") == "ok":
+            rows = result.get("facts") or []
+            hashes = {str(r.pop("_hash", "") or "") for r in rows} - {""}
+            self._session_injected_fact_ids.update(hashes)
+            logger.info(
+                f"[memory_read] {len(rows)} fact(s) read in full "
+                f"({sum(len(r.get('fact') or '') for r in rows)} chars); "
+                f"session injected facts now {len(self._session_injected_fact_ids)}"
+            )
+        return result
 
     def _memory_read_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Full diary view. 08-13: the result is replay-EXEMPT (see
