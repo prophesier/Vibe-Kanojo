@@ -1,4 +1,4 @@
-﻿"""Read-only Uber Eats browse MCP server (Stage 1).
+"""Read-only Uber Eats browse MCP server (Stage 1).
 
 Tools (browse only — there is deliberately NO cart / checkout / payment tool, so
 the model cannot order even if it wanted to):
@@ -18,6 +18,7 @@ Env: UBER_EATS_HEADLESS=0 to watch the browser (default headless).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import pathlib
@@ -56,6 +57,18 @@ _RESULT_NOTE = (
 )
 
 mcp = FastMCP("uber-eats")
+
+
+def _cleandoc(fn):
+    """Strip the docstring's source indentation before FastMCP reads it as the
+    tool description (あさひ 09-29: the leading spaces of every continuation
+    line were shipped to the model). Apply BELOW @mcp.tool() so it runs
+    first."""
+    if fn.__doc__:
+        fn.__doc__ = inspect.cleandoc(fn.__doc__)
+    return fn
+
+
 _client = UberEatsClient(headless=_HEADLESS)
 
 # Short store-id registry (あさひ 08-15): the LLM sees only the first 8 hex
@@ -168,32 +181,23 @@ async def _run(coro, what: str):
 
 
 @mcp.tool()
+@_cleandoc
 async def uber_search(
     keyword: str, vertical: str = "RESTAURANTS", limit: int = 10
 ) -> str:
-    """Search Uber Eats (Japan) for stores. Takes a keyword such as a dish name
-    or store name and returns a list of deliverable stores (name, rating,
-    store_uuid).
-    limit is how many stores to return (default 10, max 30). Decide it UP
-    FRONT from the user's intent: if he wants breadth ("いくつか候補",
-    "比較したい", "他には？"), pass a larger limit on the FIRST call —
-    re-searching with a higher limit later costs a whole extra round.
-    vertical picks the search index and must be chosen to match the intent:
-      - "RESTAURANTS" (default): restaurants and eateries — any food or dish
-        query.
-      - "RETAIL": convenience stores, supermarkets, drugstores, liquor shops —
-        when the user wants conbini/grocery shopping.
-    There is NO mixed mode: since 2026-07 Uber's API returns retail-only for
-    an empty or "ALL" vertical, so always pass the vertical explicitly (an
-    omitted/unknown value falls back to RESTAURANTS). If the intent spans
-    both, call this tool once per vertical.
-    Browse-only: you cannot order or pay. If a store looks
-    interesting, pass its store_uuid to uber_store to see the menu.
-    Stores marked ［PR］ are sponsored (ad slots).
-    A store whose delivery fee is marked "Uber One" is showing the member price.
-    The browsing account is not an Uber One member, but the user himself is, so
-    that member price (cheaper than usual, or free) is what the user actually
-    pays. "通常¥…" is the reference price for non-members."""
+    """Search Uber Eats (Japan) for stores by keyword (a dish or a store name);
+    returns deliverable stores with name, rating and store_uuid — pass a
+    store_uuid to uber_store for the menu.
+    limit = how many stores to return (default 10, max 30).
+    vertical = which index to search, and it must match the intent:
+    "RESTAURANTS" (default) for any food or dish query; "RETAIL" for
+    convenience stores, supermarkets, drugstores and liquor shops. There is no
+    mixed mode: always pass it explicitly (an omitted or unknown value falls
+    back to RESTAURANTS), and call once per vertical when the intent spans
+    both.
+    Stores marked ［PR］ are sponsored slots. A delivery fee marked "Uber One"
+    is the member price — the user is a member, so that is what he actually
+    pays; "通常¥…" is the non-member reference."""
     v = normalize_vertical(vertical)
     try:
         limit = max(1, min(int(limit), 30))
@@ -250,23 +254,19 @@ async def uber_search(
 
 
 @mcp.tool()
+@_cleandoc
 async def uber_store(store_uuid: str, section: str = "") -> str:
-    """Get the menu of the store with the given store_uuid. Pass a store_uuid
-    from the uber_search results. Returns the store name, rating, delivery
-    estimate, and the menu (categories, dish names, prices, like rate).
-    LARGE menus (over ~35 items) come back as a per-category DIGEST: every
-    category (the same categories the app shows) with its top few items by
-    popularity, full detail included. The digest is usually enough to
-    recommend from. To see ALL items of ONE category, call this tool again
-    with section="カテゴリ名" (fuzzy match on the category names shown).
-    Only drill into a category when you actually need it — each extra call
-    costs a round.
-    Every item line carries its item_uuid — pass it to uber_item for
-    toppings/set options and the full description. A trailing ⚙ on the
-    uuid line means the item has options to choose.
-    Each item's "好評率" is the share of "likes" (positive ratings), shown with
-    the rating count — it is not a repeat-order rate.
-    Browse-only: you cannot order or pay."""
+    """Menu of the store with the given store_uuid (from uber_search): store
+    name, rating, delivery estimate, and the menu with categories, dish names,
+    prices and like rate. Large menus (over ~35 items) come back as a
+    per-category DIGEST — every category the app shows, with its top few items
+    by popularity in full detail — which is usually enough to recommend from.
+    To see ALL items of ONE category, call again with section="カテゴリ名"
+    (fuzzy-matched), and only when you actually need it: each extra call costs
+    a round. Every item line carries its item_uuid for uber_item (toppings,
+    set options, full description); a trailing ⚙ on the uuid line means the
+    item has options to choose. "好評率" is the share of likes among ratings,
+    shown with the count — not a repeat-order rate."""
     full_uuid = _resolve_store_uuid(store_uuid)
     if not full_uuid:
         return (
@@ -430,16 +430,15 @@ def _fmt_catalog_item(it: dict) -> str:
 
 
 @mcp.tool()
+@_cleandoc
 async def uber_category(
     store_uuid: str, section_uuid: str, subsection_uuid: str = "", offset: int = 0
 ) -> str:
-    """Look inside a category at stores with many items, such as convenience
-    stores and supermarkets. Pass the section_uuid of a category returned by
-    uber_store. You first get a list of subcategories; pass one of their
-    subsection_uuid values to see that subcategory's items (name and price).
-    Categories without subcategories show their items directly. Use offset to
-    page further.
-    Browse-only: you cannot order or pay."""
+    """Browse one category of a store with many items (convenience stores,
+    supermarkets). Pass the section_uuid of a category from uber_store: you
+    get its subcategories first; pass one of their subsection_uuid values to
+    list that subcategory's items (name and price). Categories without
+    subcategories list their items directly. Use offset to page further."""
     full_uuid = _resolve_store_uuid(store_uuid)
     if not full_uuid:
         return (
@@ -489,11 +488,11 @@ async def uber_category(
 
 
 @mcp.tool()
+@_cleandoc
 async def uber_item(store_uuid: str, item_uuid: str) -> str:
-    """Get an item's details. Pass store_uuid and item_uuid (the trailing id
-    of an item row in the uber_store results). Returns the available options
-    and their surcharges: toppings, set contents, sizes, and so on.
-    Browse-only: you cannot order or pay."""
+    """Details of one item: pass store_uuid and item_uuid (the trailing id of
+    an item row in uber_store). Returns the available options and their
+    surcharges — toppings, set contents, sizes, and so on."""
     full_uuid = _resolve_store_uuid(store_uuid)
     if not full_uuid:
         return (

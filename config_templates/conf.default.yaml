@@ -35,6 +35,11 @@ system_config:
     diary_count: 5
     # Maximum facts to keep in facts.json before trimming oldest (Layer 2)
     max_facts: 50
+    # A fact longer than this many characters appears in list paths (auto
+    # recall, memory_search hits, the Uber related-facts section) as its
+    # title + id only; memory_read gives the full text. The resident header
+    # never collapses. 0 = never collapse.
+    long_fact_chars: 500
     # Model for memory tasks (diary / fact extraction / consolidation). Blank =
     # reuse the chat model. These are big, uncached one-shot calls, so pointing
     # them at a cheaper model cuts cost without touching chat quality. Reuses the
@@ -90,7 +95,7 @@ system_config:
       # injected paragraphs. Packing is diary-atomic — a diary's picked
       # paragraphs go in whole, so the last one may slightly exceed the budget.
       sentence_budget: 4
-      # Max memory_read_diary full-text reads per turn (each read is
+      # Max full diary reads per turn via memory_read (each read is
       # replay-exempt and stays in context permanently).
       full_reads_per_turn: 5
     # Facts RAG: a separate index for low-importance facts. Facts tagged

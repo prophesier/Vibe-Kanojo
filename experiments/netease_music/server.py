@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import functools
+import inspect
 import pathlib
 import random
 import sys
@@ -163,6 +164,11 @@ def _tool(fn):
     as a short sentence it can say out loud, and no tool call can outlive the
     client's patience.
     """
+    # The docstring becomes the tool description verbatim; strip its source
+    # indentation first (あさひ 09-29) so the model does not pay for the
+    # leading spaces of every continuation line.
+    if fn.__doc__:
+        fn.__doc__ = inspect.cleandoc(fn.__doc__)
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs) -> str:
@@ -415,9 +421,9 @@ async def _playlist_loop(
 @mcp.tool()
 @_tool
 async def music_search(keyword: str, limit: int = 8) -> str:
-    """Search NetEase Cloud Music for songs. Returns song titles, artists and
-    durations. Use this when the user wants to know what is available, or when
-    you want to confirm which version of a song before playing it."""
+    """Search NetEase Cloud Music for songs: titles, artists, durations. Use it
+    to see what is available, or to confirm which version of a song before
+    playing it."""
     songs = await _client.search(keyword, limit)
     if not songs:
         return f"「{keyword}」に一致する曲は見つかりませんでした。"
@@ -431,11 +437,10 @@ async def music_play(
 ) -> str:
     """Play music on the user's computer speakers, replacing whatever was
     playing. volume is 0-100; the song plays once (music_stop ends it early).
-
-    Give either a keyword ("米津玄師 Lemon" — title, artist, or both) or an
-    exact song_id from music_search. Titles are NOT unique: covers, remixes,
-    live versions and karaoke tracks share them constantly, so a keyword plays
-    the top match and lists the other candidates with their ids. When the user
+    Give a keyword ("米津玄師 Lemon" — title, artist, or both) or an exact
+    song_id from music_search. Titles are NOT unique — covers, remixes, live
+    versions and karaoke tracks share them constantly — so a keyword plays the
+    top match and lists the other candidates with their ids; when the user
     means a particular recording, or the top match was wrong, search first and
     play the id."""
     _cancel_playlist_run()  # a single requested song replaces playlist mode
@@ -460,10 +465,9 @@ async def music_play(
 @mcp.tool()
 @_tool
 async def music_playlists() -> str:
-    """List the user's NetEase playlists, split into the ones he made himself
-    and the ones he collected from other people. His own say much more about
-    his taste than a collected one does, so prefer them when you are choosing
-    rather than being told."""
+    """List the user's NetEase playlists: the ones he made himself and the
+    ones he collected from other people. His own say far more about his taste
+    — prefer them when you are choosing rather than being told."""
     playlists = await _client.user_playlists()
     if not playlists:
         return "プレイリストが見つかりません（ログインが必要かも）。"
@@ -487,13 +491,13 @@ async def music_play_playlist(
     stop_after_minutes: int = _PLAYLIST_DEFAULT_MINUTES,
 ) -> str:
     """Play the user's playlist continuously: a random song starts now, and
-    each time a song ends another random track from the same playlist follows,
+    after each song ends another random track from the same playlist follows,
     until stop_after_minutes (default 30, max 240) have passed — the song
     playing at that moment finishes naturally. music_stop ends the run early;
-    so does playing anything else. Matched by name (partial names are fine;
-    "小红心" or "ハート" reaches the ♥ collection). Several collected playlists
-    are also called "<someone>喜欢的音乐", so his own always wins a tie. Use
-    music_playlists first if you don't know what exists."""
+    so does playing anything else. Matched by name, partial names are fine
+    ("小红心" or "ハート" reaches the ♥ collection). Several collected
+    playlists are also called "<someone>喜欢的音乐", so his own always wins a
+    tie. Use music_playlists first if you don't know what exists."""
     playlists = await _client.user_playlists()
     match = find_playlist(playlists, name)
     if match is None:

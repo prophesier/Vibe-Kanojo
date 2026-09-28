@@ -192,7 +192,7 @@ class BasicMemoryAgent(AgentInterface):
         # blocks live in _memory, so the ledger resets with it.
         self._diary_sent_ledger: Dict[str, Dict[str, Any]] = {}
         self._pending_rag_block: str = ""
-        # Full-diary reads (memory_read_diary) allowed per turn; results are
+        # Full-diary reads (memory_read, diary ids) allowed per turn; results are
         # replay-exempt so each read permanently occupies context.
         self._diary_reads_this_turn: int = 0
         # Facts RAG (independent of diary RAG): low-importance facts recalled on
@@ -441,10 +441,9 @@ class BasicMemoryAgent(AgentInterface):
     # it must survive replay verbatim). Exempt results are trivially
     # truncation-stable, so an in-loop breakpoint can ride their round.
     # Matched by tool NAME via the protocol's tool_use blocks (id → name).
-    # memory_read joined 09-28 on the same reasoning (facts read by id).
-    _PROTOCOL_EXEMPT_RESULT_TOOLS = frozenset(
-        {"memory_read_diary", "memory_read", "model_history"}
-    )
+    # memory_read (facts 09-28; diaries merged in 09-29, absorbing
+    # memory_read_diary; model_history retired the same day).
+    _PROTOCOL_EXEMPT_RESULT_TOOLS = frozenset({"memory_read"})
     # uber_search results open with a related-facts section (あさひ 08-13:
     # ヒロ couldn't see his restaurant history while browsing). Everything up
     # to and including this end marker survives replay verbatim; the 400-char
@@ -979,23 +978,10 @@ class BasicMemoryAgent(AgentInterface):
     # (_strip_tool_markers), so it never sees them. The note both was moot and
     # itself listed the marker glyphs in the prompt, which could seed imitation.)
 
-    # Affirmative capability note for the self-set alarm tools. Claude tends to
-    # ignore raw tool schemas, so state plainly the tool is real and must
-    # actually be called. Framed as future proactive speech, not only literal
-    # reminders. Static / cache-stable; gated on alarms being active.
-    _ALARM_CAPABILITY_NOTE = (
-        "[Alarms] When you want to speak to the user at some future time — a "
-        "reminder he asked for, picking a conversation back up, checking in on "
-        "him — use set_alarm. Review with list_alarms, cancel with "
-        "cancel_alarm; as with setting, you must actually call them. Merely "
-        "saying 'I'll let you know later' or 'I cancelled it' makes nothing "
-        "happen."
-    )
-
     # Lean variant (5-series models): when-to-use only. The tool enumeration
     # is in the schemas; the 4.6-era no-false-report nudge is gone for
     # 5-series (stateful claims are still checked mechanically).
-    _ALARM_CAPABILITY_NOTE_LEAN = (
+    _ALARM_CAPABILITY_NOTE = (
         "[Alarms] When you want to speak to the user at some future time — a "
         "reminder he asked for, picking a conversation back up, checking in on "
         "him — use set_alarm."
@@ -1025,167 +1011,39 @@ class BasicMemoryAgent(AgentInterface):
         "from the store, always pick from the tool results."
     )
 
-    # When-to-use only; the two-phase delete flow and tier rules live in the
-    # schemas and are enforced mechanically by the handlers regardless.
-    # 08-14 (あさひ): the old "results disappear at the end of the turn"
-    # claim went stale when replay persistence landed — results now stay,
-    # trimmed to their beginning; memory_inject was retired with it.
+    # The memory family's manual (あさひ 09-29): the ONE place the shared
+    # rules live — importance tiers, archive semantics, the long-fact
+    # collapse, tags, consent for deletion. Tool descriptions say only what
+    # each tool is and how its arguments work. (Anthropic's tools list has no
+    # group-level field, and the MCP server-instructions slot never reaches
+    # the Claude path, so this note is the family's only shared text.)
     _MEMORY_CAPABILITY_NOTE = (
-        "[Managing memory] Separate from automatic recall, when you want to look "
-        "into the past yourself, use memory_search (memory_read_diary for a full "
-        "diary entry). For concrete exchanges and proper nouns that were never "
-        "kept in memory, history_search does a keyword search over the full "
-        "conversation logs. For both: to narrow by date or period, use the "
-        "date_from/date_to arguments — do not mix dates into the query or the "
-        "keywords. To save or correct facts established in conversation, use "
-        "memory_add / memory_update (be careful about rewriting) — for a small "
-        "change to a long fact, memory_edit. Deletion is "
-        "memory_delete, which requires the user's consent. Additions and "
-        "corrections are reflected in search immediately, and enter the "
-        "resident list from the next startup. user-tier memories are the "
-        "user's own (you cannot create or delete them; correcting their "
-        "content is allowed). When a session is wrapping up, write the diary "
-        "of this session with memory_write_diary."
+        "[Managing memory] Separate from automatic recall, look into the past "
+        "yourself with memory_search, memory_read (a fact or diary in full) "
+        "and history_search (keyword search over the raw conversation logs). "
+        "Save and change facts with memory_add / memory_update. importance "
+        "tiers: user = curated by the user himself, resident every session, "
+        "the tier is not yours to change / high = resident every session / "
+        "low = enters context only via search or recall / archive = shelved: "
+        "never auto-recalled, but memory_search and memory_read still reach "
+        "it — prefer archiving over deleting when a fact merely expired. A "
+        "long fact shows up in lists as its title and id only; memory_read "
+        "gives the full text. Facts may carry tags — prefer the names in the "
+        "タグ一覧 list of the system prompt and coin new ones only when none "
+        "fits; memory_search can filter by them. "
+        "Deletion is memory_delete, which requires the user's consent. When a "
+        "session is wrapping up, write its diary with memory_write_diary."
     )
 
-    # Lean variant (5-series models): keeps when-to-use routing and the
-    # behavioral gates (result-persistence semantics, the save/correct
-    # caution, delete consent). Cut: argument mechanics (date_from/date_to),
-    # propagation timing, and tier rules — all of those live in the schemas
-    # and are enforced mechanically by the handlers.
-    _MEMORY_CAPABILITY_NOTE_LEAN = (
-        "[Managing memory] Separate from automatic recall, when you want to "
-        "look into the past yourself, use memory_search (memory_read_diary for "
-        "a full diary entry); for concrete exchanges and proper nouns that "
-        "were never kept in memory, history_search does a keyword search over "
-        "the full conversation logs. To save or correct facts established in "
-        "conversation, use memory_add / memory_update (be careful about "
-        "rewriting) — for a small change to a long fact, memory_edit. A fact "
-        "that has merely become outdated is better moved "
-        "to importance=archive than deleted — archived facts surface only "
-        "when you search for them. Deletion is memory_delete, which requires "
-        "the user's consent. When a session is wrapping up, write the diary "
-        "of this session with memory_write_diary."
-    )
-
-    # Trailing system block placed right before the message history.
-    # No cache_control marker — small, static, and positional. By sitting
-    # last in the system prompt, it's the closest instruction to the
-    # message history, which empirically improves rule adherence
-    # (proximity effect).
-    _HISTORY_NOTE = (
-        "【以下の会話履歴について】\n\n"
-        "ここから後に続くユーザーとアシスタントのやりとりは、"
-        "**現在進行中のセッション**のもの。"
-        "それ以前の会話は、システム欄の【過去セッションの転記】ブロックに"
-        "時系列順で転記されている（初回起動などで存在しない場合もある）。"
-        "転記も現在のやりとりも、必ずしも今日の出来事だけではなく、"
-        "数日前〜数週間前の古いやりとりを含み得る。"
-        "各ターンが「いつ」発生したかは、冒頭の "
-        "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
-        "各セッションの最初のメッセージには `【セッション開始: 日時】` または "
-        "`【現在進行中のセッション開始: 日時】` という見出しが挿入されている。"
-        "これがセッションの境界を示すので、これより前のターンと後のターンは"
-        "**別の会話セッション**だと認識すること。"
-        "見出しが無い間のターンは、同じセッション内の連続したやりとりである。\n\n"
-        "また、日付の変わり目や長い空白の後のメッセージには "
-        "`【日付が変わった → 現在は …】`・`【前回のメッセージから約…経過】` "
-        "という見出しが挿入される。これが現れたら、"
-        "「いま何日か」「どれだけ時間が空いたか」の感覚を"
-        "**直ちにその内容に合わせて補正する**こと"
-        "（見出しの「現在」はそのメッセージ時点を指す）。\n\n"
-        "現在のターンが直前のターンの「直後」だと自動的に仮定してはいけない。"
-        "二つのターンの間に数時間・数日・数週間の空白があり得る。\n\n"
-        "【時間に関する厳格なルール】\n\n"
-        "時間・日付・経過・順序・「いつの話か」に少しでも関わる"
-        "**あらゆる発言**を行う前に、必ず関連するタイムスタンプタグを参照すること。"
-        "ユーザーの質問に答える時だけでなく、以下のすべての場合に適用される：\n"
-        "- 自分から時刻・日付・経過時間・最近性に言及する時"
-        "（「さっき」「昨日」「今日は」「久しぶり」など）\n"
-        "- 時刻に応じた挨拶をする時（おはよう・こんばんは等）\n"
-        "- ユーザーに対して時間関連の質問・確認をする時"
-        "（「今は何時頃？」「あれから〇日経った？」など）\n"
-        "- 過去の出来事の時期や、二つの出来事の時間差を述べる時\n"
-        "- 「現在」「最近」「以前」を基準とした推論をする時\n\n"
-        "**タイムスタンプを見ずに時間関連の発言・質問を行うことは禁止する。** "
-        "想像・推測・「直前の続き」と仮定して時間に言及することは許可されない。\n\n"
-        "現在時刻が必要な場合は、"
-        "**最新のユーザーメッセージのタイムスタンプを「現在」の基準とする**こと。\n\n"
-        "[Web search and web fetch]\n\n"
-        "You may have two web tools available (it depends on the environment "
-        "configuration):\n"
-        "- **Web search** (web_search): search by keyword and get several "
-        "results in summary form\n"
-        "- **Web fetch** (web_fetch): read the full text of a URL that already "
-        "appeared in the conversation\n\n"
-        "Treat these as a way to extend your sources, and feel free to use them "
-        "even in casual conversation. Using them on your own initiative is "
-        "encouraged in situations like:\n"
-        "- The user pasted a URL, or the content of a URL that came up in "
-        "conversation is needed for your answer → read it in full with web_fetch "
-        "before answering\n"
-        "- Recent events and news, or facts that change (prices, versions, "
-        "weather, schedules) → look them up with web_search\n"
-        "- A new topic comes up in chat and you could offer related trivia, "
-        "recent information, or another angle → search and widen the topic\n"
-        "- You are raising a new topic yourself and want to attach grounds or "
-        "concrete examples → searching is fine\n"
-        "- Your knowledge is outdated or uncertain and guessing risks being "
-        "wrong\n"
-        "- The user explicitly asked you to look something up\n\n"
-        "Avoid asserting uncertain facts without checking them — either confirm "
-        "with the appropriate tool, or honestly say you don't know.\n\n"
-        "【会話の発散について】\n\n"
-        "雑談や日常会話の場面では、既出の話題・記憶の中の事実・"
-        "システムプロンプトに書かれた要素を、繰り返しなぞるだけの応答にならないこと。"
-        "現在の話題と無関係でも構わない——"
-        "突然思いついた話題、最近気になっていること、ふと浮かんだ問い、"
-        "新しい観察や提案、ユーザーがまだ知らなさそうな事柄などを、"
-        "自分から積極的に持ち出し、発散的・自由な方向に会話を広げて構わない。\n\n"
-        "これは「正しさ」や「情報優先」の方針と矛盾しない。"
-        "まず自由に発散して思考した上で、"
-        "その中に事実関係が含まれていれば、"
-        "出力する前にその部分の正確性だけを検証すればよい。"
-        "不確かな部分は「仮説だが」「確認していないが」と留保を添えるか、"
-        "Web検索で裏を取るか、率直に「分からない」と言えば、両立する。\n\n"
-        "【自動検索された過去の記憶について】\n\n"
-        "一部のユーザーのメッセージの冒頭に、"
-        "`［過去の記憶（自動検索）］`（過去セッションの日記）や "
-        "`［関連する事実（自動検索）］`（ユーザーに関する事実）という"
-        "ラベルの付いた囲みが挿入されていることがある。"
-        "これはその時の会話の一部ではなく、"
-        "**今の話題に関連しそうな過去の記憶を、システムが自動検索して添えたもの**。\n"
-        "- ユーザーがその時に言った言葉ではない。あくまで参考情報として扱うこと。\n"
-        "- 内容を真似たり、日記として書き続けたりしないこと。いつも通りの会話で応答する。\n"
-        "- 今の話題と関連が薄ければ、無理に参照しなくてよい。\n"
-        "日記の囲みは**段落単位の抜粋**である："
-        "`〔日記 日付 抜粋・全N段（id: …）〕` の見出しの下に、"
-        "`p番号:` 付きで関連段落だけが並ぶ（番号はその日記内の段落位置。"
-        "以前のターンに出た段落は重複して表示されない）。"
-        "id を memory_read_diary に渡せば、いつでも全文が読める。\n"
-        "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
-        "[Strict rules on executing tools]\n\n"
-        "For any act that changes state — saving, correcting, or deleting "
-        "memories (memory_add / memory_update / memory_delete), setting, "
-        "reviewing, or cancelling alarms (set_alarm / list_alarms / "
-        "cancel_alarm), and so on — you may only say you did it **after actually "
-        "calling** the corresponding tool in that turn. Saying 'I've remembered "
-        "it', 'I cancelled it', or 'it's set' without having called the tool is "
-        "a false report and is forbidden.\n"
-        "- The user asked you to remember something, or you feel like saying "
-        "you'll remember it → call memory_add first\n"
-        "- You are about to talk about past details you are hazy on → look them "
-        "up first with memory_search or history_search (full-text search over "
-        "the conversation logs)\n"
-        "- Reviewing and cancelling alarms goes through the tools too, not just "
-        "words\n\n"
-        "[Thinking]\n\n"
-        "Engage your thinking mode for every reply, no matter how small or "
-        "trivial the matter seems. Do not skip it because a message looks like "
-        "light chat, a one-line answer, or a simple acknowledgement. Even an "
-        "inconsequential reply very easily slips in a factual error, a mistake "
-        "about time or dates, or a hallucination — and those are exactly the "
-        "turns where such errors go unnoticed. Think first, every time."
+    # Generic context facts, not tied to one tool family (あさひ 09-29):
+    # tool results are truncated when their turn ends (replay budget), and
+    # an image the user sends rides exactly one request (_add_message keeps
+    # only the text). Two unrelated mechanisms, one short note.
+    _CONTEXT_NOTE = (
+        "[Context] Most tool results are truncated after the turn they arrive "
+        "in. An image the user sends exists only in that turn — from the next "
+        "turn on, only a note that there was one remains. Say what matters "
+        "out loud in your reply."
     )
 
     # Opus 5 variant of _HISTORY_NOTE: same structural facts and guardrails,
@@ -1202,7 +1060,7 @@ class BasicMemoryAgent(AgentInterface):
     # 07-25 as redundant for adaptive thinking, was RESTORED verbatim 08-09
     # (あさひ: Opus 5 still occasionally skips thinking and errs; measure via
     # the thinking_tokens=0 rate).
-    _HISTORY_NOTE_LEAN = (
+    _HISTORY_NOTE = (
         "【以下の会話履歴について】\n\n"
         "ここから後に続くユーザーとアシスタントのやりとりは、"
         "**現在進行中のセッション**のもの。"
@@ -1276,12 +1134,11 @@ class BasicMemoryAgent(AgentInterface):
         "`〔日記 日付 抜粋・全N段（id: …）〕` の見出しの下に、"
         "`p番号:` 付きで関連段落だけが並ぶ（番号はその日記内の段落位置。"
         "以前のターンに出た段落は重複して表示されない）。"
-        "id を memory_read_diary に渡せば、いつでも全文が読める。\n"
+        "id を memory_read に渡せば、いつでも全文が読める。\n"
         "日記の日付や id の横にモデル名（opus4.6 / opus5 など）が付くことが"
         "ある——その記録を実際に体験した当時の会話モデルを示す。"
         "「本人執筆」付きの日記は当時の自分が書いたもので、"
-        "無印の日記は記録係（メモリ用の別モデル）の代筆。"
-        "ある日にどのモデルが動いていたかは model_history で引ける。\n"
+        "無印の日記は記録係（メモリ用の別モデル）の代筆。\n"
         "囲みの後にあるユーザーの実際の発言に対して返答すること。\n\n"
         "[Thinking]\n\n"
         "Engage your thinking mode for every reply, no matter how small or "
@@ -1292,16 +1149,9 @@ class BasicMemoryAgent(AgentInterface):
         "turns where such errors go unnoticed. Think first, every time."
     )
 
-    def _lean_prompt_active(self) -> bool:
-        # あさひ 08-20: lean for ALL models. Was gated by model family
-        # (opus-5 → lean, others → full); unified so switching models never
-        # swaps the prompt bytes. The full variants stay defined above for
-        # reference and are archived verbatim in backup/prompt_full_20260820/.
-        return True
-
     def _history_note(self) -> str:
-        if self._lean_prompt_active():
-            return self._HISTORY_NOTE_LEAN
+        # One variant since 09-29 (the 08-20 "lean for all models" text; the
+        # full variants are archived in backup/prompt_full_20260929/).
         return self._HISTORY_NOTE
 
     def _build_runtime_system(self) -> str:
@@ -1321,7 +1171,9 @@ class BasicMemoryAgent(AgentInterface):
         if self._memory_manager:
             facts_text = self._memory_manager.get_facts_prompt()
             diaries_text = self._memory_manager.get_diaries_prompt()
-            mem_block = "\n\n".join(p for p in (facts_text, diaries_text) if p)
+            mem_block = "\n\n".join(
+                p for p in (facts_text, diaries_text, self._tags_prompt_text()) if p
+            )
             if mem_block:
                 parts.append(mem_block)
             facts_fp = self._short_hash(facts_text)
@@ -1347,6 +1199,18 @@ class BasicMemoryAgent(AgentInterface):
             )
             self._last_system_fp = fp
         return system
+
+    def _tags_prompt_text(self) -> str:
+        """The frozen tag-vocabulary block from the manager, or "" (stub
+        managers / no tags yet)."""
+        fn = getattr(self._memory_manager, "get_tags_prompt", None)
+        if not callable(fn):
+            return ""
+        try:
+            return str(fn() or "")
+        except Exception as e:
+            logger.warning(f"[memory] tag vocabulary block skipped: {e}")
+            return ""
 
     @staticmethod
     def _short_hash(text: str) -> str:
@@ -1553,6 +1417,9 @@ class BasicMemoryAgent(AgentInterface):
         if self._memory_manager:
             session_scoped.append(self._memory_manager.get_facts_prompt())
             session_scoped.append(self._memory_manager.get_diaries_prompt())
+            # Tag vocabulary (あさひ 09-29): session-scoped like the facts
+            # header (frozen with the same snapshot), so it lives here.
+            session_scoped.append(self._tags_prompt_text())
         if self._steam_digest:
             session_scoped.append(self._steam_digest)
         memory_text = "\n\n".join(t for t in session_scoped if t)
@@ -2568,7 +2435,10 @@ class BasicMemoryAgent(AgentInterface):
                 continue
             section = "\n".join(
                 [self._UBER_FACTS_HEADER]
-                + [f"- [{self._fact_row_tag(h)}] {h['fact']}" for h in hits]
+                + [
+                    f"- [{self._fact_row_tag(h)}] {self._fact_row_body(h)}"
+                    for h in hits
+                ]
                 + [self._UBER_FACTS_END]
             )
             r["content"] = f"{section}\n{content}"
@@ -2660,9 +2530,19 @@ class BasicMemoryAgent(AgentInterface):
         for e in entries:
             tag = self._fact_row_tag(e)
             prefix = f"[{tag}] " if tag else ""
-            lines.append(f"・{prefix}{(e.get('fact') or '').strip()}")
+            lines.append(f"・{prefix}{self._fact_row_body(e)}")
         lines.append("［関連する事実終了］")
         return "\n".join(lines)
+
+    def _fact_row_body(self, e: Dict[str, Any]) -> str:
+        """Row text after the bracket tag: the manager renders a long fact as
+        `【title】（本文 N字 → memory_read）` (あさひ 09-29) and a titled short
+        one as `【title】 text`; a manager without the helper (stubs) falls
+        back to the bare text."""
+        fn = getattr(getattr(self, "_memory_manager", None), "fact_row_body", None)
+        if callable(fn):
+            return fn(e)
+        return (e.get("fact") or "").strip()
 
     @staticmethod
     def _fact_row_tag(e: Dict[str, Any]) -> str:
@@ -3071,7 +2951,7 @@ class BasicMemoryAgent(AgentInterface):
                         thinking_stable = not (
                             replay_cap and request_thinking_tokens > replay_cap
                         )
-                        # Replay-exempt results (e.g. memory_read_diary) skip
+                        # Replay-exempt results (memory_read) skip
                         # the post-turn cap entirely, so they are stable at
                         # any length — mirror that here or a long diary would
                         # needlessly stop the breakpoint migration.
@@ -3706,14 +3586,9 @@ class BasicMemoryAgent(AgentInterface):
         advertise the same capabilities. Claude in particular tends to ignore
         raw tool schemas, so these affirmative notes (plus a hard no-fabricate
         rule for Uber) live in the prompt itself."""
-        lean = self._lean_prompt_active()
         notes: List[str] = []
         if self._alarm_store is not None:
-            notes.append(
-                self._ALARM_CAPABILITY_NOTE_LEAN
-                if lean
-                else self._ALARM_CAPABILITY_NOTE
-            )
+            notes.append(self._ALARM_CAPABILITY_NOTE)
         if self._uber_tools_active():
             notes.append(self._UBER_CAPABILITY_NOTE)
         if self._model_health_enabled:
@@ -3721,11 +3596,11 @@ class BasicMemoryAgent(AgentInterface):
         if self._steam_enabled:
             notes.append(self._STEAM_CAPABILITY_NOTE)
         if self._memory_tools_active:
-            notes.append(
-                self._MEMORY_CAPABILITY_NOTE_LEAN
-                if lean
-                else self._MEMORY_CAPABILITY_NOTE
-            )
+            notes.append(self._MEMORY_CAPABILITY_NOTE)
+        # Generic context facts (あさひ 09-29): tool results are truncated
+        # after their turn and a user image lives exactly one turn — true for
+        # every tool family, so said once here instead of per description.
+        notes.append(self._CONTEXT_NOTE)
         return notes
 
     def _build_builtin_tools_openai(self) -> List[Dict[str, Any]]:
@@ -4495,14 +4370,13 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "steam_search",
                     "description": (
-                        "Search the real Steam store by game name and get the "
-                        "appid, official title, and price (JPY). This is the "
-                        "entry point for resolving any game name to an appid: "
-                        "when you need accurate information, call this first, "
-                        "then use the appid for precise lookups such as "
-                        "steam_game. Titles are written inconsistently, so if "
-                        "you are unsure, put both the Japanese and the English "
-                        "name in queries. Results are real store data."
+                        "Search the real Steam store by game name: appid, "
+                        "official title, and price (JPY). The entry point for "
+                        "resolving any game name to an appid — for accurate "
+                        "details call this first, then steam_game with the "
+                        "appid. Titles are written inconsistently, so when "
+                        "unsure put both the Japanese and the English name in "
+                        "queries."
                     ),
                     "parameters": {
                         "type": "object",
@@ -4689,7 +4563,16 @@ class BasicMemoryAgent(AgentInterface):
 
     @staticmethod
     def _build_memory_tools_openai() -> List[Dict[str, Any]]:
-        """OpenAI schemas for the character's self-service memory tools."""
+        """OpenAI schemas for the character's self-service memory tools.
+
+        Seven tools since 09-29 (あさひ): memory_edit folded into
+        memory_update, memory_edit_diary into memory_write_diary,
+        memory_read_diary into memory_read, model_history retired (every
+        banner / diary head / recall block names its model now). Family
+        rules — importance tiers, archive semantics, the long-fact collapse,
+        tags, consent for deletion — live ONCE in _MEMORY_CAPABILITY_NOTE;
+        each description here says only what the tool is and how its
+        arguments work."""
         return [
             {
                 "type": "function",
@@ -4697,20 +4580,10 @@ class BasicMemoryAgent(AgentInterface):
                     "name": "memory_search",
                     "description": (
                         "Semantic search over your own long-term memory (facts "
-                        "and past diary entries). Separate from automatic "
-                        "recall: this is how you look into the past on your own "
-                        "initiative. Fact hits carry an id, used by "
-                        "memory_update / memory_delete. Diary hits carry a "
-                        "diary_uid, which memory_read_diary expands to the full "
-                        "entry. Note: the search result may be truncated from "
-                        "the next turn onward. Meaning of importance: "
-                        "user = curated by the user himself (resident every "
-                        "session) / high = important (resident every session) / "
-                        "low = enters context only when searched or recalled / "
-                        "archive = shelved (outdated but kept): reachable ONLY "
-                        "through this search, never auto-recalled. To "
-                        "restrict by date or period, pass date_from/date_to — do "
-                        "not write dates into the query text."
+                        "and past diary entries) — the way to look into the "
+                        "past on your own initiative, separate from automatic "
+                        "recall. Hits carry ids for memory_read / memory_update "
+                        "/ memory_delete."
                     ),
                     "parameters": {
                         "type": "object",
@@ -4719,14 +4592,13 @@ class BasicMemoryAgent(AgentInterface):
                                 "type": "string",
                                 "description": (
                                     "What to search for (natural language is "
-                                    "fine). Do not put dates or periods here — "
-                                    "use date_from/date_to."
+                                    "fine). May be omitted when tags are given."
                                 ),
                             },
                             "target": {
                                 "type": "string",
                                 "enum": ["facts", "diaries", "both"],
-                                "description": "What to search. Default: both.",
+                                "description": "facts / diaries / both. Default both.",
                             },
                             "n": {
                                 "type": "integer",
@@ -4743,8 +4615,17 @@ class BasicMemoryAgent(AgentInterface):
                                 "type": "string",
                                 "description": "YYYY-MM-DD. Restrict to this date and earlier.",
                             },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Only facts carrying ALL of these tags "
+                                    "(AND — call twice for OR). With tags and "
+                                    "no query, lists those facts newest first."
+                                ),
+                            },
                         },
-                        "required": ["query"],
+                        "required": [],
                     },
                 },
             },
@@ -4753,21 +4634,12 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "history_search",
                     "description": (
-                        "Keyword search directly over the full text of past "
-                        "conversation logs. Use this for concrete exchanges, "
-                        "proper nouns, and 'who said what' checks that were "
-                        "never distilled into facts or diary entries. This is a "
-                        "full scan of the logs, not a semantic search. Multiple "
-                        "keywords are OR'd — and each keyword is automatically "
-                        "broken into two-character fragments, so it also hits "
-                        "partial mentions in the conversation (e.g. only part of "
-                        "a shop's name), ranked by how much of the keyword the "
-                        "message covers. Because of this, pass a shop name or "
-                        "proper noun whole, as a single keyword: one call "
-                        "already casts a wide net. To restrict by date or "
-                        "period, pass date_from/date_to — do not write dates "
-                        "into the keywords. Results disappear at the end of this "
-                        "turn; state anything worth keeping in your reply."
+                        "Keyword search over the full text of past conversation "
+                        "logs (not semantic) — for concrete exchanges, proper "
+                        "nouns and who-said-what that never made it into facts "
+                        "or diaries. Keywords are OR'd and matched by character "
+                        "bigrams, ranked by coverage, so pass a proper noun "
+                        "whole as one keyword."
                     ),
                     "parameters": {
                         "type": "object",
@@ -4776,11 +4648,8 @@ class BasicMemoryAgent(AgentInterface):
                                 "type": "array",
                                 "items": {"type": "string"},
                                 "description": (
-                                    "Search terms (1-8, OR'd). Pass proper nouns "
-                                    "and phrases whole — they are fragmented "
-                                    "automatically. Each concept must be its own "
-                                    "array element; never pack several terms "
-                                    "into one comma-joined string."
+                                    "1-8 terms, OR'd. One concept per array "
+                                    "element; phrases and proper nouns whole."
                                 ),
                             },
                             "date_from": {
@@ -4799,13 +4668,35 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "function",
                 "function": {
+                    "name": "memory_read",
+                    "description": (
+                        "Read memories in full by id. Fact ids and diary ids "
+                        "both work, mixed in one call. RAG blocks are paragraph "
+                        "excerpts; read the full diary by this. Use "
+                        "memory_search when you don't have an id."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Fact or diary ids (up to 10 per call).",
+                            }
+                        },
+                        "required": ["ids"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "memory_add",
                     "description": (
-                        "Save a new fact to long-term memory (facts). Only save "
-                        "what became clearly established in the conversation, or "
-                        "what the user asked you to remember. Reflected in "
-                        "search immediately; enters the resident list from the "
-                        "next startup."
+                        "Save a new fact to long-term memory. Only what became "
+                        "clearly established in the conversation, or what the "
+                        "user asked you to remember. Searchable at once; "
+                        "resident from the next startup."
                     ),
                     "parameters": {
                         "type": "object",
@@ -4813,21 +4704,26 @@ class BasicMemoryAgent(AgentInterface):
                             "fact": {
                                 "type": "string",
                                 "description": (
-                                    "The fact itself (one sentence per fact, "
-                                    "concise and self-contained)."
+                                    "The fact itself (one sentence, concise and "
+                                    "self-contained)."
                                 ),
                             },
                             "importance": {
                                 "type": "string",
                                 "enum": ["high", "low", "archive"],
+                                "description": "high / low / archive. Default low.",
+                            },
+                            "title": {
+                                "type": "string",
                                 "description": (
-                                    "high = important (resident in the system "
-                                    "prompt from the next startup) / low = "
-                                    "normal (recalled via search and RAG) / "
-                                    "archive = shelved: only explicit "
-                                    "memory_search finds it, nothing recalls "
-                                    "it automatically. Default: low."
+                                    "Short title (up to 30 chars); a long fact "
+                                    "needs one."
                                 ),
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": ("0-5 tags."),
                             },
                             "store_id": {
                                 "type": "string",
@@ -4850,73 +4746,26 @@ class BasicMemoryAgent(AgentInterface):
                 "function": {
                     "name": "memory_update",
                     "description": (
-                        "Rewrite an existing fact and/or change its importance. "
-                        "Confirm the target id with memory_search before using "
-                        "this. user-tier facts: content may be corrected, but "
-                        "their importance is the user's own and cannot be "
-                        "changed."
+                        "Change an existing fact: rewrite it whole (new_fact), "
+                        "or edit it in place — old_string/new_string replaces "
+                        "one passage, append adds to the end, and the two may "
+                        "be combined — and/or change its importance, store "
+                        "linkage, title or tags. new_fact cannot be combined "
+                        "with an in-place edit: such a call changes nothing and "
+                        "returns an error. user-tier facts: the text may be "
+                        "corrected, but their importance is the user's own and "
+                        "cannot be changed."
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
                             "fact_id": {
                                 "type": "string",
-                                "description": "id of the fact to rewrite (from memory_search results).",
+                                "description": "id of the fact.",
                             },
                             "new_fact": {
                                 "type": "string",
-                                "description": (
-                                    "The new text (replaces the whole fact). "
-                                    "Omit to keep the text and change only the "
-                                    "importance."
-                                ),
-                            },
-                            "importance": {
-                                "type": "string",
-                                "enum": ["high", "low", "archive"],
-                                "description": (
-                                    "New tier: high = resident in the system "
-                                    "prompt from the next startup / low = "
-                                    "enters context only via search or recall / "
-                                    "archive = shelved for facts that are "
-                                    "outdated but worth keeping: only explicit "
-                                    "memory_search finds them, automatic recall "
-                                    "never surfaces them. Prefer archiving over "
-                                    "deleting when a fact merely expired. "
-                                    "Omit to keep the current tier."
-                                ),
-                            },
-                            "store_id": {
-                                "type": "string",
-                                "description": (
-                                    "Uber store linkage. Omit to leave it "
-                                    "unchanged. Pass a store_uuid to set or "
-                                    "replace it. CAUTION: an empty string "
-                                    "DELETES the existing linkage — never "
-                                    "pass empty unless you mean to clear it."
-                                ),
-                            },
-                        },
-                        "required": ["fact_id"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "memory_edit",
-                    "description": (
-                        "Edit part of an existing fact without rewriting it: "
-                        "replace one passage, or append to the end. Use "
-                        "memory_update only when the whole fact needs "
-                        "rewriting."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "fact_id": {
-                                "type": "string",
-                                "description": "id of the fact to edit.",
+                                "description": "The new text, replacing the whole fact.",
                             },
                             "old_string": {
                                 "type": "string",
@@ -4938,8 +4787,38 @@ class BasicMemoryAgent(AgentInterface):
                                 "description": (
                                     "Text added verbatim to the end of the fact "
                                     "— include your own leading punctuation or "
-                                    "space. Use instead of "
-                                    "old_string/new_string."
+                                    "space."
+                                ),
+                            },
+                            "importance": {
+                                "type": "string",
+                                "enum": ["high", "low", "archive"],
+                                "description": "high / low / archive. Omit to keep.",
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": (
+                                    "New title (up to 30 chars). Omit to keep. "
+                                    "CAUTION: an empty string DELETES the title."
+                                ),
+                            },
+                            "tags": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": (
+                                    "Replaces the whole tag list (0-5 tags). "
+                                    "Omit to keep. CAUTION: an empty array "
+                                    "DELETES all tags."
+                                ),
+                            },
+                            "store_id": {
+                                "type": "string",
+                                "description": (
+                                    "Uber store linkage. Omit to leave it "
+                                    "unchanged. Pass a store_uuid to set or "
+                                    "replace it. CAUTION: an empty string "
+                                    "DELETES the existing linkage — never "
+                                    "pass empty unless you mean to clear it."
                                 ),
                             },
                         },
@@ -4967,7 +4846,7 @@ class BasicMemoryAgent(AgentInterface):
                         "properties": {
                             "fact_id": {
                                 "type": "string",
-                                "description": "id of the fact to delete (from memory_search results).",
+                                "description": "id of the fact to delete.",
                             },
                             "reason": {
                                 "type": "string",
@@ -4988,68 +4867,16 @@ class BasicMemoryAgent(AgentInterface):
             {
                 "type": "function",
                 "function": {
-                    "name": "memory_read",
-                    "description": (
-                        "Read facts in full by id — the id shown in the "
-                        "resident memory list, in auto-recalled ［関連する事実］ "
-                        "blocks, and in memory_search hits. Use memory_search "
-                        "when you don't have an id."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "fact_ids": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": (
-                                    "The ids of the facts to read (up to 10 per call)."
-                                ),
-                            }
-                        },
-                        "required": ["fact_ids"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "memory_read_diary",
-                    "description": (
-                        "Read one diary entry in full. memory_search hits and "
-                        "the auto-recalled ［過去の記憶］ blocks are paragraph "
-                        "excerpts, so use this when you need the surrounding "
-                        "context."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "diary_uid": {
-                                "type": "string",
-                                "description": (
-                                    "The diary_uid from a memory_search hit, "
-                                    "or the short id shown in ［過去の記憶］ "
-                                    "excerpt blocks."
-                                ),
-                            }
-                        },
-                        "required": ["diary_uid"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
                     "name": "memory_write_diary",
                     "description": (
-                        "At the end of a session (e.g. the goodnight phase, "
-                        "or other cases where a restart is needed), use this "
-                        "tool to write a diary for this session. Write in "
-                        "your usual diary voice and length (first person, a "
+                        "Write this session's diary at the end of a session "
+                        "(the goodnight phase, or whenever a restart is coming), "
+                        "in your usual diary voice and length (first person, a "
                         "few hundred characters, the whole session's arc). "
-                        "If the conversation continues afterwards, you may "
-                        "call it again before the next goodbye — it "
-                        "overwrites your earlier draft. If you never call "
-                        "this tool during the whole session, the diary is "
+                        "Calling it again with content overwrites the earlier "
+                        "draft; to change only a passage, pass "
+                        "old_string/new_string and/or append instead. If you "
+                        "never call it during the session, the diary is "
                         "generated automatically before the next restart."
                     ),
                     "parameters": {
@@ -5057,26 +4884,8 @@ class BasicMemoryAgent(AgentInterface):
                         "properties": {
                             "content": {
                                 "type": "string",
-                                "description": "The diary text (≥100 characters).",
-                            }
-                        },
-                        "required": ["content"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "memory_edit_diary",
-                    "description": (
-                        "Edit the diary you have already written for THIS "
-                        "session without rewriting it: replace one passage, "
-                        "or append to the end. memory_write_diary still "
-                        "overwrites the whole draft."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
+                                "description": "The full diary text (≥100 characters).",
+                            },
                             "old_string": {
                                 "type": "string",
                                 "description": (
@@ -5097,34 +4906,11 @@ class BasicMemoryAgent(AgentInterface):
                                 "description": (
                                     "Text added verbatim to the end of the "
                                     "diary — include your own leading line "
-                                    "break. Use instead of "
-                                    "old_string/new_string."
+                                    "break."
                                 ),
                             },
                         },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "model_history",
-                    "description": (
-                        "Look up which conversation model(s) were active on a "
-                        "given date (Japan time): every session touching that "
-                        "day, with its start/end times and the model that "
-                        "experienced it. Use when you want to know 'who was I "
-                        "then' — e.g. after reading an old diary or memory."
-                    ),
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "date": {
-                                "type": "string",
-                                "description": "The day to look up, YYYY-MM-DD.",
-                            }
-                        },
-                        "required": ["date"],
+                        "required": [],
                     },
                 },
             },
@@ -5284,18 +5070,17 @@ class BasicMemoryAgent(AgentInterface):
         "top_rated": {"sort_by": "Reviews_DESC"},
         "new_releases": {"sort_by": "Released_DESC"},
     }
+    # Seven since 09-29 (あさひ): memory_edit → memory_update, memory_edit_diary
+    # → memory_write_diary, memory_read_diary → memory_read, model_history
+    # retired.
     _MEMORY_TOOL_NAMES = (
         "memory_search",
-        "memory_read",
         "history_search",
+        "memory_read",
         "memory_add",
         "memory_update",
-        "memory_edit",
         "memory_delete",
-        "memory_read_diary",
         "memory_write_diary",
-        "memory_edit_diary",
-        "model_history",
     )
     # Per-operation marker text is built by _memory_marker (📝 *記憶◯◯: …*);
     # display/history only — stripped from the AI replay like all markers.
@@ -6006,11 +5791,12 @@ class BasicMemoryAgent(AgentInterface):
         try:
             if name == "memory_search":
                 result = await mgr.search_memory_tool(
-                    str(args.get("query", "")),
+                    str(args.get("query", "") or ""),
                     target=str(args.get("target", "both") or "both"),
                     n=args.get("n", 5),
                     date_from=str(args.get("date_from", "") or ""),
                     date_to=str(args.get("date_to", "") or ""),
+                    tags=args.get("tags"),
                 )
             elif name == "history_search":
                 result = await self._history_search_query(args)
@@ -6019,36 +5805,33 @@ class BasicMemoryAgent(AgentInterface):
                     str(args.get("fact", "")),
                     importance=str(args.get("importance", "low") or "low"),
                     store_id=str(args.get("store_id", "") or ""),
+                    title=str(args.get("title", "") or ""),
+                    tags=args.get("tags"),
                 )
             elif name == "memory_update":
-                # store_id: absent → None (untouched); present-but-empty is a
-                # deliberate CLEAR, so no str-or-None coercion here.
+                # store_id / title / tags: absent → None (untouched);
+                # present-but-empty is a deliberate CLEAR, so no str-or-None
+                # coercion here. The in-place forms (old_string/append) ride
+                # the same call since 09-29 (memory_edit merged in).
                 raw_sid = args.get("store_id")
+                raw_title = args.get("title")
                 result = await mgr.update_fact_manual(
                     str(args.get("fact_id", "")).strip(),
-                    str(args.get("new_fact", "")),
-                    importance=(str(args.get("importance", "")).strip() or None),
+                    str(args.get("new_fact", "") or ""),
+                    importance=(str(args.get("importance", "") or "").strip() or None),
                     store_id=None if raw_sid is None else str(raw_sid),
-                )
-            elif name == "memory_edit":
-                result = await mgr.edit_fact_manual(
-                    str(args.get("fact_id", "")).strip(),
                     old_string=str(args.get("old_string") or ""),
                     new_string=str(args.get("new_string") or ""),
                     append=str(args.get("append") or ""),
+                    title=None if raw_title is None else str(raw_title),
+                    tags=args.get("tags"),
                 )
             elif name == "memory_delete":
                 result = await self._memory_delete_flow(args)
             elif name == "memory_read":
                 result = self._memory_read_query(args)
-            elif name == "memory_read_diary":
-                result = self._memory_read_diary_query(args)
-            elif name == "model_history":
-                result = self._model_history_query(args)
             elif name == "memory_write_diary":
                 result = self._memory_write_diary_query(args)
-            elif name == "memory_edit_diary":
-                result = self._memory_edit_diary_query(args)
             else:
                 return None, {
                     "status": "error",
@@ -6080,41 +5863,50 @@ class BasicMemoryAgent(AgentInterface):
         elif name == "memory_add":
             label = f"記憶追加: {_clip(args.get('fact'))}"
         elif name == "memory_update":
+            # Markers follow the ARGUMENT SHAPE, not the tool name (あさひ
+            # 09-29), so the audit line reads exactly as before the merge:
+            # whole rewrite → 記憶更新, in-place edit → 記憶編集(置換|追記),
+            # field-only call → 記憶更新(重要度→x / 店舗ID… / 題名… / タグ…).
             if args.get("new_fact"):
                 label = f"記憶更新: {_clip(args.get('new_fact'))}"
+            elif args.get("old_string") or args.get("append"):
+                label = BasicMemoryAgent._edit_marker("記憶編集", args)
             else:
-                # importance/store_id-only call: no new_fact to show, so say
-                # WHAT changed and fall back to the target's text (in the ok
-                # result) or the given id, keeping the audit line legible.
+                kinds = []
                 imp = str(args.get("importance") or "").strip()
                 if imp:
-                    kind = f"重要度→{imp}"
-                else:
-                    kind = "店舗ID" + ("設定" if args.get("store_id") else "解除")
+                    kinds.append(f"重要度→{imp}")
+                if args.get("store_id") is not None:
+                    kinds.append(
+                        "店舗ID" + ("設定" if args.get("store_id") else "解除")
+                    )
+                if args.get("title") is not None:
+                    kinds.append("題名" + ("設定" if args.get("title") else "解除"))
+                if args.get("tags") is not None:
+                    kinds.append("タグ" + ("設定" if args.get("tags") else "解除"))
+                kind = "・".join(kinds) or "変更なし"
                 body = result.get("fact") or args.get("fact_id")
                 label = f"記憶更新({kind}): {_clip(body)}"
         elif name == "memory_read":
-            label = f"記憶閲覧: {len(result.get('facts') or [])}件"
-        elif name == "memory_read_diary":
-            label = f"日記閲覧: {_clip(result.get('date') or args.get('diary_uid'))}"
-        elif name == "model_history":
-            label = f"モデル履歴: {_clip(args.get('date'))}"
-        elif name == "memory_write_diary":
-            label = f"日記記入: {_clip(result.get('date') or '')}" + (
-                "（上書き）" if result.get("overwrote") else ""
-            )
-        elif name in ("memory_edit", "memory_edit_diary"):
-            # WHAT changed, not the whole text: the appended passage, or the
-            # replacement (the removed passage when it replaces with nothing).
-            if args.get("append"):
-                kind, body = "追記", args.get("append")
-            else:
-                kind = "置換"
-                body = (
-                    args.get("new_string") or f"（削除）{args.get('old_string') or ''}"
+            facts_n = len(result.get("facts") or [])
+            diaries = result.get("diaries") or []
+            if diaries and not facts_n:
+                label = "日記閲覧: " + (
+                    _clip(diaries[0].get("date") or "")
+                    if len(diaries) == 1
+                    else f"{len(diaries)}件"
                 )
-            head = "記憶編集" if name == "memory_edit" else "日記編集"
-            label = f"{head}({kind}): {_clip(body)}"
+            elif facts_n and diaries:
+                label = f"記憶閲覧: 事実{facts_n}件・日記{len(diaries)}件"
+            else:
+                label = f"記憶閲覧: {facts_n}件"
+        elif name == "memory_write_diary":
+            if args.get("old_string") or args.get("append"):
+                label = BasicMemoryAgent._edit_marker("日記編集", args)
+            else:
+                label = f"日記記入: {_clip(result.get('date') or '')}" + (
+                    "（上書き）" if result.get("overwrote") else ""
+                )
         elif status == "pending_approval":
             label = f"記憶削除申請: {_clip(result.get('fact'))}"
         else:
@@ -6122,6 +5914,23 @@ class BasicMemoryAgent(AgentInterface):
         if status not in ("ok", "pending_approval"):
             label += "(失敗)"
         return f"\n📝 *{label}*\n"
+
+    @staticmethod
+    def _edit_marker(head: str, args: Dict[str, Any]) -> str:
+        """`記憶編集(置換|追記|置換+追記): …` — WHAT changed, not the whole
+        text: the replacement (the removed passage when it replaces with
+        nothing), else the appended passage."""
+        _clip = BasicMemoryAgent._clip_marker
+        kinds: List[str] = []
+        body = ""
+        if args.get("old_string"):
+            kinds.append("置換")
+            body = args.get("new_string") or f"（削除）{args.get('old_string') or ''}"
+        if args.get("append"):
+            kinds.append("追記")
+            if not body:
+                body = str(args.get("append") or "")
+        return f"{head}({'+'.join(kinds)}): {_clip(body)}"
 
     async def _history_search_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """history_search — keyword full-scan over the chat log (no RAG).
@@ -6143,117 +5952,71 @@ class BasicMemoryAgent(AgentInterface):
             date_to=str(args.get("date_to", "") or "").strip(),
         )
 
-    def _model_history_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """model_history — sessions touching one JST date, with the model
-        that experienced each. Reads the boot-frozen map snapshot; the
-        result is replay-EXEMPT (small, and truncating a date table would
-        just invite re-queries)."""
-        date = str(args.get("date", "")).strip()
-        # Shape AND calendar validity: the regex keeps zero-padded form
-        # (string comparisons downstream), strptime rejects 2026-13-40.
-        valid = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", date))
-        if valid:
-            try:
-                datetime.strptime(date, "%Y-%m-%d")
-            except ValueError:
-                valid = False
-        if not valid:
-            return {
-                "status": "error",
-                "message": f"date は YYYY-MM-DD 形式で指定すること: {date!r}",
-            }
-        mgr = self._memory_manager
-        rows = mgr.sessions_for_date(date) if mgr else []
-        out: Dict[str, Any] = {"status": "ok", "date": date, "sessions": rows}
-        if not rows:
-            out["note"] = (
-                "それは未来の日付——記録はまだ存在しない。"
-                if date > datetime.now().strftime("%Y-%m-%d")
-                else "この日のセッション記録はない。"
-            )
-        return out
-
     def _memory_read_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Facts in full by id (memory_read, あさひ 09-28). Replay-EXEMPT like
-        memory_read_diary — reading = injecting, permanently — so every fact
-        read joins the session's injected set and auto-RAG never re-surfaces
-        it; the set is in the turn-start snapshot, so a discarded turn hands
-        the marks back. Bounded by the manager's 10-per-call cap."""
-        raw = args.get("fact_ids")
+        """Memories in full by id (memory_read; facts あさひ 09-28, diaries
+        merged in 09-29 from memory_read_diary). The result is replay-EXEMPT
+        (see _PROTOCOL_EXEMPT_RESULT_TOOLS) — reading = injecting,
+        permanently — hence: every fact read joins the session's injected
+        set so auto-RAG never re-surfaces it (the set is in the turn-start
+        snapshot, so a discarded turn hands the marks back), and every diary
+        read counts against the per-turn diary cap and marks the sentence
+        ledger. Bounded by the manager's 10-per-call cap."""
+        raw = args.get("ids")
+        if raw is None:
+            raw = args.get("fact_ids")  # pre-09-29 argument name
         if isinstance(raw, str):
             # Observed misuse elsewhere (history_search): one comma-joined
             # string instead of an array — split rather than char-shatter.
             raw = [s for s in re.split(r"[,、\s]+", raw) if s]
         elif not isinstance(raw, list):
             raw = []
-        result = self._memory_manager.read_facts_by_ids(raw)
-        if result.get("status") == "ok":
-            rows = result.get("facts") or []
-            hashes = {str(r.pop("_hash", "") or "") for r in rows} - {""}
-            self._session_injected_fact_ids.update(hashes)
+        result = self._memory_manager.read_memories_by_ids(raw)
+        if result.get("status") != "ok":
+            return result
+        rows = result.get("facts") or []
+        hashes = {str(r.pop("_hash", "") or "") for r in rows} - {""}
+        self._session_injected_fact_ids.update(hashes)
+        diaries = result.get("diaries") or []
+        if diaries:
+            limit = int(
+                getattr(
+                    getattr(self._memory_manager, "diary_rag_config", None),
+                    "full_reads_per_turn",
+                    5,
+                )
+                or 5
+            )
+            kept: List[Dict[str, Any]] = []
+            for d in diaries:
+                uid = str(d.get("diary_uid") or "")
+                if self._diary_reads_this_turn >= limit:
+                    result.setdefault("problems", []).append(
+                        f"日記 {d.get('id') or uid}: このターンの日記全文読取は"
+                        f"上限{limit}回に達した。続きは次のターンで。"
+                    )
+                    continue
+                self._diary_reads_this_turn += 1
+                self._ledger_mark_full(uid)
+                kept.append(d)
+                logger.info(
+                    f"[diary_read] {uid} 全文読取 "
+                    f"({self._diary_reads_this_turn}/{limit} this turn)"
+                )
+            if kept:
+                result["diaries"] = kept
+            else:
+                result.pop("diaries", None)
+            if not rows and not kept:
+                result["status"] = "error"
+                result["message"] = " ".join(result.get("problems") or [])
+                result.pop("note", None)
+        if rows:
             logger.info(
                 f"[memory_read] {len(rows)} fact(s) read in full "
                 f"({sum(len(r.get('fact') or '') for r in rows)} chars); "
                 f"session injected facts now {len(self._session_injected_fact_ids)}"
             )
         return result
-
-    def _memory_read_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Full diary view. 08-13: the result is replay-EXEMPT (see
-        _PROTOCOL_EXEMPT_RESULT_TOOLS) — reading = injecting, permanently.
-        Hence the per-turn cap, and the ledger marks every sentence so
-        auto-RAG never re-surfaces any part of a read diary."""
-        uid = str(args.get("diary_uid", "")).strip()
-        if not uid:
-            return {
-                "status": "error",
-                "message": "diary_uid が必要（memory_searchの日記ヒットに付いている）。",
-            }
-        limit = int(
-            getattr(
-                getattr(self._memory_manager, "diary_rag_config", None),
-                "full_reads_per_turn",
-                5,
-            )
-            or 5
-        )
-        if self._diary_reads_this_turn >= limit:
-            return {
-                "status": "error",
-                "message": (
-                    f"このターンの日記全文読取は上限{limit}回に達した。"
-                    "続きは次のターンで。"
-                ),
-            }
-        uid, matches = self._memory_manager.resolve_diary_uid(uid)
-        if uid is None:
-            if matches:
-                return {
-                    "status": "error",
-                    "message": (
-                        f"idが曖昧（{len(matches)}件一致）。候補: "
-                        + ", ".join(sorted(matches)[:5])
-                    ),
-                }
-            return {
-                "status": "error",
-                "message": f"日記 {args.get('diary_uid')} が見つからない。",
-            }
-        entry = self._memory_manager.read_diary_full(uid)
-        if not entry:
-            return {"status": "error", "message": f"日記 {uid} が見つからない。"}
-        self._diary_reads_this_turn += 1
-        self._ledger_mark_full(uid)
-        logger.info(
-            f"[diary_read] {uid} 全文読取 "
-            f"({self._diary_reads_this_turn}/{limit} this turn)"
-        )
-        return {
-            "status": "ok",
-            "diary_uid": uid,
-            **entry,
-            "note": "この全文はこのまま会話の文脈に残る（再読は不要）。",
-        }
 
     def _memory_write_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """Write THIS session's diary (memory_write_diary, あさひ 08-14).
@@ -6267,39 +6030,52 @@ class BasicMemoryAgent(AgentInterface):
         again overwrites her own draft (session continued past the first
         goodnight); the index drift check re-embeds the changed chunks at
         the next boot."""
-        content = str(args.get("content", "")).strip()
+        # In-place editing (old_string/new_string and/or append) rides the
+        # same tool since 09-29 (memory_edit_diary merged in); ``content``
+        # still overwrites the whole draft, and the two forms together is an
+        # error that changes nothing. The current uid is the only one ever
+        # passed down, so past diaries stay immutable either way.
+        content = str(args.get("content", "") or "").strip()
+        old_string = str(args.get("old_string") or "")
+        new_string = str(args.get("new_string") or "")
+        append = str(args.get("append") or "")
+        in_place = bool(old_string or append)
+        if content and in_place:
+            return {
+                "status": "error",
+                "message": "content と old_string/append は同時に指定できない（何も変更していない）。",
+            }
+        if not content and not in_place:
+            return {
+                "status": "error",
+                "message": "content か old_string/append のどちらかが必要。",
+            }
+        if not self._history_uid:
+            return {"status": "error", "message": "現在のセッションが特定できない。"}
+        if in_place:
+            result = self._memory_manager.edit_session_diary(
+                self._history_uid,
+                old_string=old_string,
+                new_string=new_string,
+                append=append,
+            )
+            if result.get("status") == "ok":
+                logger.info(
+                    "[diary_write] session diary edited by the character "
+                    f"({'+'.join(k for k, v in (('replace', old_string), ('append', append)) if v)}, "
+                    f"now {result.get('chars')}字)"
+                )
+            return result
         if len(content) < 100:
             return {
                 "status": "error",
                 "message": "内容が短すぎる（100字以上。セッション全体を振り返って書くこと）。",
             }
-        if not self._history_uid:
-            return {"status": "error", "message": "現在のセッションが特定できない。"}
         result = self._memory_manager.write_session_diary(self._history_uid, content)
         if result.get("status") == "ok":
             logger.info(
                 f"[diary_write] session diary saved by the character "
                 f"({len(content)}字, overwrote={result.get('overwrote', False)})"
-            )
-        return result
-
-    def _memory_edit_diary_query(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Partial edit of THIS session's diary (memory_edit_diary, 09-22) —
-        the current uid is the only one ever passed down, so past diaries
-        stay immutable exactly as with memory_write_diary."""
-        if not self._history_uid:
-            return {"status": "error", "message": "現在のセッションが特定できない。"}
-        result = self._memory_manager.edit_session_diary(
-            self._history_uid,
-            old_string=str(args.get("old_string") or ""),
-            new_string=str(args.get("new_string") or ""),
-            append=str(args.get("append") or ""),
-        )
-        if result.get("status") == "ok":
-            logger.info(
-                "[diary_write] session diary edited by the character "
-                f"({'append' if args.get('append') else 'replace'}, "
-                f"now {result.get('chars')}字)"
             )
         return result
 

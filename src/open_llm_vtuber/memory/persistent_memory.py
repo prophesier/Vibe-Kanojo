@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import unicodedata
 from datetime import datetime
 from typing import Any, ClassVar, Dict, List, Optional, Set
 from loguru import logger
@@ -115,11 +116,15 @@ _FACT_EXTRACT_SYSTEM = (
     "  具体的な好みの細部、個別のエピソード、特定の物事（食べた物・買った物・観た作品など）、\n"
     "  中核とまでは言えない習慣や傾向。\n"
     '迷ったら "low"。"high" は本当に常時参照する価値があるものだけに厳選する。\n\n'
+    "【タグ（tags）】\n"
+    "各事実に tags（0〜3個、短い名詞）を付けてよい。"
+    "プロンプトに「既存のタグ一覧」がある場合は、そこにある名前を優先して再利用し、"
+    "似た意味の新しい名前を作らない。該当する名前が無ければ空配列でよい。\n\n"
     "**出力形式（厳守）**：\n"
-    '[{"fact": "ユーザーは物理学部出身で物理学を専攻していた", "importance": "high"}, '
-    '{"fact": "ユーザーは白黒のポテトチップスが好き", "importance": "low"}]\n'
+    '[{"fact": "ユーザーは物理学部出身で物理学を専攻していた", "importance": "high", "tags": ["学歴"]}, '
+    '{"fact": "ユーザーは白黒のポテトチップスが好き", "importance": "low", "tags": ["食べ物", "好み"]}]\n'
     "本当に新しい事実が1件もない場合のみ、空の配列のみを出力する: []\n"
-    '繰り返す：JSON配列のみ。各要素は必ず "fact" と "importance" を持つ。'
+    '繰り返す：JSON配列のみ。各要素は必ず "fact" と "importance" を持つ（"tags" は任意）。'
     '"importance" は "high" か "low"。`[`で始まり`]`で終わる。他のテキスト・記号は一切含めない。'
 )
 
@@ -285,9 +290,16 @@ class PersistentMemoryManager:
         facts_rag_config: Any = None,
         embed_api_key: str = "",
         embed_base_url: str = "",
+        long_fact_chars: int = 500,
     ) -> None:
         self._conf_uid = conf_uid
         self._max_facts = max_facts
+        # Long-fact rule (あさひ 09-29): a fact longer than this many chars
+        # appears in every LIST path (auto recall, memory_search hits, the
+        # Uber related-facts section) as its title + id only; memory_read
+        # gives the full text. 0 disables the collapse. The resident header
+        # never collapses (resident = meant to be read in full).
+        self._long_fact_chars = max(0, int(long_fact_chars or 0))
         self._diary_count = diary_count
         self._recent_sessions = recent_sessions
         self._base_dir = os.path.join("chat_history", conf_uid)
@@ -412,6 +424,11 @@ class PersistentMemoryManager:
         # Frozen diaries-block snapshot, same discipline and lifecycle as the
         # facts snapshot above (rendered string — no downstream consumers).
         self._diaries_snapshot: Optional[str] = None
+        # Frozen tag-vocabulary block (あさひ 09-29), same lifecycle: the
+        # list of every tag in use rides block 2 so the character reuses
+        # names instead of coining near-duplicates; it catches up at the
+        # next boot like the facts header.
+        self._tags_snapshot: Optional[str] = None
         # The frozen header is also persisted to disk at freeze time, and a
         # --resume boot RELOADS it instead of re-reading live facts.json
         # (あさひ 09-02): mid-session fact writes changed the rebuilt header
@@ -493,7 +510,11 @@ class PersistentMemoryManager:
             sid = str(f.get("store_id", "") or "")[:8]
             if sid:
                 tag += f" {sid}"
-            lines.append(f"- [{tag}] {f['fact']}")
+            # Resident facts are never collapsed; a title (long facts carry
+            # one, あさひ 09-29) simply leads the text.
+            title = self._clean_title(f.get("title", ""))
+            text = f"【{title}】 {f['fact']}" if title else f["fact"]
+            lines.append(f"- [{tag}] {text}")
         body = "\n".join(lines)
         header = (
             "## ユーザーに関する長期記憶（事実）\n"
@@ -502,7 +523,7 @@ class PersistentMemoryManager:
             "出来事が実際に起きた日ではない"
             "（事実抽出は次のセッション開始時にまとめて行われるため、"
             "実際の出来事はその数時間〜数日前の可能性がある）。"
-            "id は事実そのものの短縮IDで、memory_read / memory_edit / memory_update / memory_delete に"
+            "id は事実そのものの短縮IDで、memory_read / memory_update / memory_delete に"
             "そのまま渡せる。store_id は Uber の店舗ID——uber_store に渡せば"
             "その店のメニューが開き、memory_add / memory_update の store_id "
             "引数と同じもの。"
@@ -537,6 +558,91 @@ class PersistentMemoryManager:
                 )
             self._persist_header_snapshot()
         return self._diaries_snapshot
+
+    def tag_vocabulary(self) -> List[tuple]:
+        """``(tag, count)`` over every fact (all tiers), most used first."""
+        counts: Dict[str, int] = {}
+        for f in self._load_facts():
+            for t in self._normalize_tags(f.get("tags")):
+                counts[t] = counts.get(t, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+    def _render_tags_prompt(self) -> str:
+        vocab = self.tag_vocabulary()
+        if not vocab:
+            return ""
+        # The resident lines carry no tags (あさひ 09-29: +881 tok for no new
+        # information); say so here so she does not read the resident list
+        # as untagged.
+        return (
+            "## タグ一覧（起動時点）\n"
+            + " ".join(f"#{t}({n})" for t, n in vocab)
+            + "\n常駐の事実リストの各行にはタグを表示していないが、常駐の事実にも"
+            "タグは付いている（memory_search の tags 絞り込みと memory_read で見える）。"
+        )
+
+    def get_tags_prompt(self) -> str:
+        """Tag-vocabulary block for the system prompt (あさひ 09-29) — the
+        names in use with their counts, so the character reuses popular
+        tags instead of coining near-duplicates. FROZEN per session like the
+        facts header (same resume/persist rules): a tag coined mid-session
+        shows up here at the next boot; until then the write result names
+        it (``new_tags`` / ``similar_existing``)."""
+        if getattr(self, "_tags_snapshot", None) is None:
+            self._tags_snapshot = None
+            if getattr(self, "_resume_boot", False):
+                snap = self._resume_header_snapshot()
+                restored = snap.get("tags_prompt") if snap else None
+                if isinstance(restored, str):
+                    self._tags_snapshot = restored
+                    logger.info(
+                        "[memory] tag vocabulary restored from resume snapshot "
+                        f"({len(restored)} chars)."
+                    )
+            if self._tags_snapshot is None:
+                self._tags_snapshot = self._render_tags_prompt()
+                logger.info(
+                    "[memory] tag vocabulary frozen for this session "
+                    f"({len(self._tags_snapshot)} chars)."
+                )
+            self._persist_header_snapshot()
+        return self._tags_snapshot
+
+    @staticmethod
+    def _similar_tags(tag: str, known: List[str]) -> List[str]:
+        """Known tags a new one probably duplicates: substring either way, or
+        character-bigram overlap ≥ 0.5 of the shorter tag."""
+        t = tag.lower()
+        tb = {t[i : i + 2] for i in range(len(t) - 1)} if len(t) > 1 else {t}
+        out: List[str] = []
+        for k in known:
+            kl = k.lower()
+            if kl == t:
+                continue
+            if t in kl or kl in t:
+                out.append(k)
+                continue
+            kb = {kl[i : i + 2] for i in range(len(kl) - 1)} if len(kl) > 1 else {kl}
+            if len(tb & kb) / min(len(tb), len(kb)) >= 0.5:
+                out.append(k)
+        return out
+
+    def tag_feedback(
+        self, tags: List[str], before: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Result extras for a write that used tags: ``new_tags`` (absent
+        from the vocabulary before the write) and ``similar_existing``
+        (new tag → known tags it probably duplicates). Advisory only — the
+        write goes through either way (あさひ 09-29: hint, never refuse)."""
+        known = sorted({t for f in before for t in self._normalize_tags(f.get("tags"))})
+        new = [t for t in tags if t not in known]
+        if not new:
+            return {}
+        out: Dict[str, Any] = {"new_tags": new}
+        similar = {t: s for t in new if (s := self._similar_tags(t, known))}
+        if similar:
+            out["similar_existing"] = similar
+        return out
 
     def _render_diaries_prompt(self) -> str:
         diaries = self._load_recent_diaries()
@@ -629,6 +735,85 @@ class PersistentMemoryManager:
         render `[記録日 id store_id]` without special-casing."""
         sid = str(f.get("store_id", "") or "")[:8]
         return {"store_id": sid} if sid else {}
+
+    # ------------------------------------------------------------------
+    # Titles, tags and the long-fact rule (あさひ 09-29)
+    # ------------------------------------------------------------------
+    # A fact may carry ``title`` (≤60 chars; only long facts need one) and
+    # ``tags`` (≤5, each ≤20 chars, NFKC + ASCII-lowercased). Neither is
+    # embedded — the vector index keys on the text alone — they are display
+    # and filter metadata. Long facts (over ``_long_fact_chars``) collapse to
+    # `【title】（本文 N字 → memory_read）` in every list path; a collapsed row
+    # still counts as injected for the session, so it is shown once and read
+    # by id when actually needed.
+    _TITLE_MAX = 60
+    _TAG_MAX_COUNT = 5
+    _TAG_MAX_CHARS = 20
+
+    @staticmethod
+    def _clean_title(title: Any) -> str:
+        """One-line title, inner whitespace collapsed, capped at _TITLE_MAX."""
+        t = " ".join(str(title or "").split())
+        return t[: PersistentMemoryManager._TITLE_MAX]
+
+    @staticmethod
+    def _normalize_tags(tags: Any) -> List[str]:
+        """Canonical tag list from a list or a loosely separated string:
+        NFKC, trimmed, leading '#' dropped, ASCII lowercased, deduped in
+        order, each cut to _TAG_MAX_CHARS, at most _TAG_MAX_COUNT."""
+        if tags is None:
+            return []
+        if isinstance(tags, str):
+            raw = re.split(r"[,、，\s#]+", tags)
+        elif isinstance(tags, (list, tuple, set)):
+            raw = [str(t) for t in tags if t is not None]
+        else:
+            return []
+        out: List[str] = []
+        for t in raw:
+            t = unicodedata.normalize("NFKC", str(t or "")).strip().strip("#").strip()
+            if not t:
+                continue
+            t = "".join(ch.lower() if ch.isascii() else ch for ch in t)
+            t = t[: PersistentMemoryManager._TAG_MAX_CHARS]
+            if t and t not in out:
+                out.append(t)
+            if len(out) >= PersistentMemoryManager._TAG_MAX_COUNT:
+                break
+        return out
+
+    def is_long_fact(self, f: Dict[str, Any]) -> bool:
+        limit = int(getattr(self, "_long_fact_chars", 500) or 0)
+        return bool(limit) and len(str(f.get("fact", "") or "")) > limit
+
+    def _display_fields(self, f: Dict[str, Any]) -> Dict[str, Any]:
+        """Model-facing extras for a fact row: ``title`` / ``tags`` when
+        present, plus ``collapsed``/``chars`` for a long fact. Renderers and
+        tool results decide what to do with ``collapsed``; the row's ``fact``
+        (when a caller keeps it) stays the full text for the judge/logs."""
+        out: Dict[str, Any] = {}
+        title = self._clean_title(f.get("title", ""))
+        if title:
+            out["title"] = title
+        tags = self._normalize_tags(f.get("tags"))
+        if tags:
+            out["tags"] = tags
+        if self.is_long_fact(f):
+            out["collapsed"] = True
+            out["chars"] = len(str(f.get("fact", "") or ""))
+        return out
+
+    @staticmethod
+    def fact_row_body(row: Dict[str, Any]) -> str:
+        """Line body after the `[記録日 id]` tag for the text renderers (auto
+        recall block, Uber section): the collapsed stub for a long fact,
+        otherwise the text led by its title when it has one."""
+        title = str(row.get("title") or "").strip()
+        if row.get("collapsed"):
+            head = f"【{title}】" if title else "【無題】"
+            return f"{head}（本文 {int(row.get('chars') or 0)}字 → memory_read）"
+        text = str(row.get("fact") or "").strip()
+        return f"【{title}】 {text}" if title else text
 
     # Persistent handle (あさひ 09-22). The content hash used to do three jobs:
     # vector-index key, "this exact text is already in context" dedup key, and
@@ -761,6 +946,7 @@ class PersistentMemoryManager:
                 "frozen_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "facts": self._header_snapshot,
                 "diaries_prompt": self._diaries_snapshot,
+                "tags_prompt": getattr(self, "_tags_snapshot", None),
                 "steam_digest": getattr(self, "_steam_digest_snapshot", None),
             }
             tmp = self._header_snapshot_path + ".tmp"
@@ -983,6 +1169,7 @@ class PersistentMemoryManager:
                     "score": h["score"],
                     "reason": "",
                     **self._row_store_id(by_id[h["id"]]),
+                    **self._display_fields(by_id[h["id"]]),
                 }
                 for h in hits
                 if h["id"] in by_id
@@ -1021,6 +1208,7 @@ class PersistentMemoryManager:
                 "score": 0.0,
                 "reason": j.get("reason", ""),
                 **self._row_store_id(by_id.get(j["id"], {})),
+                **self._display_fields(by_id.get(j["id"], {})),
             }
             for j in judged[:max_n]
         ]
@@ -1115,6 +1303,7 @@ class PersistentMemoryManager:
                 "date": str(by_id[fid].get("updated", ""))[:10],
                 "via": "store" if fid in scored else "topic",
                 **self._row_store_id(by_id[fid]),
+                **self._display_fields(by_id[fid]),
             }
             for fid in final
         ]
@@ -1135,51 +1324,103 @@ class PersistentMemoryManager:
         matches = self._facts_by_given_id(self._load_facts(), fact_id)
         return matches[0][1] if len(matches) == 1 else None
 
-    def read_facts_by_ids(self, fact_ids) -> Dict[str, Any]:
-        """Facts in full by id (memory_read, あさひ 09-28): the handle shown
-        wherever a fact is displayed, 8-hex short or full, 1-10 per call.
-        Rows come back in request order; an id that resolves to nothing or
-        to several facts is reported per id instead of failing the call, and
-        a fact asked for twice comes back once. Each row also carries
+    @staticmethod
+    def _diary_short_id(uid: str) -> str:
+        """8-hex display id of a diary uid (the random tail of
+        ``date_time_hex32``) — mirrors the agent's excerpt-block id."""
+        tail = (uid or "").rsplit("_", 1)[-1]
+        if len(tail) >= 8 and all(c in "0123456789abcdef" for c in tail.lower()):
+            return tail[:8]
+        return uid
+
+    def read_memories_by_ids(self, ids) -> Dict[str, Any]:
+        """Memories in full by id (memory_read; facts 09-28, diaries merged
+        in 09-29): fact handles and diary ids mixed, 1-10 per call, rows in
+        request order. Facts come back whole — never collapsed — with their
+        title/tags; diaries as ``{id, diary_uid, date, content, model?,
+        written_by?}``. An id that resolves to nothing, to several facts, or
+        to BOTH a fact and a diary is reported per id instead of failing the
+        call; something asked for twice comes back once. Fact rows carry
         ``_hash`` (the content hash) for the agent's in-context dedup set —
-        the agent strips it before the model sees the result."""
-        ids = [str(x or "").strip() for x in (fact_ids or []) if str(x or "").strip()]
-        if not ids or len(ids) > 10:
-            return {"status": "error", "message": "fact_ids は1〜10件。"}
+        the agent strips it before the model sees the result. Diary rows are
+        NOT cap-checked here: the agent applies the per-turn diary cap and
+        the sentence ledger."""
+        wanted = [str(x or "").strip() for x in (ids or []) if str(x or "").strip()]
+        if not wanted or len(wanted) > 10:
+            return {"status": "error", "message": "ids は1〜10件。"}
         facts = self._load_facts()
         rows: List[Dict[str, Any]] = []
+        diaries: List[Dict[str, Any]] = []
         problems: List[str] = []
-        seen: Set[str] = set()
-        for fid in ids:
-            matches = self._facts_by_given_id(facts, fid)
-            if len(matches) > 1:
-                problems.append(self._ambiguous_id_error(fid, matches)["message"])
+        seen_f: Set[str] = set()
+        seen_d: Set[str] = set()
+        for fid in wanted:
+            fmatches = self._facts_by_given_id(facts, fid)
+            duid, dmatches = self.resolve_diary_uid(fid)
+            if fmatches and (duid or dmatches):
+                problems.append(
+                    f"id {fid} は事実と日記の両方に一致して曖昧: 事実 "
+                    + " / ".join(self._fact_ref(f) for _, f in fmatches)
+                    + " / 日記 "
+                    + ", ".join(sorted(dmatches)[:5])
+                    + "。完全なidで再指定を。"
+                )
                 continue
-            if not matches:
-                problems.append(f"id {fid} の記憶が見つからない。")
+            if len(fmatches) > 1:
+                problems.append(self._ambiguous_id_error(fid, fmatches)["message"])
                 continue
-            f = matches[0][1]
-            ref = self._fact_ref(f)
-            if ref in seen:
-                continue
-            seen.add(ref)
-            rows.append(
-                {
-                    "id": ref[:8],
-                    "date": str(f.get("updated", ""))[:10],
-                    "importance": f.get("importance") or "low",
-                    "fact": f.get("fact", ""),
-                    **self._row_store_id(f),
-                    "_hash": self._fact_id(f.get("fact", "")),
+            if fmatches:
+                f = fmatches[0][1]
+                ref = self._fact_ref(f)
+                if ref in seen_f:
+                    continue
+                seen_f.add(ref)
+                meta = {
+                    k: v
+                    for k, v in self._display_fields(f).items()
+                    if k in ("title", "tags")
                 }
-            )
-        if not rows:
+                rows.append(
+                    {
+                        "id": ref[:8],
+                        "date": str(f.get("updated", ""))[:10],
+                        "importance": f.get("importance") or "low",
+                        **meta,
+                        "fact": f.get("fact", ""),
+                        **self._row_store_id(f),
+                        "_hash": self._fact_id(f.get("fact", "")),
+                    }
+                )
+                continue
+            if duid:
+                if duid in seen_d:
+                    continue
+                seen_d.add(duid)
+                entry = self.read_diary_full(duid)
+                if not entry:
+                    problems.append(f"日記 {fid} が見つからない。")
+                    continue
+                diaries.append(
+                    {"id": self._diary_short_id(duid), "diary_uid": duid, **entry}
+                )
+                continue
+            if dmatches:
+                problems.append(
+                    f"id {fid} が曖昧（日記{len(dmatches)}件一致）。候補: "
+                    + ", ".join(sorted(dmatches)[:5])
+                )
+                continue
+            problems.append(f"id {fid} の記憶が見つからない。")
+        if not rows and not diaries:
             return {"status": "error", "message": " ".join(problems)}
         out: Dict[str, Any] = {
             "status": "ok",
-            "facts": rows,
             "note": "この全文はこのまま会話の文脈に残る（再読は不要）。",
         }
+        if rows:
+            out["facts"] = rows
+        if diaries:
+            out["diaries"] = diaries
         if problems:
             out["problems"] = problems
         return out
@@ -1206,9 +1447,19 @@ class PersistentMemoryManager:
         }
 
     async def add_fact_manual(
-        self, text: str, importance: str = "low", store_id: str = ""
+        self,
+        text: str,
+        importance: str = "low",
+        store_id: str = "",
+        title: str = "",
+        tags: Any = None,
     ) -> Dict[str, Any]:
         """Append a fact on the character's behalf (memory_add).
+
+        ``title`` / ``tags`` (あさひ 09-29) are optional metadata (see the
+        title/tag helpers). A long fact without a title is still created —
+        the result carries ``needs_title`` and asks for one via
+        memory_update; refusing would make her re-emit the whole text.
 
         ``importance`` is clamped to high/low/archive — ``user`` is manual-only and an
         LLM must never assign it. Duplicate content (same fingerprint) is
@@ -1246,6 +1497,15 @@ class PersistentMemoryManager:
         store_id = (store_id or "").strip()
         if store_id:
             entry["store_id"] = store_id[:8]
+        title = self._clean_title(title)
+        if title:
+            entry["title"] = title
+        tag_list = self._normalize_tags(tags)
+        if tag_list:
+            entry["tags"] = tag_list
+        # Vocabulary feedback is judged against the pool BEFORE this fact
+        # joins it (its own tags must not count as "known").
+        feedback = self.tag_feedback(tag_list, facts) if tag_list else {}
         facts.append(entry)
         self._save_facts(facts)  # stamps the handle (entry["id"])
         await self._sync_facts_index()
@@ -1253,12 +1513,20 @@ class PersistentMemoryManager:
         # Full text on purpose — the log is the recovery trail for accidental
         # memory operations (facts.json.bak is only one save deep).
         logger.info(f"[memory_tool] fact ADDED ({importance}, {ref}): {text}")
-        return {
+        out: Dict[str, Any] = {
             "status": "ok",
             "id": ref[:8],
             "importance": importance,
             "note": "保存した。検索には即時反映、常駐の事実リストへは次回起動から。",
+            **feedback,
         }
+        if self.is_long_fact(entry) and not title:
+            out["needs_title"] = True
+            out["note"] += (
+                f" {self._long_fact_chars}字を超える長い事実——"
+                "memory_update で title を付けること。"
+            )
+        return out
 
     async def update_fact_manual(
         self,
@@ -1266,8 +1534,18 @@ class PersistentMemoryManager:
         new_text: str = "",
         importance: Optional[str] = None,
         store_id: Optional[str] = None,
+        old_string: str = "",
+        new_string: str = "",
+        append: str = "",
+        title: Optional[str] = None,
+        tags: Any = None,
     ) -> Dict[str, Any]:
-        """Rewrite a fact's text and/or change its importance (memory_update).
+        """Change one fact (memory_update): rewrite the text whole
+        (``new_text``), edit it in place (``old_string``→``new_string``
+        and/or ``append``; the two combine, replace first — the former
+        memory_edit, merged 09-29), and/or change importance, Uber store
+        linkage, title or tags. ``new_text`` and an in-place edit are
+        mutually exclusive; that call changes nothing and returns an error.
 
         Text edits are allowed on ALL tiers, including ``user`` (あさひ
         2026-07-09: content is editable; what stays forbidden is CREATING
@@ -1275,10 +1553,14 @@ class PersistentMemoryManager:
         equally the user's own — the character may not promote or demote it
         (あさひ 2026-08-09: importance change added for high/low —
         "archive" joined 08-31 as the search-only shelf tier; ``user``
-        stays manual-only in both directions). ``store_id`` (08-15): None =
-        untouched, empty string = clear the linkage, else set (stored as
-        the 8-char short)."""
+        stays manual-only in both directions). ``store_id`` (08-15) /
+        ``title`` / ``tags``: None = untouched, empty = clear, else set.
+        Atomic: every check runs before anything is written — an error
+        leaves the fact exactly as it was."""
         new_text = self._clean_fact_text(new_text)
+        old_string = str(old_string or "")
+        new_string = str(new_string or "")
+        append = str(append or "")
         importance = (importance or "").strip().lower() or None
         if importance == "llm":  # legacy spelling of "high"
             importance = "high"
@@ -1289,80 +1571,161 @@ class PersistentMemoryManager:
             }
         if store_id is not None:
             store_id = store_id.strip()
-        if not new_text and importance is None and store_id is None:
+        if title is not None:
+            title = self._clean_title(title)
+        tag_list = self._normalize_tags(tags) if tags is not None else None
+        in_place = bool(old_string or append)
+        if new_text and in_place:
             return {
                 "status": "error",
-                "message": "新しい本文か importance か store_id のどれかが必要。",
+                "message": "new_fact と old_string/append は同時に指定できない（何も変更していない）。",
+            }
+        if (
+            not new_text
+            and not in_place
+            and importance is None
+            and store_id is None
+            and title is None
+            and tag_list is None
+        ):
+            return {
+                "status": "error",
+                "message": (
+                    "変更内容が無い（new_fact / old_string+new_string / append / "
+                    "importance / store_id / title / tags のどれかを指定）。"
+                ),
             }
         facts = self._load_facts()
         self._ensure_fact_ids(facts)  # before any text moves — see there
         matches = self._facts_by_given_id(facts, fact_id)
         if len(matches) > 1:
             return self._ambiguous_id_error(fact_id, matches)
-        for _, f in matches:
-            old = f["fact"]
-            old_tier = f.get("importance") or "low"
-            if importance is not None and old_tier == "user":
+        if not matches:
+            return {
+                "status": "error",
+                "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
+            }
+        _, f = matches[0]
+        old = f["fact"]
+        old_tier = f.get("importance") or "low"
+        if importance is not None and old_tier == "user":
+            return {
+                "status": "error",
+                "message": (
+                    "userレベルの記憶の優先度は本人管理のため変更"
+                    "できない（本文の修正は可）。"
+                ),
+            }
+        edited = old
+        if new_text:
+            edited = new_text
+        elif in_place:
+            edited, err = self._apply_partial_edit(old, old_string, new_string, append)
+            if err:
+                return {"status": "error", "message": err}
+            edited = self._clean_fact_text(edited)
+            if not edited:
                 return {
                     "status": "error",
-                    "message": (
-                        "userレベルの記憶の優先度は本人管理のため変更"
-                        "できない（本文の修正は可）。"
-                    ),
+                    "message": "編集後の本文が空になる（削除は memory_delete で）。",
                 }
-            if new_text:
-                f["fact"] = new_text
-            if importance is not None:
-                f["importance"] = importance
-            if store_id is not None:
-                if store_id:
-                    f["store_id"] = store_id[:8]
-                else:
-                    f.pop("store_id", None)
-            f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Provenance: append the edit; a legacy fact without a history
-            # list starts one here (its creator stays unrecorded — never
-            # fabricated).
-            f.setdefault("history", []).append(
-                self._history_event("edit", self._chat_model, f["updated"])
-            )
-            self._save_facts(facts)
-            await self._sync_facts_index()
-            ref = self._fact_ref(f)
-            # Full old/new text on purpose — recovery trail for accidental
-            # edits (restore by hand from the log if needed).
-            logger.info(
-                f"[memory_tool] fact UPDATED {ref} "
-                f"(tier {old_tier}→{f.get('importance') or 'low'}):\n"
-                f"  OLD: {old}\n  NEW: {f['fact']}"
-            )
-            notes = []
-            if new_text:
-                notes.append("本文を更新した（idはそのまま）。")
+        text_changed = edited != old
+        if text_changed:
+            new_hash = self._fact_id(edited)
+            if new_hash != self._fact_id(old) and any(
+                g is not f and g.get("fact") and self._fact_id(g["fact"]) == new_hash
+                for g in facts
+            ):
+                return {
+                    "status": "error",
+                    "message": "編集後と同内容の記憶が既にある。",
+                }
+        feedback = self.tag_feedback(tag_list, facts) if tag_list else {}
+        # ---- all checks passed: mutate ----
+        if text_changed:
+            f["fact"] = edited
+        if importance is not None:
+            f["importance"] = importance
+        if store_id is not None:
+            if store_id:
+                f["store_id"] = store_id[:8]
             else:
-                notes.append("本文は変更なし。")
-            if importance is not None and importance != old_tier:
-                notes.append(f"importance を {old_tier}→{importance} に変更。")
-            if store_id is not None:
-                notes.append(
-                    f"store_id を {store_id[:8]} に設定。"
-                    if store_id
-                    else "store_id を削除。"
-                )
-            notes.append("常駐リストへの反映は次回起動から。")
-            # "fact" rides along for the chat audit marker: importance/store_id
-            # -only calls carry no new_fact, so the marker needs the target's
-            # text from here to stay legible.
-            return {
-                "status": "ok",
-                "id": ref[:8],
-                "fact": f["fact"],
-                "note": " ".join(notes),
-            }
-        return {
-            "status": "error",
-            "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
+                f.pop("store_id", None)
+        if title is not None:
+            if title:
+                f["title"] = title
+            else:
+                f.pop("title", None)
+        if tag_list is not None:
+            if tag_list:
+                f["tags"] = tag_list
+            else:
+                f.pop("tags", None)
+        f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Provenance: append the edit; a legacy fact without a history
+        # list starts one here (its creator stays unrecorded — never
+        # fabricated).
+        f.setdefault("history", []).append(
+            self._history_event("edit", self._chat_model, f["updated"])
+        )
+        self._save_facts(facts)
+        await self._sync_facts_index()
+        ref = self._fact_ref(f)
+        # Full old/new text on purpose — recovery trail for accidental
+        # edits (restore by hand from the log if needed).
+        if text_changed:
+            logger.info(
+                f"[memory_tool] fact {'UPDATED' if new_text else 'EDITED'} {ref} "
+                f"(tier {old_tier}→{f.get('importance') or 'low'}, "
+                f"{len(old)}→{len(edited)} chars):\n"
+                f"  OLD: {old}\n  NEW: {edited}"
+            )
+        else:
+            logger.info(
+                f"[memory_tool] fact UPDATED {ref} (fields only; tier "
+                f"{old_tier}→{f.get('importance') or 'low'}): {old}"
+            )
+        notes = []
+        if new_text:
+            notes.append("本文を更新した（idはそのまま）。")
+        elif in_place:
+            notes.append("本文を編集した（idはそのまま）。")
+        else:
+            notes.append("本文は変更なし。")
+        if importance is not None and importance != old_tier:
+            notes.append(f"importance を {old_tier}→{importance} に変更。")
+        if store_id is not None:
+            notes.append(
+                f"store_id を {store_id[:8]} に設定。"
+                if store_id
+                else "store_id を削除。"
+            )
+        if title is not None:
+            notes.append(f"title を「{title}」に設定。" if title else "title を削除。")
+        if tag_list is not None:
+            notes.append(
+                "tags を " + " ".join(f"#{t}" for t in tag_list) + " に設定。"
+                if tag_list
+                else "tags を削除。"
+            )
+        notes.append("常駐リストへの反映は次回起動から。")
+        # "fact" rides along for the chat audit marker: field-only calls
+        # carry no new_fact, so the marker needs the target's text from
+        # here to stay legible.
+        out: Dict[str, Any] = {
+            "status": "ok",
+            "id": ref[:8],
+            "fact": f["fact"],
+            "chars": len(f["fact"]),
+            "note": " ".join(notes),
+            **feedback,
         }
+        if self.is_long_fact(f) and not self._clean_title(f.get("title", "")):
+            out["needs_title"] = True
+            out["note"] += (
+                f" {self._long_fact_chars}字を超える長い事実——title を付けること。"
+            )
+        return out
 
     @staticmethod
     def _clean_fact_text(text: str) -> str:
@@ -1378,92 +1741,33 @@ class PersistentMemoryManager:
     def _apply_partial_edit(
         text: str, old_string: str, new_string: str, append: str
     ) -> tuple:
-        """One partial edit of ``text`` → ``(new_text, error_message)``.
+        """One in-place edit of ``text`` → ``(new_text, error_message)``.
 
-        Two forms, never both: ``old_string``→``new_string`` on a passage that
-        occurs EXACTLY once (the str_replace contract coding agents use: zero
-        or several matches change nothing), or ``append`` added verbatim at
-        the end. Matching is literal — no whitespace or width folding (あさひ
-        09-22: a model copies its own tokens faithfully; that class of slip
-        is a human one). Shared by memory_edit and memory_edit_diary."""
-        if append and (old_string or new_string):
-            return None, "old_string/new_string と append は同時に指定できない。"
-        if append:
-            return text + append, ""
-        if not old_string:
+        Two forms that combine (あさひ 09-29; were exclusive until then):
+        ``old_string``→``new_string`` on a passage that occurs EXACTLY once
+        (the str_replace contract coding agents use: zero or several
+        matches change nothing), then ``append`` added verbatim at the end.
+        Matching is literal — no whitespace or width folding (あさひ 09-22:
+        a model copies its own tokens faithfully; that class of slip is a
+        human one). Shared by memory_update and memory_write_diary."""
+        if not old_string and not append:
             return None, "old_string（置き換える箇所）か append のどちらかが必要。"
-        n = text.count(old_string)
-        if n == 0:
-            return None, "old_string が本文に見つからない（何も変更していない）。"
-        if n > 1:
-            return None, (
-                f"old_string が{n}箇所に一致した（何も変更していない）。"
-                "前後を含めて一意になるように指定を。"
-            )
-        if old_string == new_string:
-            return None, "old_string と new_string が同じ。"
-        return text.replace(old_string, new_string, 1), ""
-
-    async def edit_fact_manual(
-        self,
-        fact_id: str,
-        old_string: str = "",
-        new_string: str = "",
-        append: str = "",
-    ) -> Dict[str, Any]:
-        """Partial edit of one fact (memory_edit, あさひ/ヒロ 09-22): a 1500-
-        character shelf used to be re-emitted in full to change one clause.
-        Tier rules as memory_update's text path — every tier's text is
-        editable, ``user`` included. The handle never moves."""
-        facts = self._load_facts()
-        self._ensure_fact_ids(facts)
-        matches = self._facts_by_given_id(facts, fact_id)
-        if len(matches) > 1:
-            return self._ambiguous_id_error(fact_id, matches)
-        if not matches:
-            return {
-                "status": "error",
-                "message": f"id {fact_id} の記憶が見つからない。memory_searchで確認を。",
-            }
-        f = matches[0][1]
-        old = f["fact"]
-        edited, err = self._apply_partial_edit(
-            old, str(old_string or ""), str(new_string or ""), str(append or "")
-        )
-        if err:
-            return {"status": "error", "message": err}
-        edited = self._clean_fact_text(edited)
-        if not edited:
-            return {
-                "status": "error",
-                "message": "編集後の本文が空になる（削除は memory_delete で）。",
-            }
-        new_hash = self._fact_id(edited)
-        if new_hash != self._fact_id(old) and any(
-            g is not f and g.get("fact") and self._fact_id(g["fact"]) == new_hash
-            for g in facts
-        ):
-            return {"status": "error", "message": "編集後と同内容の記憶が既にある。"}
-        f["fact"] = edited
-        f["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        f.setdefault("history", []).append(
-            self._history_event("edit", self._chat_model, f["updated"])
-        )
-        self._save_facts(facts)
-        await self._sync_facts_index()
-        ref = self._fact_ref(f)
-        # Full old/new text on purpose — same recovery trail as UPDATED.
-        logger.info(
-            f"[memory_tool] fact EDITED {ref} "
-            f"({'append' if append else 'replace'}, {len(old)}→{len(edited)} chars):\n"
-            f"  OLD: {old}\n  NEW: {edited}"
-        )
-        return {
-            "status": "ok",
-            "id": ref[:8],
-            "chars": len(edited),
-            "note": "編集した（idはそのまま）。常駐リストへの反映は次回起動から。",
-        }
+        out = text
+        if old_string:
+            n = text.count(old_string)
+            if n == 0:
+                return None, "old_string が本文に見つからない（何も変更していない）。"
+            if n > 1:
+                return None, (
+                    f"old_string が{n}箇所に一致した（何も変更していない）。"
+                    "前後を含めて一意になるように指定を。"
+                )
+            if old_string == new_string:
+                return None, "old_string と new_string が同じ。"
+            out = text.replace(old_string, new_string, 1)
+        if append:
+            out = out + append
+        return out, ""
 
     async def delete_fact_manual(self, fact_id: str) -> Dict[str, Any]:
         """Remove one fact (memory_delete). The caller (agent) is responsible
@@ -1492,6 +1796,37 @@ class PersistentMemoryManager:
             return {"status": "ok", "deleted": removed.get("fact", "")}
         return {"status": "error", "message": f"id {fact_id} の記憶が見つからない。"}
 
+    def _search_fact_row(
+        self, f: Dict[str, Any], score: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """memory_search / tag-listing row. A long fact collapses to its
+        title + id (あさひ 09-29): the text is NOT in the row — memory_read
+        gives it — so a search can never drop a whole shelf into context."""
+        row: Dict[str, Any] = {
+            "id": self._fact_ref(f)[:8],
+            "date": str(f.get("updated", ""))[:10],
+            "importance": f.get("importance", "low"),
+        }
+        disp = self._display_fields(f)
+        if not disp.get("collapsed"):
+            row["fact"] = f.get("fact", "")
+        row.update(disp)
+        if score is not None:
+            row["score"] = round(float(score), 3)
+        row.update(self._row_store_id(f))
+        return row
+
+    @staticmethod
+    def _in_date_range(day: str, date_range: Optional[tuple]) -> bool:
+        if date_range is None:
+            return True
+        if not day:
+            return False
+        return not (
+            (date_range[0] and day < date_range[0])
+            or (date_range[1] and day > date_range[1])
+        )
+
     async def search_memory_tool(
         self,
         query: str,
@@ -1499,6 +1834,7 @@ class PersistentMemoryManager:
         n: int = 5,
         date_from: str = "",
         date_to: str = "",
+        tags: Any = None,
     ) -> Dict[str, Any]:
         """Explicit memory search for the memory_search tool.
 
@@ -1510,9 +1846,15 @@ class PersistentMemoryManager:
         ``date_from``/``date_to`` ("YYYY-MM-DD") prefilter candidates by date
         metadata (diary date / fact updated-date) BEFORE ranking, so the model
         can scope a period without polluting the semantic query with dates.
+
+        ``tags`` (あさひ 09-29): only facts carrying ALL the given tags are
+        candidates (AND — two calls for OR). With tags and no query the call
+        LISTS those facts newest first instead of ranking; diaries carry no
+        tags, so the listing mode is facts-only.
         """
         query = (query or "").strip()
-        if not query:
+        tag_list = self._normalize_tags(tags)
+        if not query and not tag_list:
             return {"status": "error", "message": "queryが空。"}
         try:
             n = max(1, min(int(n or 5), 10))
@@ -1527,25 +1869,51 @@ class PersistentMemoryManager:
                     "message": f"{label} は YYYY-MM-DD 形式で指定すること: {d!r}",
                 }
         date_range = (date_from, date_to) if (date_from or date_to) else None
-        keywords = extract_keywords(query)
+        keywords = extract_keywords(query) if query else []
         embed_q = " ".join(keywords) if keywords else query
-        out: Dict[str, Any] = {"status": "ok", "query": query}
+        out: Dict[str, Any] = {"status": "ok"}
+        if query:
+            out["query"] = query
+        if tag_list:
+            out["tags"] = tag_list
         if date_range:
             out["date_filter"] = f"{date_from or '...'} 〜 {date_to or '...'}"
 
         if target in ("facts", "both"):
-            if self._facts_index is None:
+            by_id = {
+                self._fact_id(f["fact"]): f for f in self._load_facts() if f.get("fact")
+            }
+            tagged_ids: Optional[Set[str]] = None
+            if tag_list:
+                want = set(tag_list)
+                tagged_ids = {
+                    fid
+                    for fid, f in by_id.items()
+                    if want <= set(self._normalize_tags(f.get("tags")))
+                }
+            if not query:
+                # Tag listing mode: no ranking, newest first.
+                listed = [
+                    f
+                    for fid, f in by_id.items()
+                    if fid in (tagged_ids or set())
+                    and self._in_date_range(str(f.get("updated", ""))[:10], date_range)
+                ]
+                listed.sort(key=lambda f: str(f.get("updated", "")), reverse=True)
+                out["facts"] = [self._search_fact_row(f) for f in listed[:n]]
+                out["facts_total"] = len(listed)
+            elif self._facts_index is None:
                 out["facts"] = []
                 out["facts_note"] = "facts RAGが無効のため検索不可。"
             else:
-                by_id = {
-                    self._fact_id(f["fact"]): f
-                    for f in self._load_facts()
-                    if f.get("fact")
-                }
+                exclude = (
+                    set()
+                    if tagged_ids is None
+                    else {fid for fid in by_id if fid not in tagged_ids}
+                )
                 hits, _ = await self._facts_index.retrieve(
                     embed_q,
-                    exclude_ids=set(),
+                    exclude_ids=exclude,
                     similarity_threshold=-1.0,
                     topn_threshold=-1.0,
                     max_retrievals=n,
@@ -1555,19 +1923,16 @@ class PersistentMemoryManager:
                     date_range=date_range,
                 )
                 out["facts"] = [
-                    {
-                        "id": self._fact_ref(by_id[h["id"]])[:8],
-                        "fact": by_id[h["id"]].get("fact", ""),
-                        "date": str(by_id[h["id"]].get("updated", ""))[:10],
-                        "importance": by_id[h["id"]].get("importance", "low"),
-                        "score": round(float(h.get("score", 0.0)), 3),
-                        **self._row_store_id(by_id[h["id"]]),
-                    }
+                    self._search_fact_row(by_id[h["id"]], h.get("score", 0.0))
                     for h in hits
                     if h["id"] in by_id
                 ]
+            if tag_list and not out.get("facts"):
+                out["facts_note"] = "指定タグを全部持つ事実は無い。"
 
-        if target in ("diaries", "both"):
+        if target in ("diaries", "both") and not query:
+            out["diaries_note"] = "タグだけの検索は事実のみが対象（日記にタグは無い）。"
+        elif target in ("diaries", "both"):
             if self._diary_index is None:
                 out["diaries"] = []
                 out["diaries_note"] = "diary RAGが無効のため検索不可。"
@@ -2078,6 +2443,14 @@ class PersistentMemoryManager:
                 return
 
             prompt_parts = [f"既存の事実リスト（繰り返さないこと）:\n{existing_text}"]
+            # Tag vocabulary (あさひ 09-29): names in use, most used first,
+            # so the extractor reuses them instead of coining near-duplicates.
+            vocab = self.tag_vocabulary()
+            if vocab:
+                prompt_parts.append(
+                    "既存のタグ一覧（再利用を優先）: "
+                    + " ".join(f"#{t}({c})" for t, c in vocab[:80])
+                )
             if diary_context.strip():
                 prompt_parts.append(
                     f"以前のセッションのまとめ（参考）:\n{diary_context}"
@@ -2128,6 +2501,7 @@ class PersistentMemoryManager:
                     imp = "high"
                 elif imp not in ("high", "low"):
                     imp = "low"
+                tag_list = self._normalize_tags(f.get("tags"))
                 tagged.append(
                     {
                         "fact": f["fact"],
@@ -2145,6 +2519,8 @@ class PersistentMemoryManager:
                         ],
                     }
                 )
+                if tag_list:
+                    tagged[-1]["tags"] = tag_list
             merged = existing + tagged
             # Smart trim: ask the LLM to drop least-important entries when
             # over the cap. The whole merged pool (old + new) is the

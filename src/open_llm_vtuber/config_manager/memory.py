@@ -85,8 +85,8 @@ class DiaryRagConfig(I18nMixin):
             zh="每轮注入日记段落的预算（键名沿用句子时代；装箱以篇为原子：某篇选中段整体装入，末篇可轻微超出预算）",
         ),
         "full_reads_per_turn": Description(
-            en="Max memory_read_diary full-text reads per turn (each read stays in context permanently — replay-exempt)",
-            zh="每轮 memory_read_diary 全文读取上限（读过的全文永驻上下文——回放豁免截断）",
+            en="Max full diary reads per turn via memory_read (each read stays in context permanently — replay-exempt)",
+            zh="每轮通过 memory_read 读日记全文的上限（读过的全文永驻上下文——回放豁免截断）",
         ),
     }
 
@@ -171,6 +171,7 @@ class PersistentMemoryConfig(I18nMixin):
     recent_sessions: int = Field(3, alias="recent_sessions")
     diary_count: int = Field(5, alias="diary_count")
     max_facts: int = Field(50, alias="max_facts")
+    long_fact_chars: int = Field(500, alias="long_fact_chars")
     memory_llm_model: str = Field("", alias="memory_llm_model")
     memory_llm_provider: str = Field("openai_llm", alias="memory_llm_provider")
     memory_reasoning_effort: str = Field("", alias="memory_reasoning_effort")
@@ -193,6 +194,10 @@ class PersistentMemoryConfig(I18nMixin):
         "max_facts": Description(
             en="Maximum number of facts to retain in facts.json",
             zh="facts.json 中保留的最大事实条数",
+        ),
+        "long_fact_chars": Description(
+            en="A fact longer than this many characters appears in list paths (auto recall, memory_search hits, the Uber related-facts section) as title + id only; memory_read gives the full text. The resident header never collapses. 0 = never collapse",
+            zh="正文超过此字数的事实在列表路径（自动召回、memory_search 命中、uber 关联记忆段）里只显示标题和 id，全文用 memory_read 读；常驻头不折叠。0=从不折叠",
         ),
         "memory_llm_model": Description(
             en="Model for memory tasks (diary/fact); blank = reuse the chat model. Uses the provider set by memory_llm_provider",

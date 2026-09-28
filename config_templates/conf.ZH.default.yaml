@@ -34,6 +34,9 @@ system_config:
     recent_sessions: 3  # Layer 1：新会话开始时加载的历史会话数量
     diary_count: 5       # Layer 3：注入到系统提示词的最近日记条数
     max_facts: 50        # Layer 2：facts.json 保留的最大事实条数
+    # 正文超过此字数的事实在列表路径（自动召回、memory_search 命中、uber 关联记忆段）里
+    # 只显示标题和 id，全文用 memory_read 读；常驻头不折叠。0=从不折叠。
+    long_fact_chars: 500
     # 记忆任务（日记/事实抽取/合并）用的模型。留空=复用主对话模型。这些是大块、不缓存的
     # 一次性调用，指向更便宜的模型能省钱且不影响对话质量。复用主 provider 的 key/端点，只换模型名。
     memory_llm_model: ""
@@ -65,7 +68,7 @@ system_config:
       prefilter_floor: 0.3          # 最高 hybrid 分低于此则跳过判官（省调用）
       rerank_context_turns: 6       # 给判官作上下文的最近对话轮数（让它结合在聊什么判断，而非只看最后一句）
       sentence_budget: 4            # 段落化注入：每轮段落预算（键名沿用句子时代；装箱以篇为原子，末篇可轻微超出）
-      full_reads_per_turn: 5        # 每轮 memory_read_diary 全文读取上限（读过即永驻上下文）
+      full_reads_per_turn: 5        # 每轮通过 memory_read 读日记全文的上限（读过即永驻上下文）
     # 事实 RAG：低优先级事实的独立索引。打了 user/llm 标签的事实固定进开头提示词；
     # low（默认）按需在这里检索。独立于 diary_rag，复用其嵌入 key/模型。
     # 启用前请先给事实分层：所有现有事实会迁移成 low，开头会先清空，需手动把要保留的提级。

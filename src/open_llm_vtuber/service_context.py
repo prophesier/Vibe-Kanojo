@@ -667,6 +667,7 @@ class ServiceContext:
                     facts_rag_config=mem_cfg.facts_rag,
                     embed_api_key=embed_key,
                     embed_base_url=embed_base,
+                    long_fact_chars=getattr(mem_cfg, "long_fact_chars", 500),
                 )
                 if hasattr(self.agent_engine, "set_memory_manager"):
                     self.agent_engine.set_memory_manager(self.memory_manager)
