@@ -38,9 +38,13 @@ def _split_paragraphs(text: str) -> List[str]:
     return [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
 
 
-# Matches timestamp tags injected by _to_text_prompt: "[YYYY-MM-DD HH:MM:SS Weekday]"
+# Matches the timestamp tags _to_text_prompt / history load prepend to user
+# messages: "[HH:MM]" since 09-29, plus the older "[YYYY-MM-DD HH:MM:SS 曜]"
+# shape still held in memory by a session that predates the change (disk
+# records carry no tag; it is re-rendered at load).
 _TIMESTAMP_RE = re.compile(
-    r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \w+\]\s*", re.MULTILINE
+    r"^\[(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}(?::\d{2})?(?: \w+)?\]\s*",
+    re.MULTILINE,
 )
 
 # A session uid: "YYYY-MM-DD_HH-MM-SS_<hex>". Diary files and session files

@@ -75,7 +75,11 @@ class AsyncLLM(StatelessLLMInterface):
           previous user msg | current user msg) and makes image turns
           cache-immune (implicit deterministically misses on them —
           verified probes 5–7). Requests whose system prompt carries no
-          CACHE_SEAM_MARKER (e.g. memory tasks) stay implicit.
+          CACHE_SEAM_MARKER (memory tasks and other one-shot calls) still
+          declare explicit mode but place NO breakpoint, so the server
+          writes nothing and the prompt bills at the plain input rate —
+          on gpt-5.6+ every cache write (implicit ones included) costs
+          1.25× and one-shot prompts are never re-read.
         """
         self.base_url = base_url
         self.model = model
@@ -94,7 +98,10 @@ class AsyncLLM(StatelessLLMInterface):
             cmode = "implicit"
         self._cache_mode = cmode
         if cmode == "explicit" and mode == "responses":
-            logger.info("Explicit prompt caching active (ttl 30m, 4 breakpoints).")
+            logger.info(
+                "Explicit prompt caching active (ttl 30m, 4 breakpoints; "
+                "one-shot calls: no breakpoints, no cache writes)."
+            )
         # Verbatim output items (reasoning/message/function_call) of recent
         # responses-mode tool-call rounds, keyed by call_id. Replayed on the
         # next hop of the SAME turn so encrypted reasoning survives the tool
@@ -896,11 +903,20 @@ class AsyncLLM(StatelessLLMInterface):
             if reasoning_effort is None:
                 reasoning_effort = self._reasoning_effort
 
-            # Explicit caching only for requests whose system prompt carries
-            # the seam marker (= the chat path). Memory tasks and other
-            # one-shot callers stay implicit — explicit writes bill 1.25×
-            # and their prompts are never re-read.
-            explicit_active = self._cache_mode == "explicit" and bool(
+            # Breakpoints only for requests whose system prompt carries the
+            # seam marker (= the chat path). Memory tasks and other one-shot
+            # callers still DECLARE explicit mode but place no breakpoint:
+            # on gpt-5.6+ every cache write bills 1.25× the input rate,
+            # implicit mode included, and implicit caching cannot be turned
+            # off (developers.openai.com prompt-caching guide, 09-29). With
+            # explicit mode and zero breakpoints the server writes nothing,
+            # so the whole prompt bills at the plain input rate — verified
+            # on both endpoints (experiments/_explicit_nobp_probe.py:
+            # implicit control write=3744 → explicit no-bp write=0). Those
+            # prompts were never re-read anyway (console 08-23: 519k
+            # written vs 1.3k read per day).
+            explicit_mode = self._cache_mode == "explicit"
+            explicit_active = explicit_mode and bool(
                 system and CACHE_SEAM_MARKER in system
             )
             request_kwargs: Dict[str, Any] = {
@@ -920,6 +936,9 @@ class AsyncLLM(StatelessLLMInterface):
                     "mode": "explicit",
                     "ttl": "30m",
                 }
+            elif explicit_mode:
+                # No breakpoints → nothing to retain, so no ttl.
+                extra_body["prompt_cache_options"] = {"mode": "explicit"}
             flat_tools = self._to_responses_tools(tools if self.support_tools else None)
             if flat_tools:
                 request_kwargs["tools"] = flat_tools

@@ -344,6 +344,9 @@ character_config:
         # Prompt caching (responses mode only): 'implicit' (default) or
         # 'explicit' — 4 breakpoints, image turns no longer bust the cache,
         # ttl 30m (pair with openai_cache_keepalive_minutes to keep it warm).
+        # On gpt-5.6+ every cache write bills 1.25x, implicit mode included;
+        # under 'explicit', one-shot calls (memory tasks) declare explicit
+        # mode with no breakpoints and pay the plain input rate instead.
         cache_mode: 'implicit'
 
       gemini_llm:

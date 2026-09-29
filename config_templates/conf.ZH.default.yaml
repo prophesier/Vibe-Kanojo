@@ -288,6 +288,8 @@ character_config:
         api_mode: 'chat'
         # 缓存方式（仅 responses 模式）：'implicit'（默认）或 'explicit'
         # —— 4 断点，图片回合不再掉缓存，ttl 30 分钟（配合 openai_cache_keepalive_minutes 保温）。
+        # gpt-5.6 起缓存写入一律按 1.25 倍计费（隐式也算）；'explicit' 下记忆任务等
+        # 一次性调用会开显式但不打断点，只付普通输入价。
         cache_mode: 'implicit'
 
       gemini_llm:

@@ -106,9 +106,12 @@ class OpenAICompatibleConfig(StatelessLLMBaseConfig):
         "cache_mode": Description(
             en="Prompt caching flavor (responses mode only): 'implicit' "
             "(default) or 'explicit' (4 breakpoints, image turns become "
-            "cache-immune, ttl 30m).",
+            "cache-immune, ttl 30m; one-shot calls such as memory tasks "
+            "declare explicit mode with no breakpoints, so on gpt-5.6+ they "
+            "pay the plain input rate instead of the 1.25x cache-write rate).",
             zh="缓存方式（仅 responses 模式）：'implicit'（默认）或 'explicit'"
-            "（4 断点，图片回合不再掉缓存，ttl 30 分钟）。",
+            "（4 断点，图片回合不再掉缓存，ttl 30 分钟；记忆任务等一次性调用"
+            "开显式但不打断点，gpt-5.6 起按普通输入价而非 1.25 倍写入价计费）。",
         ),
     }
 

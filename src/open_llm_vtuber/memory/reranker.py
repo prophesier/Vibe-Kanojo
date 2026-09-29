@@ -26,7 +26,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from loguru import logger
-from openai import AsyncOpenAI
+from openai import APIError, AsyncOpenAI
 
 # System instruction for the judge. Plain tool prompt — no roleplay. Japanese to
 # match the memory/query language. ``{item}`` is the entry kind ("日記"/"事実";
@@ -223,6 +223,9 @@ class MemoryReranker:
         self._model = model
         self._item = item_label
         self._timeout = timeout
+        # Explicit cache mode with no breakpoints (see _create). Cleared for
+        # the instance if the endpoint rejects the option.
+        self._no_write_mode = True
         # gpt-4o-era judges run temperature=0 for determinism; gpt-5.x
         # reasoning models 400-reject an explicit temperature. Omit the param
         # for anything that isn't a known temperature-taking family (their
@@ -230,6 +233,60 @@ class MemoryReranker:
         self._temperature_kwargs: Dict[str, Any] = (
             {"temperature": 0} if model.lower().startswith("gpt-4") else {}
         )
+
+    async def _create(self, **kwargs: Any) -> Any:
+        """chat.completions.create in explicit cache mode with NO breakpoints.
+
+        On gpt-5.6+ every cache write bills 1.25× the input rate, implicit
+        mode included, and implicit caching cannot be turned off
+        (developers.openai.com prompt-caching guide, 09-29). Judge prompts
+        are never re-read (console 08-23: 519k written vs 1.3k read per
+        day), so declaring explicit mode without a single
+        prompt_cache_breakpoint keeps the whole prompt at the plain input
+        rate — verified on chat/completions with the judge request shape
+        (experiments/_explicit_nobp_probe.py: implicit write=3744 →
+        explicit no-bp write=0). If the endpoint rejects the field the
+        instance falls back to implicit for good (one warning), so a
+        non-OpenAI judge endpoint keeps working.
+        """
+        if self._no_write_mode:
+            kwargs["extra_body"] = {"prompt_cache_options": {"mode": "explicit"}}
+        try:
+            resp = await self._client.chat.completions.create(**kwargs)
+        except APIError as e:
+            if not (self._no_write_mode and "prompt_cache" in str(e).lower()):
+                raise
+            self._no_write_mode = False
+            kwargs.pop("extra_body", None)
+            logger.warning(
+                f"[memory_rag] judge endpoint rejected prompt_cache_options "
+                f"({self._model}); falling back to implicit caching (cache "
+                "writes bill 1.25× on gpt-5.6+)."
+            )
+            resp = await self._client.chat.completions.create(**kwargs)
+        self._log_usage(resp)
+        return resp
+
+    def _log_usage(self, resp: Any) -> None:
+        """Debug line per judge call; WARNING if the server still wrote
+        cache tokens in no-write mode (the 1.25× surcharge is back)."""
+        u = getattr(resp, "usage", None)
+        if u is None:
+            return
+        d = getattr(u, "prompt_tokens_details", None)
+        total = getattr(u, "prompt_tokens", 0) or 0
+        cached = getattr(d, "cached_tokens", 0) or 0
+        write = getattr(d, "cache_write_tokens", 0) or 0
+        logger.debug(
+            f"[memory_rag] judge usage ({self._model}): input={total} "
+            f"cached={cached} write={write}"
+        )
+        if write and self._no_write_mode:
+            logger.warning(
+                f"[memory_rag] judge ({self._model}) wrote {write} cache tokens "
+                "despite explicit no-breakpoint mode — the 1.25× write charge "
+                "is back; check the endpoint."
+            )
 
     async def rerank(
         self,
@@ -262,7 +319,7 @@ class MemoryReranker:
         parts.append(f"{self._item}の候補:\n{numbered}")
         user = "\n\n".join(parts)
         try:
-            resp = await self._client.chat.completions.create(
+            resp = await self._create(
                 model=self._model,
                 messages=[
                     {
@@ -344,7 +401,7 @@ class MemoryReranker:
         parts.append("日記の候補:\n" + "\n\n".join(blocks))
         user = "\n\n".join(parts)
         try:
-            resp = await self._client.chat.completions.create(
+            resp = await self._create(
                 model=self._model,
                 messages=[
                     {

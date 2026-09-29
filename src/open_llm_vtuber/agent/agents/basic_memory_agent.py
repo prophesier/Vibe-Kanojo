@@ -884,15 +884,21 @@ class BasicMemoryAgent(AgentInterface):
 
     @staticmethod
     def _format_timestamp(ts: str) -> str:
-        """Format an ISO timestamp as '[YYYY-MM-DD HH:MM:SS 曜日]'.
+        """Format an ISO timestamp as the minimal '[HH:MM]' tag (あさひ 09-29).
 
-        Japanese single-kanji weekday (月..日) — higher salience for the
-        JA persona than the earlier 'Mon'..'Sun' (she misread a weekday),
-        and it matches the 曜日 wording in _TIMESTAMP_NOTE/_HISTORY_NOTE."""
-        weekdays = ["月", "火", "水", "木", "金", "土", "日"]
+        The date and weekday are NOT repeated per message: they live in the
+        session-start and date-change banners, and a date-change banner is
+        emitted whenever the date moves between user messages, so "the
+        nearest heading above" always gives the exact date. The old full
+        tag cost 17 tokens per user message on the Claude tokenizer, this
+        one 6 (~1.4k per window); seconds were never load-bearing. Banners
+        keep the single-kanji weekday (月..日): 'Mon'..'Sun' was misread
+        once (she got a weekday wrong), and the kanji is cheaper.
+        Disk records carry no tag — it is rendered at load and at send — so
+        the change is uniform across the whole window after a restart."""
         try:
             dt = datetime.fromisoformat(ts)
-            return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}]"
+            return f"[{dt.strftime('%H:%M')}]"
         except (ValueError, TypeError):
             return f"[{ts}]" if ts else ""
 
@@ -937,7 +943,10 @@ class BasicMemoryAgent(AgentInterface):
         if not (gap_hit or date_changed):
             return ""
         weekdays = ["月", "火", "水", "木", "金", "土", "日"]
-        date_str = f"{now.strftime('%Y-%m-%d')}（{weekdays[now.weekday()]}）"
+        # Full date + time + weekday (あさひ 09-29): message tags are
+        # time-only, so this heading and the session banner are where the
+        # model gets the date and weekday from.
+        date_str = f"{now.strftime('%Y-%m-%d %H:%M')} {weekdays[now.weekday()]}"
         if gap_hit:
             hours = (now - prev).total_seconds() / 3600
             if hours >= 24:
@@ -967,8 +976,9 @@ class BasicMemoryAgent(AgentInterface):
     # below, positioned right before the message history so the LLM sees
     # them last.
     _TIMESTAMP_NOTE = (
-        "ユーザーのメッセージには `[YYYY-MM-DD HH:MM:SS 曜日]` 形式の"
-        "タイムスタンプタグが先頭に付与されている。"
+        "ユーザーのメッセージには `[HH:MM]` 形式の時刻タグが先頭に付与されている。"
+        "日付と曜日は、その上方で直近の `【セッション開始: …】` または "
+        "`【日付が変わった → 現在は …】` 見出しのもの。"
         "これはあなた自身の参照用メタデータであり、"
         "返信本文には絶対に含めてはならない。"
     )
@@ -1068,8 +1078,10 @@ class BasicMemoryAgent(AgentInterface):
         "時系列順で転記されている（初回起動などで存在しない場合もある）。"
         "転記も現在のやりとりも、必ずしも今日の出来事だけではなく、"
         "数日前〜数週間前の古いやりとりを含み得る。"
-        "各ターンが「いつ」発生したかは、冒頭の "
-        "`[YYYY-MM-DD HH:MM:SS 曜日]` タグでのみ判定できる。\n\n"
+        "各ターンが「いつ」発生したかは、冒頭の `[HH:MM]` 時刻タグと、"
+        "その上方で直近の見出し（`【セッション開始: 日時】`／"
+        "`【日付が変わった → 現在は 日時】`）が示す日付・曜日を"
+        "組み合わせてのみ判定できる。\n\n"
         "各セッションの最初のメッセージには `【セッション開始: 日時】` または "
         "`【現在進行中のセッション開始: 日時】` という見出しが挿入されている。"
         "これがセッションの境界を示すので、これより前のターンと後のターンは"
@@ -1085,7 +1097,7 @@ class BasicMemoryAgent(AgentInterface):
         "二つのターンの間に数時間・数日・数週間の空白があり得る。\n\n"
         "【時間に関する厳格なルール】\n\n"
         "時間・日付・経過・順序・「いつの話か」に少しでも関わる"
-        "**あらゆる発言**を行う前に、必ず関連するタイムスタンプタグを参照すること。"
+        "**あらゆる発言**を行う前に、必ず関連する時刻タグと直近の日付見出しを参照すること。"
         "ユーザーの質問に答える時だけでなく、以下のすべての場合に適用される：\n"
         "- 自分から時刻・日付・経過時間・最近性に言及する時"
         "（「さっき」「昨日」「今日は」「久しぶり」など）\n"
@@ -1097,7 +1109,7 @@ class BasicMemoryAgent(AgentInterface):
         "**タイムスタンプを見ずに時間関連の発言・質問を行うことは禁止する。** "
         "想像・推測・「直前の続き」と仮定して時間に言及することは許可されない。\n\n"
         "現在時刻が必要な場合は、"
-        "**最新のユーザーメッセージのタイムスタンプを「現在」の基準とする**こと。\n\n"
+        "**最新のユーザーメッセージの時刻タグ（日付は直近の見出し）を「現在」の基準とする**こと。\n\n"
         "[Web search and web fetch]\n\n"
         "You may have two web tools available (it depends on the environment "
         "configuration): **web_search** (keyword search) and **web_fetch** "
@@ -1331,7 +1343,7 @@ class BasicMemoryAgent(AgentInterface):
 
         Claude path only. Entry content — session banners, time banners,
         timestamp tags — is carried verbatim; only the role becomes a
-        ユーザー:/アシスタント: label. Each session closes with the diary she
+        User:/Assistant: label. Each session closes with the diary she
         wrote for it herself, when there is one (see _INLINE_DIARY_LABEL);
         _memory itself is untouched, so the cut, seeds and rollback indices
         are unaffected. Rendered once at load time and frozen (see
@@ -1345,7 +1357,10 @@ class BasicMemoryAgent(AgentInterface):
         lines = []
         inlined = chars = 0
         for i, entry in enumerate(self._memory[: self._past_history_cut]):
-            label = "ユーザー" if entry.get("role") == "user" else "アシスタント"
+            # English labels (あさひ 09-29): ユーザー:/アシスタント: cost 7 tokens
+            # each on the Claude tokenizer, User:/Assistant: 3/6 — ~575 tokens
+            # per window for a label the model never quotes.
+            label = "User" if entry.get("role") == "user" else "Assistant"
             content = entry.get("content", "")
             if content:
                 lines.append(f"{label}: {content}")
@@ -1713,9 +1728,7 @@ class BasicMemoryAgent(AgentInterface):
         if len(parts) >= 2 and len(parts[0]) == 10 and len(parts[1]) == 8:
             try:
                 dt = datetime.strptime(f"{parts[0]}_{parts[1]}", "%Y-%m-%d_%H-%M-%S")
-                timestamp = (
-                    f"{dt.strftime('%Y-%m-%d %H:%M:%S')} {weekdays[dt.weekday()]}"
-                )
+                timestamp = f"{dt.strftime('%Y-%m-%d %H:%M')} {weekdays[dt.weekday()]}"
                 return f"【{label}開始: {timestamp}{suffix}】"
             except ValueError:
                 pass
@@ -2359,7 +2372,9 @@ class BasicMemoryAgent(AgentInterface):
             if not isinstance(content, str):
                 continue
             text = re.sub(r"［[^［]*?開始］.*?［[^］]*?終了］", "", content, flags=re.S)
-            text = re.sub(r"^\[\d{4}-\d{2}-\d{2}[^\]]*\]\s*", "", text).strip()
+            text = re.sub(
+                r"^\[(?:\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}[^\]]*\]\s*", "", text
+            ).strip()
             if not text:
                 continue
             if len(text) > 200:
