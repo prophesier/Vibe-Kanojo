@@ -5859,7 +5859,20 @@ class BasicMemoryAgent(AgentInterface):
                 "message": "記憶の処理中に内部エラーが起きた。再試行してよい。",
             }
             return self._memory_marker(name, args, result), result
-        return self._memory_marker(name, args, result), result
+        # The marker may read agent-private fields ("_fact"); the model
+        # never gets them.
+        marker = self._memory_marker(name, args, result)
+        return marker, self._public_result(result)
+
+    @staticmethod
+    def _public_result(result: Any) -> Any:
+        """A tool result as the model sees it: top-level keys starting with
+        "_" are agent-private (the audit marker's text) and are dropped.
+        The fact text is one of them since 10-01 — an in-place edit of a
+        long shelf fact used to echo thousands of characters back."""
+        if not isinstance(result, dict):
+            return result
+        return {k: v for k, v in result.items() if not str(k).startswith("_")}
 
     @staticmethod
     def _memory_marker(
@@ -5900,7 +5913,7 @@ class BasicMemoryAgent(AgentInterface):
                 if args.get("tags") is not None:
                     kinds.append("タグ" + ("設定" if args.get("tags") else "解除"))
                 kind = "・".join(kinds) or "変更なし"
-                body = result.get("fact") or args.get("fact_id")
+                body = result.get("_fact") or args.get("fact_id")
                 label = f"記憶更新({kind}): {_clip(body)}"
         elif name == "memory_read":
             facts_n = len(result.get("facts") or [])
@@ -5923,9 +5936,9 @@ class BasicMemoryAgent(AgentInterface):
                     "（上書き）" if result.get("overwrote") else ""
                 )
         elif status == "pending_approval":
-            label = f"記憶削除申請: {_clip(result.get('fact'))}"
+            label = f"記憶削除申請: {_clip(result.get('_fact') or result.get('fact'))}"
         else:
-            label = f"記憶削除: {_clip(result.get('deleted') or args.get('fact_id'))}"
+            label = f"記憶削除: {_clip(result.get('_fact') or args.get('fact_id'))}"
         if status not in ("ok", "pending_approval"):
             label += "(失敗)"
         return f"\n📝 *{label}*\n"
@@ -6144,10 +6157,21 @@ class BasicMemoryAgent(AgentInterface):
             logger.info(
                 f"[memory_tool] delete STAGED ({fact_id}): {fact.get('fact', '')[:80]}"
             )
+            # A long fact is shown collapsed (title + size, the same stub as
+            # the recall rows): the approval step must not drop a whole
+            # shelf into context either — memory_read shows it when she
+            # needs the text to ask him. "_fact" feeds the audit marker only.
+            shown = fact.get("fact", "")
+            disp = getattr(mgr, "_display_fields", None)
+            body_fn = getattr(mgr, "fact_row_body", None)
+            fields = disp(fact) if callable(disp) else {}
+            if fields.get("collapsed") and callable(body_fn):
+                shown = body_fn({**fields, "fact": shown})
             return {
                 "status": "pending_approval",
                 "id": fact_id,
-                "fact": fact.get("fact", ""),
+                "fact": shown,
+                "_fact": fact.get("fact", ""),
                 "message": (
                     "削除には本人の同意が必要。この記憶を削除してよいか、"
                     "内容を示して本人に確認すること。同意の返事をもらった"

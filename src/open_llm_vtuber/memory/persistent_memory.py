@@ -1713,17 +1713,26 @@ class PersistentMemoryManager:
                 else "tags を削除。"
             )
         notes.append("常駐リストへの反映は次回起動から。")
-        # "fact" rides along for the chat audit marker: field-only calls
-        # carry no new_fact, so the marker needs the target's text from
-        # here to stay legible.
-        out: Dict[str, Any] = {
-            "status": "ok",
-            "id": ref[:8],
-            "fact": f["fact"],
-            "chars": len(f["fact"]),
-            "note": " ".join(notes),
-            **feedback,
-        }
+        # The text itself is NOT returned to the model (あさひ 10-01): her
+        # shelf facts run to thousands of characters, and four in-place
+        # edits echoed 13.8k chars back in one round (~15k tokens; a result
+        # over the replay budget also stops in-loop cache marking for the
+        # rest of the turn). The size before/after is the confirmation and
+        # memory_read shows the text. "_fact" is agent-private — the chat
+        # audit marker of a field-only call needs the target text to stay
+        # legible — and is dropped before the result reaches the model
+        # (_run_memory_tool / _public_result).
+        out: Dict[str, Any] = {"status": "ok", "id": ref[:8]}
+        if text_changed:
+            out["chars_before"] = len(old)
+        out.update(
+            {
+                "chars": len(f["fact"]),
+                "note": " ".join(notes),
+                **feedback,
+                "_fact": f["fact"],
+            }
+        )
         if self.is_long_fact(f) and not self._clean_title(f.get("title", "")):
             out["needs_title"] = True
             out["note"] += (
@@ -1797,7 +1806,15 @@ class PersistentMemoryManager:
                 f"importance={removed.get('importance', 'low')}): "
                 f"{removed.get('fact', '')}"
             )
-            return {"status": "ok", "deleted": removed.get("fact", "")}
+            # No text back to the model (あさひ 10-01): id and size only.
+            # "_fact" is agent-private, for the chat audit marker.
+            text = removed.get("fact", "")
+            return {
+                "status": "ok",
+                "id": self._fact_ref(removed)[:8],
+                "chars": len(text),
+                "_fact": text,
+            }
         return {"status": "error", "message": f"id {fact_id} の記憶が見つからない。"}
 
     def _search_fact_row(
